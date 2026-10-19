@@ -180,7 +180,7 @@ class Model:
 
 def patchgate(repo: Path, model: Model, *args, **settings) -> subprocess.CompletedProcess:
     """Run patchgate against the scripted model. Show its output in the agent log."""
-    env = {**os.environ, "PATCHGATE_MODEL_URL": model.url, "PATCHGATE_TIMEOUT": "30", **settings}
+    env = {**os.environ, "PATCHGATE_MODEL_URL": model.url, "PATCHGATE_MODEL_API": "openai", "PATCHGATE_TIMEOUT": "30", **settings}
     result = run(PATCHGATE, *args, cwd=repo, env=env, check=False)
     print(f"$ patchgate {' '.join(args)}  (exit {result.returncode})")
     print(result.stdout, result.stderr, sep="", end="", flush=True)

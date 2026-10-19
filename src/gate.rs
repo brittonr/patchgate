@@ -13,7 +13,7 @@ use regex::RegexSet;
 use serde::{Deserialize, Serialize};
 
 use crate::change::{self, Choices, Conflict, ConflictFile, Hunks, Piece, Region, Unmerged, short};
-use crate::model::Model;
+use crate::model::{Api, Model};
 use crate::pijul::{LogEntry, Pijul, Signer};
 
 pub struct Settings {
@@ -22,6 +22,7 @@ pub struct Settings {
     pub main: String,
     pub model_url: String,
     pub model: String,
+    pub model_api: Api,
     pub policy: String,
     protected: Vec<String>,
     max_change_chars: usize,
@@ -38,6 +39,9 @@ impl Settings {
             model_url: env::var("PATCHGATE_MODEL_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into()),
             model: env::var("PATCHGATE_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".into()),
+            model_api: env::var("PATCHGATE_MODEL_API")
+                .unwrap_or_else(|_| "openai".into())
+                .parse()?,
             policy: env::var("PATCHGATE_POLICY").unwrap_or_else(|_| "POLICY.md".into()),
             protected: env::var("PATCHGATE_PROTECTED")
                 .unwrap_or_default()
@@ -276,7 +280,12 @@ impl Gate {
         Ok(Self {
             pijul: Pijul::new(settings.repo.clone()),
             signer: Signer::new(ledger.directory.clone()),
-            model: Model::new(&settings.model_url, &settings.model, settings.timeout)?,
+            model: Model::new(
+                &settings.model_url,
+                &settings.model,
+                settings.timeout,
+                settings.model_api,
+            )?,
             protected,
             settings,
             ledger,
