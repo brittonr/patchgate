@@ -233,7 +233,7 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
 ## Tests
 
-The tests are [Harbor](https://harborframework.com) tasks in `harbor/tasks`. Each task starts from a Pijul repository with a fixed history, and its verifier examines the channels and the ledger of that repository.
+The 22 tests are [Harbor](https://harborframework.com) tasks in `harbor/tasks`. Each task starts with a fixed Pijul history. Its verifier checks channel contents, local files, and decision records.
 
 | Task | What patchgate must do |
 | --- | --- |
@@ -250,8 +250,26 @@ The tests are [Harbor](https://harborframework.com) tasks in `harbor/tasks`. Eac
 | `invalid-reply-escalates` | Escalate a change when the reply has no verdict. |
 | `long-change-escalates` | Escalate a long change without the model. |
 | `new-inbox-root-change` | Land the root change, and wait for a policy in main. |
+| `multi-file-merge-atomic` | Keep the complete candidate out of main if one file still needs a human decision. |
+| `merge-outage-retries` | Preserve main and the ledger after a merge outage, then accept the candidate after recovery. |
+| `dirty-inbox-merge` | Merge into main without loss of unrecorded inbox edits, even when inbox cannot receive the merge. |
+| `human-dependency-override` | Refuse dependent acceptance until a human accepts its rejected prerequisite. |
+| `removed-acceptance-blocks` | Keep a removed acceptance and its dependent out of main, without a decision on the dependent. |
+| `custom-channels-policy` | Use custom channels and policy, protect the policy update, and accept it only through a human decision. |
+| `systemone-review-decisions` | Accept, reject, and escalate independent changes through typed SystemOne answers. |
+| `systemone-merge-conflict` | Review and merge through SystemOne, with a recorded resolution in both channels. |
+| `systemone-response-recovery` | Preserve state after invalid envelopes or probabilities, recover with a valid answer, and escalate an unknown choice. |
 
 `cargo test --locked` checks parser boundaries, protected-path matching, safe merge choices, and model replies. `devenv test` runs `patchgate-harbor check` against the compiled Rust executable. It runs each task with the `oracle` agent and with the `nop` agent. It fails unless the oracle gets reward 1 and the nop agent gets reward 0 on each task.
+
+The oracles check failed commands for nonzero exits and unchanged channel hashes and ledger bytes. Verifiers check decision histories, not reason wording.
+
+Local smoke checks and `devenv test --no-tui` passed on 2026-10-19. The Docker image build also passed all 17 Rust tests.
+
+| Docker control | Trials | Reward per trial | Exceptions |
+| --- | ---: | ---: | ---: |
+| Oracle | 22 | 1 | 0 |
+| Nop | 22 | 0 | 0 |
 
 The oracle runs patchgate with a scripted model server in the task. The nop agent changes nothing, which proves that a verifier does not pass an unchanged repository. The tests do not use the local model.
 

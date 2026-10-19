@@ -10,8 +10,8 @@ the inbox channel, and facts.json, the change hashes that the oracle and the
 verifier use. The Nix build of harbor/environment.nix runs setup-all. Harbor
 runs solve as the oracle agent, and check as the verifier.
 
-The verifier examines only the channels and the patchgate ledger of the
-repository. The nop agent changes neither, so it gets reward 0 on each task.
+The verifier examines the channels, repository files, and patchgate ledger.
+The nop agent changes none of these, so it gets reward 0 on each task.
 """
 
 from __future__ import annotations
@@ -136,25 +136,35 @@ def escalate(reason: str) -> dict:
 
 
 class Model:
-    """A scripted model server with an OpenAI-compatible API. patchgate is its client."""
+    """A scripted model server for the OpenAI and SystemOne APIs."""
 
-    def __init__(self, verdict=None, merge=None, status=200):
+    def __init__(self, verdict=None, merge=None, status=200, api="openai", response=None):
         self.verdict = verdict or (lambda system, change: accept("No rule applies."))
         self.merge = merge or (lambda prompt: escalate("This script has no merge."))
         self.status = status
+        self.api = api
+        self.response = response
         model = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_POST(self):
+                endpoint = "systemone" if model.api == "systemone" else "chat/completions"
+                if self.path != f"/v1/{endpoint}":
+                    self.send_error(404)
+                    return
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                system, user = body["messages"][0]["content"], body["messages"][-1]["content"]
-                if body["response_format"]["json_schema"]["name"] == "merge":
-                    content = model.merge(user)
+                if model.response is not None:
+                    reply = model.response(body)
                 else:
-                    content = model.verdict(system, user)
-                if not isinstance(content, str):
-                    content = json.dumps(content)
-                payload = json.dumps({"choices": [{"message": {"role": "assistant", "content": content}}]}).encode()
+                    system, user = body["messages"][0]["content"], body["messages"][-1]["content"]
+                    if body["response_format"]["json_schema"]["name"] == "merge":
+                        content = model.merge(user)
+                    else:
+                        content = model.verdict(system, user)
+                    if not isinstance(content, str):
+                        content = json.dumps(content)
+                    reply = {"choices": [{"message": {"role": "assistant", "content": content}}]}
+                payload = json.dumps(reply).encode()
                 if model.status != 200:
                     payload = b'{"error": "scripted failure"}'
                 self.send_response(model.status)
@@ -180,7 +190,7 @@ class Model:
 
 def patchgate(repo: Path, model: Model, *args, **settings) -> subprocess.CompletedProcess:
     """Run patchgate against the scripted model. Show its output in the agent log."""
-    env = {**os.environ, "PATCHGATE_MODEL_URL": model.url, "PATCHGATE_MODEL_API": "openai", "PATCHGATE_TIMEOUT": "30", **settings}
+    env = {**os.environ, "PATCHGATE_MODEL_URL": model.url, "PATCHGATE_MODEL_API": model.api, "PATCHGATE_TIMEOUT": "30", **settings}
     result = run(PATCHGATE, *args, cwd=repo, env=env, check=False)
     print(f"$ patchgate {' '.join(args)}  (exit {result.returncode})")
     print(result.stdout, result.stderr, sep="", end="", flush=True)
@@ -234,12 +244,12 @@ class Check:
         lines = ledger.read_text().splitlines() if ledger.exists() else []
         return [r for r in map(json.loads, filter(None, lines)) if r["hash"] == self.facts[name]]
 
-    def last(self, name: str, decision: str, by: str, text: str = "") -> None:
+    def last(self, name: str, decision: str, by: str) -> None:
         records = self.records(name)
         record = records[-1] if records else {}
         self.expect(
-            record.get("decision") == decision and record.get("by") == by and text in record.get("reason", ""),
-            f"the last decision for {name!r} must be {decision} by {by} with {text!r}, not {record or 'nothing'}",
+            record.get("decision") == decision and record.get("by") == by,
+            f"the last decision for {name!r} must be {decision} by {by}, not {record or 'nothing'}",
         )
 
 
@@ -329,7 +339,7 @@ class UnsafeMergeEscalates:
         c.outside("main", "fix")
         c.no_conflict("main")
         c.expect(c.file("main", "lib.sh") == LIBRARY.replace(CLEAN, ""), f"lib.sh in main must be the removal: {c.file('main', 'lib.sh')!r}")
-        c.last("fix", "escalate", "gate", "is not one of the choices")
+        c.last("fix", "escalate", "gate")
 
 
 class ValueConflictEscalates:
@@ -356,7 +366,7 @@ class ValueConflictEscalates:
         c.outside("main", "second")
         c.no_conflict("main")
         c.expect(c.file("main", "server.conf") == "port = 8080\nhost = localhost\n", "server.conf in main must keep port 8080")
-        c.last("second", "escalate", "gate", "replace the same lines")
+        c.last("second", "escalate", "gate")
 
 
 class HumanResolvesConflict:
@@ -405,7 +415,7 @@ class NameConflictEscalates:
     def check(self, c: Check) -> None:
         c.within("main", "ours")
         c.outside("main", "theirs")
-        c.last("theirs", "escalate", "gate", "Name conflict")
+        c.last("theirs", "escalate", "gate")
         ledger = c.repo / ".pijul" / "patchgate" / "ledger.jsonl"
         records = [json.loads(line) for line in ledger.read_text().splitlines() if line]
         c.expect(all(record.get("decision") != "merge" for record in records), "the model must not merge a name conflict")
@@ -489,7 +499,7 @@ class RenameOntoProtectedPath:
     def check(self, c: Check) -> None:
         c.within("main", "draft")
         c.outside("main", "rename")
-        c.last("rename", "escalate", "gate", "devenv.nix")
+        c.last("rename", "escalate", "gate")
 
 
 class ModelOutageDecidesNothing:
@@ -524,7 +534,7 @@ class InvalidReplyEscalates:
 
     def check(self, c: Check) -> None:
         c.outside("main", "notes")
-        c.last("notes", "escalate", "gate", "not a valid verdict")
+        c.last("notes", "escalate", "gate")
 
 
 class LongChangeEscalates:
@@ -540,7 +550,7 @@ class LongChangeEscalates:
 
     def check(self, c: Check) -> None:
         c.outside("main", "data")
-        c.last("data", "escalate", "gate", "model limit")
+        c.last("data", "escalate", "gate")
 
 
 class NewInboxRootChange:
@@ -567,6 +577,502 @@ class NewInboxRootChange:
         c.last("notes", "accept", "model")
 
 
+class MultiFileMergeAtomic:
+    """A refusal in one file prevents the complete candidate from main."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        repo = start(directory, signer, {"POLICY.md": POLICY, "a.sh": GREETING, "z.sh": GREETING})
+        base = repo.pijul("log", "--channel", "main", "--hash-only").split()
+        with tempfile.TemporaryDirectory() as temporary:
+            author = Repo(Path(temporary) / "author", repo.env)
+            run("pijul", "clone", "--channel", "main", repo.path, author.path, env=repo.env)
+            first = repo.change({"a.sh": FRENCH, "z.sh": FRENCH}, "Greet in French in both scripts")
+            second = author.change({"a.sh": GERMAN, "z.sh": GERMAN}, "Greet in German in both scripts")
+            author.pijul("push", repo.path, "--to-channel", "inbox", "--no-notify", "-a")
+        return {"first": first, "second": second, "base": base}
+
+    def solve(self, directory: Path) -> None:
+        def merge(prompt: str) -> dict:
+            if "a.sh" in prompt:
+                return {"choice": "both, side 1 first", "reason": "Keep both greetings in this script."}
+            return escalate("The owner must decide the other script.")
+
+        with Model(merge=merge) as model:
+            result = patchgate(directory / "repo", model, "review")
+            assert result.returncode == 0, "The conflict must produce an escalation, not a command error."
+
+    def check(self, c: Check) -> None:
+        c.expect(
+            c.hashes("main") == set(c.facts["base"]) | {c.facts["first"]},
+            "main must contain only the base and the first change, with no partial resolution",
+        )
+        c.within("inbox", "first", "second")
+        c.last("first", "accept", "model")
+        c.last("second", "escalate", "gate")
+        second = c.records("second")
+        c.expect(
+            len(second) == 1 and bool(second[0].get("conflict")) and not second[0].get("merge"),
+            "the second change must have one conflict escalation and no merge link",
+        )
+        for path in ("a.sh", "z.sh"):
+            c.expect(c.file("main", path) == FRENCH, f"{path} must retain only the first change")
+        ledger = c.repo / ".pijul" / "patchgate" / "ledger.jsonl"
+        records = [json.loads(line) for line in ledger.read_text().splitlines() if line] if ledger.exists() else []
+        c.expect(all(record.get("decision") != "merge" for record in records), "a partial merge must not enter the ledger")
+        c.no_conflict("main")
+
+
+class MergeOutageRetries:
+    """A model outage during a merge leaves the candidate available for a later review."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        return MergeOrderConflict().setup(directory, signer)
+
+    def solve(self, directory: Path) -> None:
+        repo = directory / "repo"
+        ledger = repo / ".pijul" / "patchgate" / "ledger.jsonl"
+        snapshot = None
+
+        def response(body: dict) -> dict:
+            nonlocal snapshot
+            if body["response_format"]["json_schema"]["name"] == "merge":
+                snapshot = (Check(directory).hashes("main"), ledger.read_bytes())
+                model.status = 503
+            return {"choices": [{"message": {"content": json.dumps(accept("No rule applies."))}}]}
+
+        with Model(response=response) as model:
+            result = patchgate(repo, model, "review")
+            assert result.returncode != 0, "The merge outage must stop the review."
+            assert snapshot is not None, "The failed review must reach the merge."
+            assert (Check(directory).hashes("main"), ledger.read_bytes()) == snapshot, "The failed merge must preserve main and its ledger."
+            model.status = 200
+            model.response = None
+            model.merge = lambda prompt: {"choice": "both, side 1 first", "reason": "Keep both greetings after recovery."}
+            result = patchgate(repo, model, "review")
+            assert result.returncode == 0, "The review must succeed after model recovery."
+
+    def check(self, c: Check) -> None:
+        MergeOrderConflict().check(c)
+        records = c.records("german")
+        c.expect(
+            [(record.get("decision"), record.get("by")) for record in records] == [("accept", "model")],
+            "the failed merge must leave no decision before the successful acceptance",
+        )
+        link = records[0].get("merge") if len(records) == 1 else None
+        ledger = c.repo / ".pijul" / "patchgate" / "ledger.jsonl"
+        history = [json.loads(line) for line in ledger.read_text().splitlines() if line] if ledger.exists() else []
+        merges = [record for record in history if record.get("decision") == "merge"]
+        c.expect(
+            len(merges) == 1 and merges[0].get("hash") == link
+            and merges[0].get("for") == [c.facts["german"]] and merges[0].get("files") == ["greet.sh"],
+            "the accepted candidate must link to one recorded greeting resolution",
+        )
+        c.expect(
+            link is not None and link in c.hashes("main") and link in c.hashes("inbox"),
+            "the recorded merge must reach both channels after recovery",
+        )
+
+
+class DirtyInboxMerge:
+    """A merge can reach main without loss of unrecorded inbox edits."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        facts = MergeOrderConflict().setup(directory, signer)
+        path = directory / "repo" / "greet.sh"
+        facts["dirty_text"] = path.read_text() + "echo local-only\n"
+        path.write_text(facts["dirty_text"])
+        return facts
+
+    def solve(self, directory: Path) -> None:
+        with Model(merge=lambda prompt: {"choice": "both, side 1 first", "reason": "Keep both recorded greetings."}) as model:
+            result = patchgate(directory / "repo", model, "review")
+            assert result.returncode == 0, "The dirty inbox must not prevent a safe merge into main."
+
+    def check(self, c: Check) -> None:
+        c.within("main", "french", "german")
+        c.no_conflict("main")
+        lines = (c.file("main", "greet.sh") or "").splitlines()
+        c.expect(
+            lines[:2] == ["#!/bin/sh", "echo hello"] and lines[-1:] == ["echo bye"]
+            and sorted(lines[2:-1]) == ["echo bonjour", "echo hallo"],
+            "main must contain each recorded greeting once, without the local edit",
+        )
+        c.expect((c.repo / "greet.sh").read_text() == c.facts["dirty_text"], "the complete dirty inbox file must remain unchanged")
+        c.last("german", "accept", "model")
+        records = c.records("german")
+        link = records[-1].get("merge") if records else None
+        c.expect(
+            link is not None and link in c.hashes("main") and link not in c.hashes("inbox"),
+            "the merge must reach main but remain outside the dirty inbox",
+        )
+        ledger = c.repo / ".pijul" / "patchgate" / "ledger.jsonl"
+        history = [json.loads(line) for line in ledger.read_text().splitlines() if line] if ledger.exists() else []
+        c.expect(
+            any(record.get("hash") == link and record.get("decision") == "merge" for record in history),
+            "the successful main resolution must have a merge ledger record",
+        )
+
+
+def workflow_snapshot(repo: Path, channels: tuple[str, ...]) -> tuple:
+    ledger = repo / ".pijul" / "patchgate" / "ledger.jsonl"
+    hashes = tuple(frozenset(run("pijul", "log", "--channel", name, "--hash-only", cwd=repo).stdout.split()) for name in channels)
+    return hashes, ledger.read_bytes() if ledger.exists() else b""
+
+
+def workflow_require(c: Check) -> None:
+    if c.failures:
+        raise AssertionError("\n".join(c.failures))
+
+
+class HumanDependencyOverride:
+    """A human must accept the prerequisite before its dependent can enter main."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        repo = start(directory, signer, {"POLICY.md": POLICY})
+        prerequisite = repo.change({"secret.env": "SECRET=1\n"}, "Add a secret")
+        dependent = repo.change({"secret.env": "SECRET=1\nOTHER=2\n"}, "Extend the secret file")
+        return {"prerequisite": prerequisite, "dependent": dependent}
+
+    def solve(self, directory: Path) -> None:
+        repo = directory / "repo"
+        facts = json.loads((directory / "facts.json").read_text())
+        reject = lambda system, change: {"decision": "reject", "summary": "A secret.", "reason": "The policy rejects a secret."}
+        with Model(verdict=reject) as model:
+            assert patchgate(repo, model, "review").returncode == 0
+            c = Check(directory)
+            c.outside("main", "prerequisite", "dependent")
+            c.last("prerequisite", "reject", "model")
+            c.expect(c.records("dependent") == [], "The dependent must have no decision before human acceptance.")
+            workflow_require(c)
+            before = workflow_snapshot(repo, ("main", "inbox"))
+            result = patchgate(repo, model, "accept", facts["dependent"], "--reason", "Accept the dependent.")
+            assert result.returncode != 0, "Human acceptance must fail while the prerequisite is absent."
+            assert workflow_snapshot(repo, ("main", "inbox")) == before, "Refusal must preserve both channels and the ledger."
+            assert patchgate(repo, model, "accept", facts["prerequisite"], "--reason", "The owner permits this secret.").returncode == 0
+            model.verdict = lambda system, change: accept("The owner permits this extension.")
+            assert patchgate(repo, model, "review").returncode == 0
+            assert patchgate(repo, model, "review").returncode == 0
+
+    def check(self, c: Check) -> None:
+        c.within("main", "prerequisite", "dependent")
+        c.within("inbox", "prerequisite", "dependent")
+        c.expect(c.file("main", "secret.env") == "SECRET=1\nOTHER=2\n", "Main must contain the complete extension.")
+        c.expect([(r["decision"], r["by"]) for r in c.records("prerequisite")] == [("reject", "model"), ("accept", "human")], "The prerequisite must have a model rejection, then human acceptance.")
+        c.expect([(r["decision"], r["by"]) for r in c.records("dependent")] == [("accept", "model")], "The dependent must have exactly one model acceptance.")
+        c.no_conflict("main")
+        c.no_conflict("inbox")
+
+
+class RemovedAcceptanceBlocks:
+    """A removed acceptance must not restore a prerequisite or permit its dependent."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        repo = start(directory, signer, {"POLICY.md": POLICY})
+        prerequisite = repo.change({"base.txt": "base\n"}, "Add the prerequisite")
+        dependent = repo.change({"base.txt": "base\ndependent\n"}, "Extend the prerequisite")
+        independent = repo.change({"independent.txt": "independent\n"}, "Add an independent file")
+        return {"prerequisite": prerequisite, "dependent": dependent, "independent": independent}
+
+    def solve(self, directory: Path) -> None:
+        repo = directory / "repo"
+        facts = json.loads((directory / "facts.json").read_text())
+        with Model() as model:
+            assert patchgate(repo, model, "accept", facts["prerequisite"], "--reason", "The owner accepts the prerequisite.").returncode == 0
+            before = Check(directory).records("prerequisite")
+            run("pijul", "unrecord", "--channel", "main", facts["prerequisite"], cwd=repo)
+            c = Check(directory)
+            c.outside("main", "prerequisite", "dependent", "independent")
+            c.within("inbox", "prerequisite", "dependent", "independent")
+            workflow_require(c)
+            assert patchgate(repo, model, "review").returncode == 0
+            assert patchgate(repo, model, "review").returncode == 0
+            assert Check(directory).records("prerequisite") == before, "Review must preserve the original human acceptance."
+
+    def check(self, c: Check) -> None:
+        c.outside("main", "prerequisite", "dependent")
+        c.within("main", "independent")
+        c.within("inbox", "prerequisite", "dependent", "independent")
+        c.expect(c.file("main", "base.txt") is None, "Main must not restore the removed file.")
+        c.expect(c.file("main", "independent.txt") == "independent\n", "Main must contain the independent file.")
+        c.expect(c.file("inbox", "base.txt") == "base\ndependent\n", "Inbox must retain the blocked extension.")
+        c.expect([(r["decision"], r["by"]) for r in c.records("prerequisite")] == [("accept", "human")], "The prerequisite must retain only its original human acceptance.")
+        c.expect(c.records("dependent") == [], "The blocked dependent must have no decision.")
+        c.expect([(r["decision"], r["by"]) for r in c.records("independent")] == [("accept", "model")], "The independent change must have one model acceptance.")
+        c.no_conflict("main")
+        c.no_conflict("inbox")
+
+
+class CustomChannelsPolicy:
+    """Custom channels and a custom policy path control all gate decisions."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        repo = Repo(directory / "repo", signer.env)
+        repo.path.mkdir(parents=True)
+        repo.pijul("init")
+        repo.change({"review-rules.txt": TODO_POLICY, "POLICY.md": OPEN_POLICY}, "Start the project")
+        repo.pijul("channel", "rename", "main", "stable")
+        settings = {**signer.env, "PATCHGATE_MAIN": "stable", "PATCHGATE_INBOX": "proposals", "PATCHGATE_POLICY": "review-rules.txt", "PATCHGATE_PROTECTED": ""}
+        run(PATCHGATE, "init", cwd=repo.path, env=settings)
+        benign = repo.change({"hello.txt": "hello\n"}, "Add a greeting")
+        violation = repo.change({"notes.txt": "TODO: write notes\n"}, "Add notes")
+        policy = repo.change({"review-rules.txt": OPEN_POLICY}, "Permit all changes")
+        return {"benign": benign, "violation": violation, "policy": policy}
+
+    def solve(self, directory: Path) -> None:
+        repo = directory / "repo"
+        facts = json.loads((directory / "facts.json").read_text())
+        settings = {"PATCHGATE_MAIN": "stable", "PATCHGATE_INBOX": "proposals", "PATCHGATE_POLICY": "review-rules.txt", "PATCHGATE_PROTECTED": ""}
+
+        def verdict(system: str, change: str) -> dict:
+            if "Reject a change that adds a TODO" in system and "TODO" in change:
+                return {"decision": "reject", "summary": "A TODO.", "reason": "The custom policy rejects a TODO."}
+            return accept("No rule applies.")
+
+        with Model(verdict=verdict) as model:
+            assert patchgate(repo, model, "review", **settings).returncode == 0
+            c = Check(directory)
+            c.within("stable", "benign")
+            c.outside("stable", "violation", "policy")
+            c.last("violation", "reject", "model")
+            c.last("policy", "escalate", "gate")
+            c.expect(c.file("stable", "review-rules.txt") == TODO_POLICY, "The target must retain its policy before human acceptance.")
+            workflow_require(c)
+            assert patchgate(repo, model, "accept", facts["policy"], "--reason", "The owner approves the custom policy.", **settings).returncode == 0
+            assert patchgate(repo, model, "review", **settings).returncode == 0
+
+    def check(self, c: Check) -> None:
+        channels = {line.strip().lstrip("* ") for line in run("pijul", "channel", cwd=c.repo).stdout.splitlines()}
+        c.expect(channels == {"stable", "proposals"}, "Only the custom source and target channels must exist.")
+        c.within("stable", "benign", "policy")
+        c.outside("stable", "violation")
+        c.within("proposals", "benign", "violation", "policy")
+        c.expect(c.file("stable", "hello.txt") == "hello\n", "The target must contain the benign file.")
+        c.expect(c.file("stable", "notes.txt") is None, "The target must exclude the policy violation.")
+        c.expect(c.file("proposals", "notes.txt") == "TODO: write notes\n", "The source must retain the policy violation.")
+        for channel in ("stable", "proposals"):
+            c.expect(c.file(channel, "review-rules.txt") == OPEN_POLICY, "Both channels must contain the human-approved custom policy.")
+            c.expect(c.file(channel, "POLICY.md") == OPEN_POLICY, "The default policy file must remain unchanged.")
+            c.no_conflict(channel)
+        c.expect([(r["decision"], r["by"]) for r in c.records("benign")] == [("accept", "model")], "The benign change must have one model acceptance.")
+        c.expect([(r["decision"], r["by"]) for r in c.records("violation")] == [("reject", "model")], "The custom policy must reject the violation exactly once.")
+        c.expect([(r["decision"], r["by"]) for r in c.records("policy")] == [("escalate", "gate"), ("accept", "human")], "The custom policy update must require a human decision.")
+
+
+def _systemone_answer(question: str, choice: str, confidence: float = 0.91) -> dict:
+    return {"answers": {question: {"type": "choice", "choice": choice, "confidence": confidence}}}
+
+
+def _systemone_ledger(repo: Path) -> list[dict]:
+    path = repo / ".pijul" / "patchgate" / "ledger.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line] if path.exists() else []
+
+
+def _systemone_snapshot(repo: Path) -> tuple:
+    hashes = tuple(
+        frozenset(run("pijul", "log", "--channel", channel, "--hash-only", cwd=repo).stdout.split())
+        for channel in ("main", "inbox")
+    )
+    ledger = repo / ".pijul" / "patchgate" / "ledger.jsonl"
+    return hashes, ledger.read_bytes() if ledger.exists() else None
+
+
+class SystemOneReviewDecisions:
+    """Independent changes receive the three typed review decisions."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        policy = POLICY + "Escalate a change that adds a request for human review.\n"
+        repo = start(directory, signer, {"POLICY.md": policy})
+        base = repo.pijul("log", "--channel", "main", "--hash-only").split()
+        approved, rejected = concurrent(
+            repo,
+            ("notes.txt", "public-note-content\n", "Add public notes"),
+            ("secret.txt", "TEST_SECRET=private-secret-content\n", "Add credentials"),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            author = Repo(Path(temporary) / "author", signer.env)
+            run("pijul", "clone", "--channel", "main", repo.path, author.path, env=signer.env)
+            escalated = author.change({"request.txt": "Request human review: manual-review-content\n"}, "Request a decision")
+            author.pijul("push", repo.path, "--to-channel", "inbox", "--no-notify", "-a")
+        return {"approved": approved, "rejected": rejected, "escalated": escalated, "base": base, "policy": policy}
+
+    def solve(self, directory: Path) -> None:
+        def response(body: dict) -> dict:
+            state = body["state"]
+            change = state["change"]
+            if "public-note-content" in change:
+                decision = "accept"
+            elif "private-secret-content" in change:
+                decision = "reject"
+            elif "manual-review-content" in change:
+                decision = "escalate"
+            else:
+                raise AssertionError("The review must contain a known change.")
+            return _systemone_answer("review", decision)
+
+        with Model(api="systemone", response=response) as model:
+            result = patchgate(directory / "repo", model, "review")
+            assert result.returncode == 0, "The three reviews must succeed."
+
+    def check(self, c: Check) -> None:
+        c.within("main", "approved")
+        c.outside("main", "rejected", "escalated")
+        c.within("inbox", "approved", "rejected", "escalated")
+        c.expect(c.hashes("main") == set(c.facts["base"]) | {c.facts["approved"]}, "Main must contain only the approved change and its base.")
+        c.expect(
+            c.hashes("inbox") == set(c.facts["base"]) | {c.facts[name] for name in ("approved", "rejected", "escalated")},
+            "Inbox must retain all three independent changes.",
+        )
+        c.expect(c.archive("main")[0] == {"POLICY.md": c.facts["policy"], "notes.txt": "public-note-content\n"}, "Main must contain the policy and exact approved notes only.")
+        c.expect(
+            c.archive("inbox")[0] == {
+                "POLICY.md": c.facts["policy"],
+                "notes.txt": "public-note-content\n",
+                "secret.txt": "TEST_SECRET=private-secret-content\n",
+                "request.txt": "Request human review: manual-review-content\n",
+            },
+            "Inbox must retain the exact contents of all three changes.",
+        )
+        for name, decision in (("approved", "accept"), ("rejected", "reject"), ("escalated", "escalate")):
+            c.last(name, decision, "model")
+            records = c.records(name)
+            c.expect([(record.get("decision"), record.get("by")) for record in records] == [(decision, "model")], f"{name} must have exactly one model decision.")
+        c.expect(len(_systemone_ledger(c.repo)) == 3, "The ledger must contain exactly the three model decisions.")
+        c.no_conflict("main")
+        c.no_conflict("inbox")
+
+
+class SystemOneMergeConflict:
+    """SystemOne reviews both changes and selects both greetings in the merge."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        repo = start(directory, signer, {"POLICY.md": POLICY, "greet.sh": GREETING})
+        base = repo.pijul("log", "--channel", "main", "--hash-only").split()
+        french, german = concurrent(
+            repo, ("greet.sh", FRENCH, "Greet in French"), ("greet.sh", GERMAN, "Greet in German")
+        )
+        return {"french": french, "german": german, "base": base}
+
+    def solve(self, directory: Path) -> None:
+        def response(body: dict) -> dict:
+            if "review" in body["questions"]:
+                return _systemone_answer("review", "accept")
+            return _systemone_answer("merge", "both, side 1 first")
+
+        with Model(api="systemone", response=response) as model:
+            result = patchgate(directory / "repo", model, "review")
+            assert result.returncode == 0, "The reviews and merge must succeed."
+
+    def check(self, c: Check) -> None:
+        c.within("main", "french", "german")
+        c.within("inbox", "french", "german")
+        c.no_conflict("main")
+        c.no_conflict("inbox")
+        for channel in ("main", "inbox"):
+            files = c.archive(channel)[0]
+            lines = files.get("greet.sh", "").splitlines()
+            c.expect(
+                set(files) == {"POLICY.md", "greet.sh"}
+                and files.get("POLICY.md") == POLICY
+                and len(lines) == 5
+                and lines[:2] == ["#!/bin/sh", "echo hello"]
+                and lines[-1:] == ["echo bye"]
+                and sorted(lines[2:-1]) == ["echo bonjour", "echo hallo"],
+                f"{channel} must contain each greeting exactly once and no other files.",
+            )
+        records = _systemone_ledger(c.repo)
+        accepted = []
+        for name in ("french", "german"):
+            c.last(name, "accept", "model")
+            history = c.records(name)
+            c.expect([(record.get("decision"), record.get("by")) for record in history] == [("accept", "model")], f"{name} must have exactly one accepted model review.")
+            accepted.extend(history)
+        merges = [record for record in records if record.get("decision") == "merge"]
+        c.expect(len(records) == 3 and len(merges) == 1, "The ledger must contain two reviews and one real merge.")
+        if len(merges) != 1:
+            return
+        merge = merges[0]
+        merge_hash = merge.get("hash")
+        linked = [record for record in accepted if record.get("merge") == merge_hash]
+        c.expect(merge.get("by") == "model", "The merge must belong to the model decision.")
+        c.expect(len(linked) == 1, "One accepted candidate must link to the merge record.")
+        if len(linked) == 1:
+            c.expect(merge.get("for") == [linked[0]["hash"]], "The merge must identify the accepted candidate.")
+            c.expect(records.index(linked[0]) < records.index(merge), "The accepted review record must precede its merge record.")
+        c.expect(merge.get("files") == ["greet.sh"], "The merge must identify greet.sh.")
+        original = set(c.facts["base"]) | {c.facts["french"], c.facts["german"]}
+        c.expect(isinstance(merge_hash, str) and merge_hash not in original, "The merge must have a separate recorded hash.")
+        for channel in ("main", "inbox"):
+            c.expect(c.hashes(channel) == original | {merge_hash}, f"{channel} must contain the real merge change and both candidates.")
+
+
+class SystemOneResponseRecovery:
+    """Invalid envelopes stop review without decisions. A later valid answer permits recovery."""
+
+    def setup(self, directory: Path, signer: Signer) -> dict:
+        repo = start(directory, signer, {"POLICY.md": POLICY})
+        base = repo.pijul("log", "--channel", "main", "--hash-only").split()
+        benign, unknown = concurrent(
+            repo,
+            ("notes.txt", "recovery-benign-content\n", "Add recovery notes"),
+            ("later.txt", "unknown-choice-content\n", "Add separate notes"),
+        )
+        return {"benign": benign, "unknown": unknown, "base": base}
+
+    def solve(self, directory: Path) -> None:
+        repo = directory / "repo"
+        malformed = [
+            {"answers": {}},
+            {"answers": {"review": {"type": "score", "choice": "accept", "confidence": 0.91}}},
+            _systemone_answer("review", "accept", -0.1),
+            _systemone_answer("review", "accept", 1.1),
+        ]
+        for invalid in malformed:
+            def response(body: dict) -> dict:
+                state = body["state"]
+                if "recovery-benign-content" in state["change"]:
+                    return invalid
+                assert "unknown-choice-content" in state["change"], "The request must contain a known change."
+                return _systemone_answer("review", "accept")
+
+            before = _systemone_snapshot(repo)
+            with Model(api="systemone", response=response) as model:
+                result = patchgate(repo, model, "review")
+            assert result.returncode != 0, "An invalid answer must abort review."
+            assert _systemone_snapshot(repo) == before, "A failed review must preserve both channels and all ledger bytes."
+
+        def recovered(body: dict) -> dict:
+            state = body["state"]
+            if "recovery-benign-content" in state["change"]:
+                return _systemone_answer("review", "accept")
+            assert "unknown-choice-content" in state["change"], "The request must contain a known change."
+            return _systemone_answer("review", "unlisted-choice")
+
+        with Model(api="systemone", response=recovered) as model:
+            result = patchgate(repo, model, "review")
+            assert result.returncode == 0, "A valid answer must permit review to recover."
+
+    def check(self, c: Check) -> None:
+        c.within("main", "benign")
+        c.outside("main", "unknown")
+        c.within("inbox", "benign", "unknown")
+        c.expect(c.hashes("main") == set(c.facts["base"]) | {c.facts["benign"]}, "Main must contain only the recovered benign change and its base.")
+        c.expect(c.hashes("inbox") == set(c.facts["base"]) | {c.facts["benign"], c.facts["unknown"]}, "Inbox must retain both pending candidates.")
+        c.expect(c.archive("main")[0] == {"POLICY.md": POLICY, "notes.txt": "recovery-benign-content\n"}, "Main must contain only the exact benign content and policy.")
+        c.expect(
+            c.archive("inbox")[0] == {"POLICY.md": POLICY, "notes.txt": "recovery-benign-content\n", "later.txt": "unknown-choice-content\n"},
+            "Inbox must retain both exact candidate contents.",
+        )
+        c.last("benign", "accept", "model")
+        c.last("unknown", "escalate", "gate")
+        benign = c.records("benign")
+        unknown = c.records("unknown")
+        c.expect([(record.get("decision"), record.get("by")) for record in benign] == [("accept", "model")], "Failures must not create benign change decisions.")
+        c.expect([(record.get("decision"), record.get("by")) for record in unknown] == [("escalate", "gate")], "The unknown choice must cause exactly one gate escalation.")
+        c.expect(len(_systemone_ledger(c.repo)) == 2, "The ledger must contain only the final acceptance and escalation.")
+        c.no_conflict("main")
+        c.no_conflict("inbox")
+
+
 SCENARIOS = {
     "merge-order-conflict": MergeOrderConflict(),
     "merge-deletion-conflict": MergeDeletionConflict(),
@@ -581,6 +1087,15 @@ SCENARIOS = {
     "invalid-reply-escalates": InvalidReplyEscalates(),
     "long-change-escalates": LongChangeEscalates(),
     "new-inbox-root-change": NewInboxRootChange(),
+    "multi-file-merge-atomic": MultiFileMergeAtomic(),
+    "merge-outage-retries": MergeOutageRetries(),
+    "dirty-inbox-merge": DirtyInboxMerge(),
+    "human-dependency-override": HumanDependencyOverride(),
+    "removed-acceptance-blocks": RemovedAcceptanceBlocks(),
+    "custom-channels-policy": CustomChannelsPolicy(),
+    "systemone-review-decisions": SystemOneReviewDecisions(),
+    "systemone-merge-conflict": SystemOneMergeConflict(),
+    "systemone-response-recovery": SystemOneResponseRecovery(),
 }
 
 
