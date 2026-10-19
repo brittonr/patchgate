@@ -1,5 +1,10 @@
 *
 !devenv.lock
-!patchgate.py
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!nix/
+!nix/package.nix
 !harbor/environment.nix
 !harbor/scenarios.py

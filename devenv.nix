@@ -6,11 +6,21 @@
 }:
 
 {
-  # Pijul is the version control system. Python runs patchgate.
+  # Pijul stores changes. Cargo runs the Rust gate from the current source.
+  packages = [
+    pkgs.pijul
+    pkgs.openssh
+    pkgs.cargo
+    pkgs.rustc
   # <!-- ste-disable-next-line semicolon -->
-  packages = [ pkgs.pijul ];
+  ];
+  # Python runs only the Harbor tools.
   # <!-- ste-disable-next-line semicolon -->
   languages.python.enable = true;
+
+  # `devenv build` builds the same package as Harbor without a second shell build.
+  # <!-- ste-disable-next-line semicolon -->
+  outputs.patchgate = import ./nix/package.nix { inherit pkgs; };
 
   # patchgate sends each change to a model server with an OpenAI-compatible API.
   # LM Studio gives this API on port 1234. Ollama and llama.cpp also give it.
@@ -21,7 +31,7 @@
   # These files control the gate. A human must accept each change to them.
   # patchgate always protects POLICY.md.
   # <!-- ste-disable-next-line semicolon -->
-  env.PATCHGATE_PROTECTED = "patchgate.py,devenv.nix,devenv.yaml,devenv.lock,.envrc";
+  env.PATCHGATE_PROTECTED = "src/*,Cargo.toml,Cargo.lock,nix/*,devenv.nix,devenv.yaml,devenv.lock,.envrc,harbor/environment.nix,harbor/Dockerfile,.dockerignore";
 
   # <!-- ste-disable-next-line semicolon -->
   scripts.patchgate.description = "Let the local model merge conflicting inbox changes and decide which changes go into main";
@@ -30,7 +40,7 @@
   # <!-- ste-disable-next-line semicolon -->
   scripts.patchgate.packages = [ pkgs.openssh ];
   # <!-- ste-disable-next-line semicolon -->
-  scripts.patchgate.exec = ''exec python3 "$DEVENV_ROOT/patchgate.py" "$@"'';
+  scripts.patchgate.exec = ''exec cargo run --locked --quiet --manifest-path "$DEVENV_ROOT/Cargo.toml" -- "$@"'';
 
   # `devenv up` runs the gate. `devenv test` does not run it, because the gate changes main.
   # <!-- ste-disable-next-line semicolon -->

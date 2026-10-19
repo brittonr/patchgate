@@ -29,7 +29,7 @@ import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-PATCHGATE = Path(__file__).resolve().parents[1] / "patchgate.py"
+PATCHGATE = os.environ.get("PATCHGATE_BIN", "patchgate")
 REWARD = Path("/logs/verifier/reward.txt")
 
 POLICY = "# Review policy\n\nReject a change that adds a secret. Accept other changes.\n"
@@ -112,7 +112,7 @@ def start(directory: Path, signer: Signer, files: dict[str, str]) -> Repo:
     repo.pijul("init")
     if files:
         repo.change(files, "Start the project")
-    run(sys.executable, PATCHGATE, "init", cwd=repo.path, env=signer.env)
+    run(PATCHGATE, "init", cwd=repo.path, env=signer.env)
     return repo
 
 
@@ -181,7 +181,7 @@ class Model:
 def patchgate(repo: Path, model: Model, *args, **settings) -> subprocess.CompletedProcess:
     """Run patchgate against the scripted model. Show its output in the agent log."""
     env = {**os.environ, "PATCHGATE_MODEL_URL": model.url, "PATCHGATE_TIMEOUT": "30", **settings}
-    result = run(sys.executable, PATCHGATE, *args, cwd=repo, env=env, check=False)
+    result = run(PATCHGATE, *args, cwd=repo, env=env, check=False)
     print(f"$ patchgate {' '.join(args)}  (exit {result.returncode})")
     print(result.stdout, result.stderr, sep="", end="", flush=True)
     return result
@@ -406,8 +406,9 @@ class NameConflictEscalates:
         c.within("main", "ours")
         c.outside("main", "theirs")
         c.last("theirs", "escalate", "gate", "Name conflict")
-        ledger = (c.repo / ".pijul" / "patchgate" / "ledger.jsonl").read_text()
-        c.expect('"decision": "merge"' not in ledger, "the model must not merge a name conflict")
+        ledger = c.repo / ".pijul" / "patchgate" / "ledger.jsonl"
+        records = [json.loads(line) for line in ledger.read_text().splitlines() if line]
+        c.expect(all(record.get("decision") != "merge" for record in records), "the model must not merge a name conflict")
 
 
 class RejectedDependencyBlocks:

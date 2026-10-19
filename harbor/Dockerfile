@@ -9,7 +9,11 @@ COPY harbor/environment.nix /build/harbor/environment.nix
 
 RUN nix-build /build/harbor/environment.nix -A tools --option sandbox false --out-link /tools
 
-COPY patchgate.py /build/patchgate.py
+COPY Cargo.toml Cargo.lock /build/
+
+COPY src /build/src
+
+COPY nix/package.nix /build/nix/package.nix
 
 COPY harbor/scenarios.py /build/harbor/scenarios.py
 

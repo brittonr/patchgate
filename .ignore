@@ -5,6 +5,9 @@
 result
 result-*
 
+# Rust
+target/
+
 # devenv
 .devenv*
 devenv.local.nix

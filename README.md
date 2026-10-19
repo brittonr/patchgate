@@ -1,6 +1,6 @@
 # patchgate
 
-patchgate puts a local model in front of a [Pijul](https://pijul.org) repository. Authors and agents add changes to the `inbox` channel. The model reviews each change, and it merges the conflicts between changes. patchgate applies the result to the `main` channel, so `main` never has a conflict. Nobody records in `main` directly.
+patchgate is a Rust CLI for a [Pijul](https://pijul.org) repository. Authors and agents add changes to the `inbox` channel. The model reviews each change, and it merges the conflicts between changes. patchgate applies the result to the `main` channel, so `main` never has a conflict. Nobody records in `main` directly.
 
 ```mermaid
 flowchart LR
@@ -67,7 +67,7 @@ $ patchgate accept <hash of the change that you recorded>
 
 ## Models
 
-A model with more parameters merges better, but it is slower. These are the results of six reviews and three conflicts in the same repository, on an Apple M4 with 24 GB:
+These measurements use the former Python implementation, not the Rust port. They cover six reviews and three conflicts on an Apple M4 with 24 GB:
 
 | Model | Two greetings at one place | A deleted function that the other change edits | Two values for one port | Time |
 | --- | --- | --- | --- | --- |
@@ -76,11 +76,34 @@ A model with more parameters merges better, but it is slower. These are the resu
 
 LM Studio estimates that `qwen/qwen3.6-27b` needs 21 GiB, so its guardrails refuse that model on this machine. A thinking model on LM Studio can put its answer in `reasoning_content`, and patchgate reads that field when `content` is empty.
 
+### Model test queue
+
+The [Cloudflare CLEF collection](https://huggingface.co/collections/Cloudflare/clef) contains these models. Both tests remain queued. Neither model has a patchgate result yet.
+
+- [ ] Test [Cloudflare/clef](https://huggingface.co/Cloudflare/clef).
+- [ ] Test [Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash).
+
+For each model, test JSON verdicts, two greetings, safe deletion-conflict choices, and value-conflict escalation. Record the server, quantization, results, and elapsed time.
+
 ## Requirements
 
 - [devenv](https://devenv.sh) 2.4 or later.
 - A model server with an OpenAI-compatible API. The default is LM Studio at `http://127.0.0.1:1234/v1` with the model `google/gemma-4-e4b`. LM Studio loads the model when the first request comes.
 - An SSH agent with an Ed25519 key. `pijul record` signs each change with a key from the agent.
+
+## Build
+
+`devenv shell` supplies Rust, Cargo, Pijul, and OpenSSH. Python runs only the Harbor tools. The `patchgate` command uses `cargo run` against the current source.
+
+To build a release executable and run the Rust checks:
+
+```bash
+cargo build --locked --release
+./target/release/patchgate --help
+cargo test --locked
+```
+
+`devenv build` builds `outputs.patchgate` through `nix/package.nix`. Harbor uses that same package definition. Both builds use `Cargo.lock`. The executable needs Pijul and OpenSSH on `PATH`.
 
 ## Start
 
@@ -196,12 +219,16 @@ The tests are [Harbor](https://harborframework.com) tasks in `harbor/tasks`. Eac
 | `long-change-escalates` | Escalate a long change without the model. |
 | `new-inbox-root-change` | Land the root change, and wait for a policy in main. |
 
-`devenv test` runs `patchgate-harbor check`. It runs each task with the `oracle` agent and with the `nop` agent. It fails unless the oracle gets reward 1 and the nop agent gets reward 0 on each task. The oracle runs patchgate with a scripted model server in the task. The nop agent changes nothing, which proves that a verifier does not pass an unchanged repository. The tests do not use the local model.
+`cargo test --locked` checks parser boundaries, protected-path matching, safe merge choices, and model replies. `devenv test` runs `patchgate-harbor check` against the compiled Rust executable. It runs each task with the `oracle` agent and with the `nop` agent. It fails unless the oracle gets reward 1 and the nop agent gets reward 0 on each task.
+
+The oracle runs patchgate with a scripted model server in the task. The nop agent changes nothing, which proves that a verifier does not pass an unchanged repository. The tests do not use the local model.
 
 `patchgate-harbor` does these steps:
 
-1. It builds the image `patchgate-harbor:dev` from `harbor/Dockerfile`. The image builds `harbor/environment.nix` with the nixpkgs of `devenv.lock`, so the tasks use the same pijul and Python as the devenv shell. The Nix build runs `harbor/scenarios.py setup-all`, which makes the repository of each task.
-2. If Docker does not answer, it starts the Colima profile `patchgate`. Colima shares only the home directory with its virtual machine, and Harbor reads each reward through that share. Thus the Harbor jobs stay in `.devenv/state/harbor-jobs`. To use another Docker engine, set `DOCKER_HOST`. To stop the virtual machine, run `colima stop patchgate`.
+1. If Docker does not answer, it starts the Colima profile `patchgate`. Colima shares only the home directory with its virtual machine, and Harbor reads each reward through that share. Thus the Harbor jobs stay in `.devenv/state/harbor-jobs`. To use another Docker engine, set `DOCKER_HOST`. To stop the virtual machine, run `colima stop patchgate`.
+
+2. It builds the image `patchgate-harbor:dev` from `harbor/Dockerfile`. The image uses `nix/package.nix` and the nixpkgs revision in `devenv.lock`. The same Rust package runs the task setup and the oracle. The Nix build runs `harbor/scenarios.py setup-all`, which makes the repository of each task.
+
 3. It installs Harbor 0.24.0 from the hash-locked `harbor/requirements.txt` in `.devenv/state/harbor`.
 
 To run another Harbor agent on the tasks, give its options to `patchgate-harbor run`, for example `patchgate-harbor run --agent nop`. Each task also has `environment/default.nix` for the bubblewrap backend of Harbor. That backend runs only on Linux, so the Docker image is the environment on macOS.
