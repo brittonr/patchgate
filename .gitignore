@@ -1,0 +1,20 @@
+# Nix
+result
+result-*
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# Pijul keeps its repository in .pijul. Git does not track it.
+.pijul/
+
+# Python
+__pycache__/
+
+# macOS
+.DS_Store

@@ -1,0 +1,5 @@
+*
+!devenv.lock
+!patchgate.py
+!harbor/environment.nix
+!harbor/scenarios.py

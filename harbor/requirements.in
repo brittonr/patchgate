@@ -1,0 +1,4 @@
+# The Harbor command of the patchgate tasks. patchgate-harbor installs harbor/requirements.txt with uv.
+# To change the version, edit this file and compile it again:
+# uv pip compile --universal --generate-hashes --python-version 3.12 harbor/requirements.in -o harbor/requirements.txt
+harbor==0.24.0

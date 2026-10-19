@@ -1,0 +1,17 @@
+.git
+.DS_Store
+
+# Nix
+result
+result-*
+
+# devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# Python
+__pycache__/
