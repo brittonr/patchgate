@@ -42,6 +42,13 @@
   # <!-- ste-disable-next-line semicolon -->
   scripts.patchgate.exec = ''exec cargo run --locked --quiet --manifest-path "$DEVENV_ROOT/Cargo.toml" -- "$@"'';
 
+  # Rust handles the new scenarios, verifier controls, and live model jobs.
+  # <!-- ste-disable-next-line semicolon -->
+  scripts.patchgate-eval.description = "Evaluate Rust Harbor tasks";
+
+  # <!-- ste-disable-next-line semicolon -->
+  scripts.patchgate-eval.exec = ''exec cargo run --locked --quiet --manifest-path "$DEVENV_ROOT/Cargo.toml" --bin patchgate-eval -- "$@"'';
+
   # `devenv up` runs the gate. `devenv test` does not run it, because the gate changes main.
   # <!-- ste-disable-next-line semicolon -->
   processes.patchgate = lib.mkIf (!config.devenv.isTesting) { exec = "patchgate watch"; };

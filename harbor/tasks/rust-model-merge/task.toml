@@ -1,0 +1,16 @@
+schema_version = "1.4"
+artifacts = [{ source = "/scenarios/rust-model-merge/model-metrics.json", destination = "model-metrics.json" }]
+
+[metadata]
+coverage = "rust-model"
+
+[verifier]
+timeout_sec = 120.0
+
+[agent]
+timeout_sec = 900.0
+
+[environment]
+docker_image = "patchgate-harbor:dev"
+workdir = "/scenarios/rust-model-merge"
+build_timeout_sec = 900.0

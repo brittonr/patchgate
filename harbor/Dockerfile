@@ -19,7 +19,7 @@ COPY harbor/scenarios.py /build/harbor/scenarios.py
 
 # The rootfs files become real files that the agent can change.
 # The scripts of the tasks start with #!/bin/bash, and the base image has only /bin/sh.
-RUN nix-build /build/harbor/environment.nix -A default --option sandbox false --out-link /env && cp -RL /env/rootfs/. / && chmod -R u+w /opt/patchgate /scenarios && ln -sf /env/bin/bash /bin/bash
+RUN nix-build /build/harbor/environment.nix -A default --option sandbox false --out-link /env && cp -R /env/rootfs/. / && chmod -R u+w /opt/patchgate /scenarios && ln -sf /env/bin/bash /bin/bash
 
 ENV PATH=/env/bin:$PATH
 

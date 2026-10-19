@@ -14,9 +14,13 @@
 }:
 
 let
-  # Harbor needs Python and shell tools. patchgate needs Pijul and OpenSSH.
+  # Rust fixtures need a compiler, linker, and process tools.
   # <!-- ste-disable-next-line semicolon -->
-  tools = pkgs.buildEnv { name = "patchgate-harbor-tools"; paths = with pkgs; [ bashInteractive coreutils findutils gnugrep gnutar gzip openssh pijul python3 ]; };
+  rustTools = (with pkgs; [ cargo rustc stdenv.cc ]) ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.procps ];
+
+  # Harbor also retains the runtime of the older tasks.
+  # <!-- ste-disable-next-line semicolon -->
+  tools = pkgs.buildEnv { name = "patchgate-harbor-tools"; paths = (with pkgs; [ bashInteractive coreutils findutils gnugrep gnutar gzip openssh pijul python3 ]) ++ rustTools; };
 
   # The shared Rust package supplies the executable.
   # <!-- ste-disable-next-line semicolon -->
@@ -34,9 +38,10 @@ let
     mkdir -p $out/rootfs/opt
     cp -R ${project} $out/rootfs/opt/patchgate
     chmod -R u+w $out/rootfs/opt/patchgate
-    # The setup uses the same executable as the task runtime.
+    # Both runners use the compiled gate from the shared package.
+    HOME=$TMPDIR python3 ${project}/harbor/scenarios.py setup-all $out/rootfs/scenarios
     # <!-- ste-disable-next-line semicolon -->
-    HOME=$TMPDIR python3 ${project}/harbor/scenarios.py setup-all $out/rootfs/scenarios'';
+    HOME=$TMPDIR patchgate-eval setup-all $out/rootfs/scenarios'';
 in
 {
   # <!-- ste-disable-next-line semicolon -->

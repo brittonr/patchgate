@@ -3,6 +3,7 @@
 
     patchgate-harbor check           build the image, run the oracle and nop agents, and compare the rewards
     patchgate-harbor run [OPTIONS]   build the image, then run `harbor run` on harbor/tasks with OPTIONS
+    patchgate-harbor model OPTIONS  run the Rust live-model evaluation inside Harbor
                                      (default: --agent oracle)
 
 Docker runs in the Colima profile PATCHGATE_COLIMA_PROFILE (default: patchgate),
@@ -115,17 +116,28 @@ def check(env: dict) -> int:
         verdict = "ok" if reward == expected else f"WRONG, expected {expected}"
         print(f"{task:<{width}}  {agent:<6}  {reward!s:<8}  {verdict}")
     say(f"{len(rows) - wrong} of {len(rows)} control results are correct.")
-    return 1 if wrong else 0
+    if wrong:
+        return 1
+    return run(
+        "patchgate-eval", "verify-harbor", "--harbor", harbor(),
+        "--tasks", TASKS, "--jobs", STATE / "harbor-jobs", env=env, check=False,
+    ).returncode
 
 
 def main(argv: list[str]) -> int:
-    if not argv or argv[0] not in ("check", "run"):
+    if not argv or argv[0] not in ("check", "run", "model"):
         print(__doc__)
         return 2
     if Path.home() not in STATE.resolve().parents:
         say(f"warning: {STATE} is outside the home directory, so the Colima VM cannot see the Harbor jobs.")
     env = docker_env()
     run("docker", "build", "--tag", IMAGE, "--file", ROOT / "harbor" / "Dockerfile", ROOT, env=env)
+    if argv[0] == "model":
+        return run(
+            "patchgate-eval", "model-harbor", "--harbor", harbor(),
+            "--tasks", TASKS, "--jobs", STATE / "harbor-jobs", *argv[1:],
+            env=env, check=False,
+        ).returncode
     if argv[0] == "check":
         return check(env)
     job = harbor_run(env, "run", *(argv[1:] or ["--agent", "oracle"]))

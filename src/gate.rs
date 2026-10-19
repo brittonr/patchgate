@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
@@ -141,7 +141,7 @@ impl From<LogEntry> for Item {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Record {
     pub hash: String,
     pub decision: String,
@@ -189,7 +189,53 @@ impl Record {
     }
 }
 
+#[derive(Deserialize, Serialize)]
+struct Acceptance {
+    version: u32,
+    main: String,
+    inbox: String,
+    ledger_offset: u64,
+    leading_newline: bool,
+    records: Vec<Record>,
+}
+
+impl Acceptance {
+    fn bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        if self.leading_newline {
+            bytes.push(b'\n');
+        }
+        for record in &self.records {
+            serde_json::to_writer(&mut bytes, record)?;
+            bytes.push(b'\n');
+        }
+        Ok(bytes)
+    }
+
+    fn applied(&self, main: &HashSet<String>) -> Result<bool> {
+        let present = self
+            .records
+            .iter()
+            .filter(|record| main.contains(&record.hash))
+            .count();
+        if present != 0 && present != self.records.len() {
+            bail!(
+                "Only part of the durable acceptance transaction is in {}.",
+                self.main
+            );
+        }
+        Ok(present == self.records.len())
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path)?
+        .sync_all()
+        .with_context(|| path.display().to_string())
+}
+
 pub struct Ledger {
+    repo: PathBuf,
     directory: PathBuf,
     path: PathBuf,
 }
@@ -198,10 +244,28 @@ impl Ledger {
     fn new(repo: &Path) -> Self {
         let directory = repo.join(".pijul/patchgate");
         let path = directory.join("ledger.jsonl");
-        Self { directory, path }
+        Self {
+            repo: repo.into(),
+            directory,
+            path,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        for path in [
+            &self.directory,
+            &self.path,
+            &self.directory.join("lock"),
+            &self.intent_path(),
+            &self.directory.join("acceptance.tmp"),
+        ] {
+            crate::pijul::safe_path(&self.repo, path.strip_prefix(&self.repo)?)?;
+        }
+        Ok(())
     }
 
     pub fn history(&self) -> Result<Vec<Record>> {
+        self.validate()?;
         let file = match File::open(&self.path) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -229,18 +293,155 @@ impl Ledger {
     }
 
     fn append(&self, record: &Record) -> Result<()> {
-        fs::create_dir_all(&self.directory)?;
+        self.validate()?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&self.path)?;
+        let length = file.metadata()?.len();
+        if length != 0 {
+            file.seek(SeekFrom::End(-1))?;
+            let mut last = [0];
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                file.write_all(b"\n")?;
+            }
+        }
+        serde_json::to_writer(&mut file, record)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        sync_directory(&self.directory)
+    }
+
+    fn intent_path(&self) -> PathBuf {
+        self.directory.join("acceptance.json")
+    }
+
+    fn pending(&self) -> Result<Option<Acceptance>> {
+        self.validate()?;
+        let file = match File::open(self.intent_path()) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let intent: Acceptance = serde_json::from_reader(file)
+            .context("Cannot read the durable acceptance transaction")?;
+        if intent.version != 1 || intent.records.is_empty() {
+            bail!("The durable acceptance transaction has an unsupported format.");
+        }
+        Ok(Some(intent))
+    }
+
+    fn prepare(&self, main: &str, inbox: &str, records: Vec<Record>) -> Result<Acceptance> {
+        self.validate()?;
+        if self.intent_path().exists() {
+            bail!("An acceptance transaction still needs recovery.");
+        }
+        self.history()?;
+        let mut offset = 0;
+        let mut leading_newline = false;
+        match File::open(&self.path) {
+            Ok(mut file) => {
+                offset = file.metadata()?.len();
+                if offset != 0 {
+                    file.seek(SeekFrom::End(-1))?;
+                    let mut last = [0];
+                    file.read_exact(&mut last)?;
+                    leading_newline = last[0] != b'\n';
+                }
+                file.sync_all()?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let intent = Acceptance {
+            version: 1,
+            main: main.into(),
+            inbox: inbox.into(),
+            ledger_offset: offset,
+            leading_newline,
+            records,
+        };
+        let temporary = self.directory.join("acceptance.tmp");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, &intent)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, self.intent_path())?;
+        sync_directory(&self.directory)?;
+        Ok(intent)
+    }
+
+    fn reconcile(&self, intent: &Acceptance, applied: bool) -> Result<()> {
+        self.validate()?;
+        let expected = intent.bytes()?;
+        let mut tail = Vec::new();
+        match File::open(&self.path) {
+            Ok(mut file) => {
+                let length = file.metadata()?.len();
+                if length < intent.ledger_offset {
+                    bail!("The ledger is shorter than the acceptance transaction boundary.");
+                }
+                for (index, line) in BufReader::new((&mut file).take(intent.ledger_offset))
+                    .lines()
+                    .enumerate()
+                {
+                    let line = line?;
+                    if !line.trim().is_empty() {
+                        serde_json::from_str::<Record>(&line)
+                            .with_context(|| format!("{}:{}", self.path.display(), index + 1))?;
+                    }
+                }
+                if length - intent.ledger_offset > expected.len() as u64 {
+                    bail!("Unrelated ledger data follows the acceptance transaction boundary.");
+                }
+                file.read_to_end(&mut tail)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if intent.ledger_offset != 0 {
+                    bail!("The ledger for the acceptance transaction is missing.");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if !expected.starts_with(&tail) {
+            bail!("Ledger data does not match the durable acceptance transaction.");
+        }
+        if !applied {
+            if !tail.is_empty() {
+                bail!("The ledger records an acceptance that is absent from its main channel.");
+            }
+            return Ok(());
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        serde_json::to_writer(&mut file, record)?;
-        file.write_all(b"\n")?;
-        Ok(())
+        file.write_all(&expected[tail.len()..])?;
+        file.sync_all()?;
+        sync_directory(&self.directory)
+    }
+
+    fn finish(&self) -> Result<()> {
+        self.validate()?;
+        fs::remove_file(self.intent_path())?;
+        sync_directory(&self.directory)
     }
 
     fn lock(&self) -> Result<File> {
+        self.validate()?;
         fs::create_dir_all(&self.directory)?;
+        sync_directory(&self.directory)?;
+        sync_directory(
+            self.directory
+                .parent()
+                .expect("The ledger directory has a parent"),
+        )?;
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -277,7 +478,7 @@ impl Gate {
                 .chain(&settings.protected)
                 .map(|pattern| crate::protected::pattern_regex(pattern)),
         )?;
-        Ok(Self {
+        let gate = Self {
             pijul: Pijul::new(settings.repo.clone()),
             signer: Signer::new(ledger.directory.clone()),
             model: Model::new(
@@ -291,7 +492,46 @@ impl Gate {
             ledger,
             changes: HashMap::new(),
             policy: None,
-        })
+        };
+        let _lock = gate.ledger.lock()?;
+        gate.recover()?;
+        Ok(gate)
+    }
+
+    fn recover(&self) -> Result<()> {
+        let Some(intent) = self.ledger.pending()? else {
+            return Ok(());
+        };
+        let main = self.pijul.hashes(&intent.main)?;
+        let applied = intent.applied(&main)?;
+        self.ledger.reconcile(&intent, applied)?;
+        if applied {
+            for record in &intent.records {
+                if record.decision == "merge" {
+                    let note = self.mirror_merge(record, &intent.inbox);
+                    if !note.is_empty() {
+                        eprintln!("{note}");
+                    }
+                }
+            }
+        }
+        self.ledger.finish()
+    }
+
+    fn mirror_merge(&self, record: &Record, inbox: &str) -> String {
+        match self.pijul.hashes(inbox).and_then(|hashes| {
+            if hashes.contains(&record.hash) {
+                Ok(())
+            } else {
+                self.pijul.apply(&record.hash, inbox)
+            }
+        }) {
+            Ok(()) => String::new(),
+            Err(error) => format!(
+                "The merge is not in {inbox}. {error} When the working copy is clean, run: pijul apply --channel {inbox} {}",
+                short(&record.hash)
+            ),
+        }
     }
 
     fn change_text(&mut self, hash: &str) -> Result<Rc<str>> {
@@ -342,6 +582,7 @@ impl Gate {
 
     pub fn review(&mut self, report: impl FnMut(&Item)) -> Result<Vec<Item>> {
         let _lock = self.ledger.lock()?;
+        self.recover()?;
         self.policy = None;
         self.walk(true, report)
     }
@@ -353,6 +594,7 @@ impl Gate {
         reason: Option<&str>,
     ) -> Result<Item> {
         let _lock = self.ledger.lock()?;
+        self.recover()?;
         let main = self.pijul.hashes(&self.settings.main)?;
         let inbox = self.pijul.log(&self.settings.inbox)?;
         let prefix_upper = prefix.to_uppercase();
@@ -413,12 +655,14 @@ impl Gate {
             record
         };
         if decision != "accept" {
+            self.ledger.history()?;
             self.ledger.append(&record(&item.hash))?;
             item.state = State::from_decision(decision);
             return Ok(item);
         }
         let hashes = self.with_conflicting_dependencies(&item.hash, &main, &inbox)?;
-        match self.land(&hashes, &main) {
+        let records: Vec<_> = hashes.iter().map(|hash| record(hash)).collect();
+        match self.land(&hashes, &main, &records) {
             Err(error) => {
                 let problem = error.downcast::<Unmerged>()?;
                 bail!(
@@ -431,12 +675,6 @@ impl Gate {
             Ok(Landing {
                 extra, merge, note, ..
             }) => {
-                for hash in &hashes {
-                    self.ledger.append(&record(hash))?;
-                }
-                if let Some(merge) = &merge {
-                    self.ledger.append(merge)?;
-                }
                 item.state = State::Accepted;
                 item.merge = merge;
                 item.note = note;
@@ -540,7 +778,11 @@ impl Gate {
         let mut record = self.decide(item, text)?;
         let mut extra = BTreeSet::new();
         if record.decision == "accept" {
-            match self.land(std::slice::from_ref(&item.hash), main) {
+            match self.land(
+                std::slice::from_ref(&item.hash),
+                main,
+                std::slice::from_ref(&record),
+            ) {
                 Err(error) => {
                     let problem = error.downcast::<Unmerged>()?;
                     record.decision = "escalate".into();
@@ -565,9 +807,8 @@ impl Gate {
                 }
             }
         }
-        self.ledger.append(&record)?;
-        if let Some(merge) = &item.merge {
-            self.ledger.append(merge)?;
+        if record.decision != "accept" {
+            self.ledger.append(&record)?;
         }
         item.state = if record.decision == "accept" {
             State::Accepted
@@ -587,12 +828,25 @@ impl Gate {
             "gate",
             String::new(),
         );
+        let paths = match self
+            .pijul
+            .touched_paths(&self.settings.inbox, &item.paths, text)
+            .and_then(|paths| {
+                self.pijul.check_paths(&paths)?;
+                Ok(paths)
+            }) {
+            Ok(paths) => paths,
+            Err(error) => {
+                record.reason = format!("Unsafe repository path. A human must review it. {error}");
+                return Ok(record);
+            }
+        };
         if change::is_root_change(text) {
             record.decision = "accept".into();
             record.reason = "The Pijul root change has no content.".into();
             return Ok(record);
         }
-        let touched: Vec<_> = change::touched_paths(&item.paths, text)
+        let touched: Vec<_> = paths
             .into_iter()
             .filter(|path| self.protected.is_match(path))
             .collect();
@@ -638,7 +892,12 @@ impl Gate {
         Ok(record)
     }
 
-    fn land(&mut self, hashes: &[String], main: &HashSet<String>) -> Result<Landing> {
+    fn land(
+        &mut self,
+        hashes: &[String],
+        main: &HashSet<String>,
+        records: &[Record],
+    ) -> Result<Landing> {
         let log_paths: HashMap<_, _> = self
             .pijul
             .log(&self.settings.inbox)?
@@ -647,11 +906,20 @@ impl Gate {
             .collect();
         let mut paths = BTreeSet::new();
         for hash in hashes {
-            paths.extend(change::touched_paths(
-                log_paths.get(hash).map(Vec::as_slice).unwrap_or_default(),
-                &self.change_text(hash)?,
-            ));
+            let text = self.change_text(hash)?;
+            paths.extend(
+                self.pijul
+                    .touched_paths(
+                        &self.settings.inbox,
+                        log_paths.get(hash).map(Vec::as_slice).unwrap_or_default(),
+                        &text,
+                    )
+                    .map_err(|error| Unmerged(error.to_string()))?,
+            );
         }
+        self.pijul
+            .check_paths(&paths)
+            .map_err(|error| Unmerged(error.to_string()))?;
         let directory = tempfile::Builder::new().prefix("patchgate-").tempdir()?;
         let path = directory.path().join("main");
         self.pijul.run([
@@ -675,6 +943,9 @@ impl Gate {
                 .filter(|r| !r.path.is_empty())
                 .map(|r| r.path.clone()),
         );
+        scratch
+            .check_paths(&paths)
+            .map_err(|error| Unmerged(error.to_string()))?;
         let files = Self::conflicted_files(&scratch, &paths)?;
         let merge = if remaining.is_empty() && files.is_empty() {
             None
@@ -694,6 +965,19 @@ impl Gate {
             args.push(scratch.change_file(&merge.hash).into_os_string());
             expected.insert(&merge.hash);
         }
+        let mut audit = records.to_vec();
+        if let Some(merge) = &merge {
+            for record in &mut audit {
+                record.merge = Some(merge.hash.clone());
+            }
+            audit.push(merge.clone());
+        }
+        self.pijul
+            .check_paths(&paths)
+            .map_err(|error| Unmerged(error.to_string()))?;
+        let intent = self
+            .ledger
+            .prepare(&self.settings.main, &self.settings.inbox, audit)?;
         self.pijul.run(args)?;
         let after = self.pijul.hashes(&self.settings.main)?;
         let mut missing: Vec<_> = expected
@@ -718,18 +1002,12 @@ impl Gate {
             .filter(|hash| !main.contains(*hash) && !expected.contains(hash.as_str()))
             .cloned()
             .collect();
-        let note = match &merge {
-            Some(record) => match self.pijul.apply(&record.hash, &self.settings.inbox) {
-                Ok(()) => String::new(),
-                Err(error) => format!(
-                    "The merge is not in {}. {error} When the working copy is clean, run: pijul apply --channel {} {}",
-                    self.settings.inbox,
-                    self.settings.inbox,
-                    short(&record.hash)
-                ),
-            },
-            None => String::new(),
-        };
+        self.ledger.reconcile(&intent, true)?;
+        let note = merge
+            .as_ref()
+            .map(|record| self.mirror_merge(record, &self.settings.inbox))
+            .unwrap_or_default();
+        self.ledger.finish()?;
         Ok(Landing {
             main: after,
             extra,
@@ -744,11 +1022,13 @@ impl Gate {
     ) -> Result<BTreeMap<String, ConflictFile>> {
         let mut found = BTreeMap::new();
         for path in paths {
-            if !scratch.repo.join(path).is_file() {
+            let target = crate::pijul::safe_path(&scratch.repo, Path::new(path))
+                .map_err(|error| Unmerged(error.to_string()))?;
+            if !target.is_file() {
                 continue;
             }
             let entries: Vec<serde_json::Value> = scratch
-                .run(["credit", "--output-format", "json", path])
+                .run(["credit", "--output-format", "json", "--", path])
                 .and_then(|output| serde_json::from_str(&output).map_err(Into::into))
                 .map_err(|error| {
                     Unmerged(format!(
@@ -910,7 +1190,9 @@ impl Gate {
             merged.insert(path.clone(), text);
         }
         for (path, text) in &merged {
-            fs::write(scratch.repo.join(path), text)?;
+            let target = crate::pijul::safe_path(&scratch.repo, Path::new(path))
+                .map_err(|error| Unmerged(error.to_string()))?;
+            fs::write(target, text)?;
         }
         let mut seen_names = HashSet::new();
         let names: Vec<_> = sides
@@ -1112,4 +1394,184 @@ pub fn find_repo(start: &Path) -> Result<PathBuf> {
         }
     }
     bail!("{} is not in a Pijul repository.", start.display())
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    fn fixture() -> Result<(tempfile::TempDir, Ledger)> {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join(".pijul"))?;
+        let ledger = Ledger::new(directory.path());
+        let _lock = ledger.lock()?;
+        Ok((directory, ledger))
+    }
+
+    fn records() -> Vec<Record> {
+        let mut acceptance = Record::new(
+            "CANDIDATE".into(),
+            "A candidate".into(),
+            "accept",
+            "model",
+            "The policy permits it.".into(),
+        );
+        acceptance.model = Some("fixture".into());
+        acceptance.merge = Some("MERGE".into());
+        let mut merge = Record::new(
+            "MERGE".into(),
+            "A signed merge".into(),
+            "merge",
+            "model",
+            "Preserve both contributions.".into(),
+        );
+        merge.model = Some("fixture".into());
+        merge.for_hashes = vec!["CANDIDATE".into()];
+        merge.files = vec!["file.txt".into()];
+        vec![acceptance, merge]
+    }
+
+    #[test]
+    fn every_partial_acceptance_append_recovers_once() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        ledger.append(&Record::new(
+            "OLD".into(),
+            "An earlier decision".into(),
+            "reject",
+            "human",
+            "A human rejects it.".into(),
+        ))?;
+        let prefix = fs::read(&ledger.path)?;
+        let intent = ledger.prepare("main", "inbox", records())?;
+        let expected = intent.bytes()?;
+        for boundary in 0..=expected.len() {
+            let mut interrupted = prefix.clone();
+            interrupted.extend_from_slice(&expected[..boundary]);
+            fs::write(&ledger.path, interrupted)?;
+            ledger.reconcile(&intent, true)?;
+            let complete = fs::read(&ledger.path)?;
+            ledger.reconcile(&intent, true)?;
+            assert_eq!(fs::read(&ledger.path)?, complete, "boundary {boundary}");
+            let history = ledger.history()?;
+            assert_eq!(history.len(), 3, "boundary {boundary}");
+            assert_eq!(history[1].merge.as_deref(), Some("MERGE"));
+            assert_eq!(history[2].for_hashes, ["CANDIDATE"]);
+        }
+        ledger.finish()?;
+        assert!(ledger.pending()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_unapplied_intent_creates_no_acceptance() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        let intent = ledger.prepare("main", "inbox", records())?;
+        ledger.reconcile(&intent, false)?;
+        ledger.finish()?;
+        assert!(ledger.history()?.is_empty());
+        assert!(!ledger.path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn unapplied_intent_with_ledger_bytes_is_not_discarded() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        let intent = ledger.prepare("main", "inbox", records())?;
+        let partial = &intent.bytes()?[..5];
+        fs::write(&ledger.path, partial)?;
+        assert!(ledger.reconcile(&intent, false).is_err());
+        assert_eq!(fs::read(&ledger.path)?, partial);
+        assert!(ledger.pending()?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_tail_corruption_is_preserved() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        let intent = ledger.prepare("main", "inbox", records())?;
+        for damaged in [
+            b"{not the transaction".to_vec(),
+            [intent.bytes()?, b"unrelated\n".to_vec()].concat(),
+        ] {
+            fs::write(&ledger.path, &damaged)?;
+            assert!(ledger.reconcile(&intent, true).is_err());
+            assert_eq!(fs::read(&ledger.path)?, damaged);
+        }
+        assert!(ledger.pending()?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_prefix_corruption_is_preserved() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        ledger.append(&Record::new(
+            "OLD".into(),
+            "Old".into(),
+            "reject",
+            "human",
+            "No.".into(),
+        ))?;
+        let intent = ledger.prepare("main", "inbox", records())?;
+        let mut damaged = fs::read(&ledger.path)?;
+        damaged[0] = b'!';
+        damaged.extend_from_slice(&intent.bytes()?[..7]);
+        fs::write(&ledger.path, &damaged)?;
+        assert!(ledger.reconcile(&intent, true).is_err());
+        assert_eq!(fs::read(&ledger.path)?, damaged);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_or_short_ledger_boundary_is_an_error() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        ledger.append(&Record::new(
+            "OLD".into(),
+            "Old".into(),
+            "reject",
+            "human",
+            "No.".into(),
+        ))?;
+        let intent = ledger.prepare("main", "inbox", records())?;
+        fs::write(&ledger.path, b"{}")?;
+        assert!(ledger.reconcile(&intent, true).is_err());
+        fs::remove_file(&ledger.path)?;
+        assert!(ledger.reconcile(&intent, true).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_final_record_without_newline_remains_readable() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        let old = Record::new("OLD".into(), "Old".into(), "reject", "human", "No.".into());
+        let prefix = serde_json::to_vec(&old)?;
+        fs::write(&ledger.path, &prefix)?;
+        let intent = ledger.prepare("main", "inbox", records())?;
+        assert!(intent.leading_newline);
+        ledger.reconcile(&intent, true)?;
+        assert_eq!(ledger.history()?.len(), 3);
+        assert!(fs::read(&ledger.path)?.starts_with(&prefix));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_journal_remains_an_explicit_error() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        fs::write(ledger.intent_path(), b"{partial")?;
+        assert!(ledger.pending().is_err());
+        assert_eq!(fs::read(ledger.intent_path())?, b"{partial");
+        Ok(())
+    }
+
+    #[test]
+    fn uncertain_application_never_invents_a_complete_transaction() -> Result<()> {
+        let (_directory, ledger) = fixture()?;
+        let intent = ledger.prepare("main", "inbox", records())?;
+        let mut main = HashSet::new();
+        assert!(!intent.applied(&main)?);
+        main.insert("CANDIDATE".into());
+        assert!(intent.applied(&main).is_err());
+        main.insert("MERGE".into());
+        assert!(intent.applied(&main)?);
+        Ok(())
+    }
 }

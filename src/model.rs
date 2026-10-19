@@ -88,9 +88,9 @@ impl Model {
                 "reject": "The change violates a reject rule in the policy.",
                 "escalate": "A human must decide. The policy requires review, does not cover the change, or the answer is uncertain."
             });
-            let state = json!({"policy": policy, "hash": hash, "change": text});
+            let state = json!({"hash": hash, "change": text});
             let instructions = format!(
-                "{REVIEW_RULES}Use escalate when you are not sure, or when the policy does not cover the change."
+                "{REVIEW_RULES}Use escalate when you are not sure, or when the policy does not cover the change.\nPolicy:\n\n{policy}"
             );
             return Ok(self
                 .systemone("review", &instructions, state, criteria)?

@@ -162,22 +162,32 @@ pub fn is_root_change(text: &str) -> bool {
 }
 
 fn unquote_path(path: &str) -> String {
-    path.replace("\\\"", "\"").replace("\\\\", "\\")
+    serde_json::from_str(&format!("\"{path}\"")).unwrap_or_else(|_| path.to_owned())
 }
 
 pub fn touched_paths(log_paths: &[String], text: &str) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = log_paths
         .iter()
-        .map(|path| path.trim_matches('/').to_owned())
+        .filter(|path| path.as_str() != "/")
+        .cloned()
         .collect();
     for header in hunk_headers(text) {
         for capture in QUOTED.captures_iter(header) {
             let path = unquote_path(capture.get(1).expect("quoted path capture").as_str());
-            names.insert(path.trim_matches('/').to_owned());
+            names.insert(path);
         }
     }
     names.remove("");
     names
+}
+
+pub fn rename_targets(text: &str) -> Vec<String> {
+    hunk_headers(text)
+        .into_iter()
+        .filter(|header| header.starts_with("Moved:"))
+        .filter_map(|header| QUOTED.captures_iter(header).nth(1))
+        .map(|capture| unquote_path(capture.get(1).expect("rename target capture").as_str()))
+        .collect()
 }
 
 pub fn conflict_report(stderr: &str) -> Vec<Conflict> {
@@ -524,8 +534,22 @@ mod tests {
         let paths = touched_paths(&["/old/".to_owned()], text);
         assert_eq!(
             paths,
-            BTreeSet::from(["old".to_owned(), "a\"b".to_owned(), "other".to_owned()])
+            BTreeSet::from(["/old/".to_owned(), "a\"b".to_owned(), "other".to_owned()])
         );
+    }
+
+    #[test]
+    fn path_parser_preserves_unsafe_paths_and_literal_names() {
+        let text = "# Hunks\n1. Moved: \"draft.rs\" \"guard.rs\" 3.18\n2. Edit in \"-safe 'quote\\\" café.txt\":1\n+ safe\n";
+        assert_eq!(rename_targets(text), vec!["guard.rs"]);
+        let paths = touched_paths(
+            &["/".into(), "../external".into(), "/absolute".into()],
+            text,
+        );
+        assert!(paths.contains("../external"));
+        assert!(paths.contains("/absolute"));
+        assert!(paths.contains("-safe 'quote\" café.txt"));
+        assert!(!paths.contains("/"));
     }
 
     #[test]
