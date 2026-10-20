@@ -541,15 +541,27 @@ The Nix acceptance tasks need their Docker privilege declarations.
 
 ### Task image closure
 
-`harbor/Dockerfile` uses separate builder and runtime stages with the same digest-pinned Nix base.
+The `tools-builder` stage builds the pinned Pijul, Nix, OpenSSH, Rust, linker, and process tools.
+`harbor/environment.nix` exposes their source-independent closure as `runtimeClosure`.
+The `runtime-base` stage imports that closure without application source inputs.
 The builder runs the package runtime check.
-The final stage imports only the environment closure and registers its store paths.
-A BuildKit bind mount keeps the export archive outside final image layers.
+The final stage imports and registers only environment paths absent from that base.
+BuildKit bind mounts keep both export archives outside final image layers.
 
 The final image has no `/build` source tree or closure export archive.
 It retains the compiler, linker, Pijul, and Nix commands.
 All 62 scenario workdirs remain empty until startup.
 The registered paths equal the base-image paths plus the complete `/env` closure.
+
+The image build checks the complete requisite closure and exact store registration.
+An independent read-only probe also checks installed commands, source exclusion, and empty fixture directories.
+Proof: `.devenv/runtime-layer-closure-proof-final/summary.json`.
+
+The complete `devenv --no-eval-cache test --no-tui` run also passed after the runtime-base split.
+All 124 primary Harbor controls matched expected rewards, with no trial errors.
+Four verifier baselines and ten negative controls passed without exceptions.
+Docker and Linux bubblewrap lifecycle checks passed.
+Report: `.devenv/runtime-layer-complete-check.result.json`.
 
 The earlier closure measurements use an ARM64 Linux image.
 GB means 1,000,000,000 bytes.
@@ -568,32 +580,34 @@ Each measurement set uses one fresh Linux ARM64 `docker-container` BuildKit buil
 Upstream image and Nix binary caches remain enabled.
 All three durations include image export and `--load`.
 
-| Build | Before artifact reuse, seconds | With artifact reuse, seconds |
-| --- | ---: | ---: |
-| Cold private BuildKit cache | 364.2 | 599.9 |
-| Unchanged source and reused cache | 21.9 | 14.9 |
-| One Rust comment change and reused cache | 147.5 | 238.4 |
+| Build | Before artifact reuse, seconds | Artifact reuse only, seconds | Stable runtime base, seconds |
+| --- | ---: | ---: | ---: |
+| Cold private BuildKit cache | 364.2 | 599.9 | 639.2 |
+| Unchanged source and reused cache | 21.9 | 14.9 | 15.5 |
+| One Rust comment change and reused cache | 147.5 | 238.4 | 77.1 |
 
-The source-change run reused dependency artifacts and compiled only application code.
-Its runtime build check took 44.0 seconds.
-Image export and transfer took 117.1 seconds.
+The latest source-change run reused all 70 runtime-base layers and imported four application and fixture store paths.
+It reused dependency artifacts and compiled only application code.
+Its runtime check took 42.2 seconds, and image export and transfer took 12.6 seconds.
 
-The cold and source-change image builds are slower than before.
+The measured source-change time fell by 67.7% against the artifact-only run.
+Cold and unchanged totals did not improve in this run.
 These separate runs do not isolate machine load or filesystem performance.
-Do not treat dependency reuse as an image-build speed improvement.
 
 The comment changed only a temporary source copy.
 The live source hash remained unchanged.
-The temporary images, private builder, cache, and source copy are removed.
+The benchmark removed its temporary images, private builder, cache, and source copy.
 Logs, metadata, source hashes, and complete JSON evidence remain.
 
-Before reuse: `.devenv/nix-acceptance-build-times.json`.
-With reuse: `.devenv/cargo-artifact-build-times.json`.
-Full evidence and logs: `../patchgate-cargo-artifact-build-evidence-closure/`.
+Before artifact reuse: `.devenv/nix-acceptance-build-times.json`.
+Artifact reuse only: `.devenv/cargo-artifact-build-times.json`.
+Earlier full evidence and logs: `../patchgate-cargo-artifact-build-evidence-closure/`.
+Stable runtime base: `.devenv/runtime-layer-build-times.json`.
+Latest full evidence and logs: `../patchgate-runtime-layer-evidence-20261020-01/`.
 
 An earlier run exposed a vendor-source reference in the evaluator binary.
 The package now removes that reference and rejects build-only references in both outputs.
-The corrected task image contains 127 runtime store paths and no dependency source or artifact paths.
+The complete `/env` closure contains 127 store paths and no build-only dependency sources or compiled artifact archives.
 
 
 
