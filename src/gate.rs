@@ -1014,13 +1014,8 @@ impl Gate {
             remaining.extend(reported.into_iter().filter(|r| files.contains_key(&r.path)));
             Some(self.merge(&scratch, hashes, main, &remaining, &files)?)
         };
-        // Apply the candidate and its resolution in one Pijul transaction.
-        let mut args = vec![
-            std::ffi::OsString::from("apply"),
-            "--channel".into(),
-            self.settings.main.clone().into(),
-        ];
-        args.extend(hashes.iter().map(std::ffi::OsString::from));
+        // The native transaction checks main before it applies this candidate.
+        let mut args: Vec<_> = hashes.iter().map(std::ffi::OsString::from).collect();
         let mut expected: HashSet<&str> = hashes.iter().map(String::as_str).collect();
         if let Some(merge) = &merge {
             args.push(scratch.change_file(&merge.hash).into_os_string());
@@ -1062,7 +1057,16 @@ impl Gate {
         let intent = self
             .ledger
             .prepare(&self.settings.main, &self.settings.inbox, audit)?;
-        self.pijul.run(args)?;
+        if !self
+            .pijul
+            .apply_if_current(&self.settings.main, main.state.as_deref(), &args)?
+        {
+            self.ledger.finish()?;
+            bail!(
+                "Channel {} changed before application. Run patchgate review again.",
+                self.settings.main
+            );
+        }
         let after = self.pijul.hashes(&self.settings.main)?;
         let mut missing: Vec<_> = expected
             .iter()

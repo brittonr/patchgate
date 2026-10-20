@@ -1,0 +1,69 @@
+--- a/src/commands/apply.rs
++++ b/src/commands/apply.rs
+@@ -8,7 +8,13 @@
+ use crate::commands::load_channel;
+ use pijul_core::HashMap;
+ use pijul_core::changestore::ChangeStore;
+-use pijul_core::{MutTxnTExt, TxnT};
++use pijul_core::pristine::Merkle;
++use pijul_core::{Base32, MutTxnTExt, TxnT, TxnTExt};
+ use pijul_interaction::{OUTPUT_MESSAGE, Spinner};
+ 
++#[derive(Debug, thiserror::Error)]
++#[error("Channel state does not match --expected-state")]
++// <!-- ste-disable-next-line semicolon -->
++pub struct ExpectedStateMismatch;
++
+ #[derive(Parser, Debug)]
+@@ -18,6 +24,9 @@
+     /// Only apply the dependencies of the change, not the change itself. Only applicable for a single change.
+     #[clap(long = "deps-only")]
+     deps_only: bool,
++    /// Apply only if the channel has this full native state, or `empty` for an empty channel.
++    #[clap(long = "expected-state", value_name = "STATE")]
++    expected_state: Option<String>,
+     /// The change that need to be applied. If this value is missing, read the change in text format on the standard input.
+     change: Vec<String>,
+ }
+@@ -33,6 +42,31 @@
+         let txn = repo.pristine.arc_txn_begin()?;
+ 
+         let (channel, is_current_channel) = load_channel(self.base.channel(), &*txn.read())?;
++
++        if let Some(expected) = self.expected_state.as_deref() {
++            let expected = if expected == "empty" {
++                None
++            } else {
++                let Some(state) = Merkle::from_base32(expected.as_bytes())
++                    .filter(|state| state.to_base32() == expected)
++                else {
++                    bail!("Invalid --expected-state: use a full native state or empty")
++                };
++                Some(state)
++            };
++            // The native write transaction holds the exclusive file lock until commit.
++            // Use the first log entry so an empty channel has no state.
++            let txnr = txn.read();
++            let current = txnr
++                .reverse_log(&*channel.read(), None)?
++                .next()
++                .transpose()?
++                // <!-- ste-disable-next-line semicolon -->
++                .map(|(_, (_, state))| Merkle::from(state));
++            if current != expected {
++                bail!(ExpectedStateMismatch)
++            }
++        }
+ 
+         let mut hashes = Vec::new();
+         if self.change.is_empty() {
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -204,1 +204,3 @@
+     if let Err(e) = run(opts).await {
++        // <!-- ste-disable-next-line semicolon sentence-length -->
++        let exit_code = if e.is::<commands::ExpectedStateMismatch>() { 42 } else { 1 };
+@@ -213,1 +215,2 @@
+-        std::process::exit(1);
++        // <!-- ste-disable-next-line semicolon -->
++        std::process::exit(exit_code);

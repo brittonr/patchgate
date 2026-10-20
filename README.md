@@ -29,7 +29,8 @@ patchgate examines the inbox changes that are not in main, in the order of the i
 6. If main declares Nix checks, each check must pass against the final scratch source.
 7. patchgate checks main after each model reply and after Nix verification.
    If main changed, the command stops without that acceptance.
-8. patchgate applies the change, and its merge, to main.
+8. Pijul compares the reviewed main state inside its write transaction.
+   It applies the candidate and merge only if that state matches.
 
 
 patchgate reads the policy from main, not from the working copy. Thus a pending change cannot change the rules for its own review. A change to `POLICY.md` always goes to a human.
@@ -117,10 +118,19 @@ Before acceptance, the gate writes `.pijul/patchgate/acceptance.json` with the c
 If the process stops after Pijul applies the change, the next gate command restores the missing audit bytes exactly once.
 An unapplied transaction creates no acceptance. Unrelated ledger corruption remains an explicit error.
 
-The stale-review check compares the native main state and complete change set after review and before the acceptance transaction.
-It also covers changes during a model merge request or Nix verification.
-The comparison and Pijul application remain separate commands.
-Do not use independent Pijul commands to write main during gate application.
+The gate calls patched Pijul with `apply --expected-state <STATE>` for every final acceptance.
+Pijul compares the full native main state inside the same write transaction that applies the candidate and merge.
+The transaction holds Pijul's exclusive write lock until commit.
+An empty channel uses the `empty` state marker.
+
+If the state differs, Pijul returns exit 42 without application.
+The gate cancels the prepared journal and writes no acceptance.
+Retry `review` or `accept` against the current main state.
+Other native failures retain the journal for crash recovery.
+
+Independent Pijul commands can still change main before or after this transaction.
+They cannot write main between the conditional state comparison and commit.
+Direct commands still bypass gate policy.
 
 
 
@@ -357,9 +367,9 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
 ## Tests
 
-The suite contains 50 [Harbor](https://harborframework.com) tasks in `harbor/tasks`.
+The suite contains 53 [Harbor](https://harborframework.com) tasks in `harbor/tasks`.
 Each task starts with a fixed Pijul history. Its verifier checks channel contents, local files, and decision records.
-The 28 Rust tasks use `src/bin/patchgate-eval/` for fixtures, oracles, verifiers, controls, and live-model jobs.
+The 31 Rust tasks use `src/bin/patchgate-eval/` for fixtures, oracles, verifiers, controls, and live-model jobs.
 The 22 earlier tasks retain their Python runner.
 
 
@@ -415,6 +425,9 @@ The 22 earlier tasks retain their Python runner.
 | `stale-policy-review` | Refuse an old response after an independent policy update, then reject the candidate under the current policy. |
 | `stale-main-review` | Refuse a response after main advances, then review the candidate against the current channel. |
 | `stale-main-merge` | Refuse a merge after main advances, then produce one fresh merge without stale audit records. |
+| `apply-race-review` | Refuse a stale model acceptance inside native application, preserve audit bytes, and accept one fresh retry. |
+| `apply-race-human` | Refuse a stale human acceptance inside native application, preserve audit bytes, and accept one fresh retry. |
+| `apply-race-merge` | Refuse a stale candidate and merge inside native application, then accept one fresh linked merge. |
 | `dependency-graph-approved` | Accept the exact closure of a fixed-seed graph with chains, diamonds, and multiple prerequisites. |
 | `dependency-graph-rejected` | Block all descendants of a rejected root while independent branches proceed. |
 | `dependency-graph-removed` | Preserve a removed root acceptance without restoration or dependent decisions. |
@@ -429,7 +442,7 @@ The 22 earlier tasks retain their Python runner.
 
 
 `cargo test --locked --all-targets` checks parser boundaries, path safety, journal recovery, safe merge choices, and model replies.
-`patchgate-eval smoke` exercises all 28 Rust scenarios with oracle and nop controls.
+`patchgate-eval smoke` exercises all 31 Rust scenarios with oracle and nop controls.
 
 The storage fault cases need Linux, procfs, Rust, a C linker, and a gate binary with dynamic libc.
 They use a Rust `LD_PRELOAD` library against real file descriptors.
@@ -445,7 +458,7 @@ It then runs four oracle baseline jobs and ten stronger negative controls inside
 
 The oracles check failed commands for nonzero exits and unchanged channel hashes and ledger bytes. Verifiers check decision histories, not reason wording.
 
-The installed evaluator passed all 25 non-storage Rust scenarios with an empty caller `PATH`.
+The installed evaluator passed all 28 non-storage Rust scenarios with an empty caller `PATH`.
 The complete `devenv test --no-tui` run passed on 2026-10-19, including Linux storage syscall faults.
 
 
@@ -455,8 +468,8 @@ Package runtime checks also passed on Darwin and Linux.
 
 | Harbor control | Trials | Required reward | Trial exceptions |
 | :--- | ---: | ---: | ---: |
-| Oracle | 50 | 1 | 0 |
-| Nop | 50 | 0 | 0 |
+| Oracle | 53 | 1 | 0 |
+| Nop | 53 | 0 | 0 |
 | Oracle baselines | 4 | 1 | 0 |
 | Stronger negative controls | 10 | 0 | 0 |
 
@@ -477,6 +490,21 @@ The oracle runs patchgate with a scripted model server in the task. The nop agen
 3. It installs Harbor 0.24.0 from the hash-locked `harbor/requirements.txt` in `.devenv/state/harbor`.
 
 To run another Harbor agent on the tasks, give its options to `patchgate-harbor run`, for example `patchgate-harbor run --agent nop`. Each task also has `environment/default.nix` for the bubblewrap backend of Harbor. That backend runs only on Linux, so the Docker image is the environment on macOS.
+
+### Atomic application checks
+
+All three final-application races fail against the old gate and pass against the conditional application fix.
+The cases cover model acceptance, human acceptance, and a recorded model merge.
+An independent Pijul command advances main after journal preparation, immediately before native application.
+The fixed gate preserves existing audit bytes and accepts exactly one fresh retry.
+
+Native CLI checks cover matching empty and full states, stale states, invalid state arguments, and ordinary unconditional application.
+Refused applications preserve main and the unrecorded working copy.
+
+Reports:
+
+- `.devenv/atomic-application-verification.json`
+- `.devenv/atomic-native-contract-complete/report.json`
 
 ### Trusted Nix checks
 

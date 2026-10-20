@@ -13,6 +13,8 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Deserializer, Serialize};
 use tempfile::TempDir;
 
+const EXPECTED_STATE_MISMATCH: i32 = 42;
+
 pub type CommandEnv = BTreeMap<OsString, OsString>;
 
 #[derive(Deserialize)]
@@ -133,6 +135,15 @@ impl Pijul {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        let (command, output) = self.execute(args, env)?;
+        text_output(output, &command)
+    }
+
+    fn execute<I, S>(&self, args: I, env: Option<&CommandEnv>) -> Result<(Command, Output)>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let mut command = Command::new("pijul");
         command
             .args(args)
@@ -149,8 +160,33 @@ impl Pijul {
                 anyhow!(error).context(format!("Cannot execute {}", command_name(&command, None)))
             }
         })?;
-        let (stdout, stderr) = text_output(output, &command)?;
-        Ok((stdout, stderr))
+        Ok((command, output))
+    }
+
+    pub fn apply_if_current(
+        &self,
+        channel: &str,
+        state: Option<&str>,
+        changes: &[OsString],
+    ) -> Result<bool> {
+        let (command, output) = self.execute(
+            [
+                "apply",
+                "--channel",
+                channel,
+                "--expected-state",
+                state.unwrap_or("empty"),
+            ]
+            .into_iter()
+            .map(OsStr::new)
+            .chain(changes.iter().map(OsString::as_os_str)),
+            None,
+        )?;
+        if output.status.code() == Some(EXPECTED_STATE_MISMATCH) {
+            return Ok(false);
+        }
+        text_output(output, &command)?;
+        Ok(true)
     }
 
     pub fn run<I, S>(&self, args: I) -> Result<String>

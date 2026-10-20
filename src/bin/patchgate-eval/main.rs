@@ -1,3 +1,4 @@
+mod apply_race;
 mod concurrency;
 mod contracts;
 mod controls;
@@ -56,6 +57,11 @@ enum Action {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    #[command(disable_help_flag = true)]
+    InterceptApplyRace {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
 }
 
 #[derive(Args)]
@@ -92,6 +98,7 @@ fn scenarios() -> impl Iterator<Item = &'static Scenario> {
         real_model::SCENARIOS,
         generalization::SCENARIOS,
         stale::SCENARIOS,
+        apply_race::SCENARIOS,
         storage::SCENARIOS,
         structured::SCENARIOS,
     ]
@@ -233,6 +240,7 @@ fn run() -> Result<()> {
         Action::VerifyHarbor(args) => controls::verify_harbor(args)?,
         Action::ModelHarbor(args) => real_model::model_harbor(args)?,
         Action::InterceptPijul { args } => recovery::intercept_pijul(&args)?,
+        Action::InterceptApplyRace { args } => apply_race::intercept_pijul(&args)?,
     }
     Ok(())
 }

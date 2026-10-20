@@ -7,6 +7,8 @@ pkgs.pijul.overrideAttrs (old: {
     archive=$(find "$cargoDepsCopy" -path '*/pijul-core-*/src/output/archive.rs')
     test -f "$archive"
     patch -d "$(dirname "$archive")" < ${./pijul-archive.patch}
+    # Compare channel states inside the native write transaction.
+    patch -p1 < ${./pijul-apply.patch}
   # <!-- ste-disable-next-line semicolon -->
   '';
 })
