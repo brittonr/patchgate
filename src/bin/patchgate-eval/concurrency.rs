@@ -1,10 +1,11 @@
 use super::support::*;
+use parking_lot::{Condvar, Mutex};
 use std::collections::BTreeSet;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
 pub const SCENARIOS: &[Scenario] = &[
@@ -40,7 +41,7 @@ impl Trace {
     }
 
     fn add(&self, event: &str, data: Value) {
-        self.events.lock().unwrap().push(json!({
+        self.events.lock().push(json!({
             "event": event, "elapsed_ms": self.start.elapsed().as_millis() as u64, "data": data
         }));
     }
@@ -48,7 +49,7 @@ impl Trace {
     fn save(&self, dir: &Path) -> Result<()> {
         fs::write(
             dir.join("process-evidence.json"),
-            serde_json::to_vec_pretty(&*self.events.lock().unwrap())?,
+            serde_json::to_vec_pretty(&*self.events.lock())?,
         )?;
         Ok(())
     }
@@ -188,7 +189,7 @@ impl Hold {
     }
     fn release(&self) {
         let (lock, ready) = &*self.state;
-        *lock.lock().unwrap() = true;
+        *lock.lock() = true;
         ready.notify_all();
     }
 }
@@ -210,11 +211,9 @@ fn held_model(fail_first: bool, trace: &Trace) -> Result<(ModelServer, Hold, mps
             trace.add("request-held", json!({}));
             let _ = sender.send(());
             let (lock, ready) = &*state;
-            let released = lock.lock().unwrap();
-            let result = ready
-                .wait_timeout_while(released, WAIT, |released| !*released)
-                .unwrap();
-            if !*result.0 {
+            let mut released = lock.lock();
+            ready.wait_while_for(&mut released, |released| !*released, WAIT);
+            if !*released {
                 return Reply {
                     status: 503,
                     body: json!({"error": "fixture request barrier expired"}),
@@ -529,11 +528,16 @@ fn exact_records(c: &mut Check, name: &str, expected: &[(&str, &str)]) -> Result
     Ok(records)
 }
 
-fn evidence(c: &Check) -> Result<Vec<Value>> {
+fn evidence(c: &mut Check) -> Result<Option<Vec<Value>>> {
     let root = c.repo.path.parent().context("scenario root is absent")?;
-    Ok(serde_json::from_slice(&fs::read(
-        root.join("process-evidence.json"),
-    )?)?)
+    match fs::read(root.join("process-evidence.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            c.require(false, "The process lifecycle evidence is absent");
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn event<'a>(events: &'a [Value], name: &str) -> Result<&'a Value> {
@@ -617,7 +621,9 @@ fn check_concurrent(c: &mut Check) -> Result<()> {
             );
         }
     }
-    let events = evidence(c)?;
+    let Some(events) = evidence(c)? else {
+        return Ok(());
+    };
     check_processes(
         c,
         &events,
@@ -684,7 +690,9 @@ fn check_watch(c: &mut Check) -> Result<()> {
             );
         }
     }
-    let events = evidence(c)?;
+    let Some(events) = evidence(c)? else {
+        return Ok(());
+    };
     check_processes(c, &events, &[("watch", 130), ("push", 0)])?;
     let phases = [
         "request-held",

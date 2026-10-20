@@ -203,12 +203,8 @@ fn solve_message(dir: &Path, options: &RunOptions) -> Result<()> {
         )?
     } else {
         let model = ModelServer::new(|request| {
-            let text = request.body["messages"]
-                .as_array()
-                .and_then(|messages| messages.last())
-                .and_then(|message| message["content"].as_str())
-                .unwrap_or("");
-            chat_reply(verdict(if text.contains(SECRET) {
+            let input = review_input(&request.body).expect("Valid structured review data");
+            chat_reply(verdict(if review_contains_text(&input, SECRET) {
                 "reject"
             } else {
                 "accept"

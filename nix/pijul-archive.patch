@@ -1,0 +1,5 @@
+--- archive.rs
++++ archive.rs
+@@ -75 +75,2 @@
++        header.set_size(0);
+         header.set_entry_type(tar::EntryType::Directory);

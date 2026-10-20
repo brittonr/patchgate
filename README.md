@@ -22,14 +22,89 @@ patchgate examines the inbox changes that are not in main, in the order of the i
 
 1. If a dependency of the change is not in main, the change waits. If that dependency has the state `rejected`, `escalated`, or `blocked`, patchgate blocks the change. `pijul apply` also applies the dependencies of a change, so patchgate never applies a blocked change.
 2. If the change touches a protected path, patchgate escalates the change to a human. The model does not see the change.
-3. If the change text is longer than `PATCHGATE_MAX_CHANGE_CHARS`, patchgate escalates the change. The model never sees a part of a change.
-4. Else, patchgate sends the change and the `POLICY.md` of main to the model. The model replies with `accept`, `reject`, or `escalate`, a summary, and a reason.
-5. patchgate applies each accepted change to a scratch clone of main. If the change conflicts with main, the model merges the conflict, as the next section tells.
-6. patchgate applies the change, and its merge, to main.
+3. If the complete structured review data exceeds `PATCHGATE_MAX_CHANGE_CHARS`, patchgate escalates the change. It never truncates review data.
+4. Else, patchgate sends structured native context and the trusted policy from main to the model.
+   The model accepts, rejects, or escalates the candidate.
+5. patchgate applies each accepted change to a scratch clone of main. If the change conflicts with main, the model merges the conflict.
+6. If main declares Nix checks, each check must pass against the final scratch source.
+7. patchgate checks main after each model reply and after Nix verification.
+   If main changed, the command stops without that acceptance.
+8. patchgate applies the change, and its merge, to main.
+
 
 patchgate reads the policy from main, not from the working copy. Thus a pending change cannot change the rules for its own review. A change to `POLICY.md` always goes to a human.
 
 The decisions and the merges go into `.pijul/patchgate/ledger.jsonl`.
+
+### Structured review data
+
+Review data uses schema version 1 with `candidate` and `binding` objects.
+The candidate contains its hash, message, authors, timestamp, actual dependencies, and full repository paths.
+`pijul change --context` supplies native vertices with exact text, origin hashes, byte ranges, and `add`, `del`, or `keep` kinds.
+Context references do not become prerequisites.
+Human acceptance still follows conflict references when it applies a recorded resolution.
+`metadata_context` supplies exact before and after archive text when native vertices omit a file, including path-only renames.
+
+The gate creates an isolated channel and applies only the candidate and its actual prerequisites.
+Later or concurrent inbox edits cannot enter that context.
+Immutable change files use hard links where the filesystem supports them.
+Binary data, invalid UTF-8, incomplete context, and ambiguous paths go to a human before a model request.
+
+Model decisions store a `review` object in the ledger.
+It identifies candidate hashes, the SHA-256 digest of exact policy bytes, and the native reviewed main state.
+Model merge records retain the same main snapshot.
+Gate and human decisions do not claim model review evidence.
+Earlier ledger records remain readable without retroactive review claims.
+
+Both environments use `nix/pijul.nix` to correct empty-directory archive headers in the pinned Pijul package.
+The writer sets directory sizes to zero. Archive validation remains strict.
+
+### Trusted Nix verification
+
+Record `nix/checks.json` on main to enable mandatory Nix checks.
+Without that file, the repository has no declared Nix check requirement.
+The gate always protects `nix/`, even when `PATCHGATE_PROTECTED` is empty.
+
+The manifest uses schema version 1, a nonempty `checks` list, and named `inputs`.
+Each input declares a `url` and a SHA-256 `nar_hash`.
+Use HTTPS or an immutable Nix store path.
+The project manifest pins the same Nixpkgs revision and NAR hash as `devenv.lock`.
+No check command updates a lock file.
+
+Each check is a `{ src, system, inputs }: derivation` function in the trusted main-channel `nix/` directory.
+Use only trusted definition files and pinned inputs for Nix evaluation.
+Do not import candidate Nix expressions from `src`.
+`nix/build.nix` reuses `nix/package.nix` with the candidate source, including its Cargo lock file.
+
+The gate exports the recorded scratch channel after the final merge resolution.
+It excludes `.pijul`, `.git`, `.devenv`, `.direnv`, `target`, `result`, and `result-*` at the source root.
+It preserves source bytes, executable modes, and safe internal links.
+Unrecorded files, the SSH agent, and gate keys do not enter the source tree.
+Do not record credentials. Nix copies recorded source into its store.
+
+The Nix client uses a private HOME and no inherited model variables or SSH agent.
+Evaluation is pure and restricted. It uses local store inputs but blocks network fetches and import from derivations.
+Enable the Nix sandbox in both client and daemon configuration.
+The gate refuses a disabled client sandbox and explicit check-level sandbox exceptions.
+The daemon, sandbox policy, build machines, and binary caches remain trusted.
+
+Every declared check must pass before the acceptance journal or main application.
+A failed check prevents both model acceptance and `patchgate accept`.
+Nix can reuse valid cached build results.
+`PATCHGATE_CHECK_TIMEOUT` limits the Nix commands for one candidate.
+SIGINT cancels an active check without acceptance.
+
+Successful acceptance and merge records include `verification` evidence.
+It binds candidate hashes, the merge hash, native main state, source NAR hash, trusted definition NAR hash, and pinned inputs.
+It also records check names, derivation paths, and output paths.
+The durable acceptance journal includes this evidence.
+Nix garbage collection can remove store paths later. The recorded hashes remain in the ledger.
+
+Record the initial trusted check files on main before intake.
+An existing requirement also applies to human approval of a check change.
+A broken trusted check needs an owner-controlled main update.
+
+
 
 ### Safe paths and crash recovery
 
@@ -41,6 +116,12 @@ File names and change messages remain data, including names with spaces, quotes,
 Before acceptance, the gate writes `.pijul/patchgate/acceptance.json` with the complete audit records and ledger boundary.
 If the process stops after Pijul applies the change, the next gate command restores the missing audit bytes exactly once.
 An unapplied transaction creates no acceptance. Unrelated ledger corruption remains an explicit error.
+
+The stale-review check compares the native main state and complete change set after review and before the acceptance transaction.
+It also covers changes during a model merge request or Nix verification.
+The comparison and Pijul application remain separate commands.
+Do not use independent Pijul commands to write main during gate application.
+
 
 
 ## How patchgate merges conflicts
@@ -118,8 +199,9 @@ CLEF uses typed decisions, not text generation. Use the bundled `clef_mlx.py` lo
 
 Set `PATCHGATE_MODEL_API=systemone` for a server with a `/v1/systemone` endpoint. Keep the `/v1` suffix in `PATCHGATE_MODEL_URL`. patchgate submits one choice question for each review or conflict.
 
-For review, both APIs receive the policy as trusted instructions.
-SystemOne `state` contains only the change hash and Pijul change text, not the policy.
+SystemOne receives the structured review object in `state`.
+Chat receives the same object as JSON user content.
+Both APIs receive exact policy text as trusted instructions, outside that data.
 
 CLEF does not generate a summary or a written reason. The ledger keeps an empty summary and a reason that states the selected option and its probability. Do not treat that probability as proof of correctness.
 
@@ -134,7 +216,7 @@ patchgate review
 
 ## Requirements
 
-- [devenv](https://devenv.sh) 2.4 or later.
+- [devenv](https://devenv.sh) 2.4 or later for source development and Nix builds.
 - A model server with an OpenAI-compatible API or the SystemOne API. The default is LM Studio at `http://127.0.0.1:1234/v1` with the model `google/gemma-4-e4b`. LM Studio loads the model when the first request comes.
 - An SSH agent with an Ed25519 key. `pijul record` signs each change with a key from the agent.
 
@@ -150,7 +232,29 @@ cargo build --locked --release
 cargo test --locked
 ```
 
-`devenv build` builds `outputs.patchgate` through `nix/package.nix`. Harbor uses that same package definition. Both builds use `Cargo.lock`. The executable needs Pijul and OpenSSH on `PATH`.
+`nix/package.nix` creates separate application and evaluator outputs from one locked Rust build.
+devenv exposes these build results:
+
+- `outputs.patchgate` contains the application with pinned Pijul, OpenSSH, and Nix commands.
+- `outputs.patchgate-eval` contains the evaluator and its compiler and process tools.
+- `outputs.runtime-check` checks the installed application without an external model or Docker.
+
+Select the application output with `devenv build outputs.patchgate`.
+Use the returned store path to execute its `bin/patchgate` entry outside devenv.
+The application needs no Cargo, Python, Docker, or caller-provided Pijul.
+Caller commands cannot replace its pinned Pijul, OpenSSH, and Nix commands.
+
+`devenv build` also builds the evaluator and runtime check.
+The runtime check initializes repositories, reviews changes, and verifies a recorded merge with empty and incorrect caller paths.
+It compiles and executes the merged Rust program.
+It also checks evaluator process control without caller tools.
+Harbor uses the same package outputs and runs the runtime check on Linux.
+
+Normal evaluator operations use the wrapped application.
+Crash tests select the private executable so their Pijul interceptor can stop the gate after real application.
+Both paths execute the same compiled application.
+The evaluator wrapper supplies defaults for `PATCHGATE_BIN` and `PATCHGATE_EVAL_UNWRAPPED_BIN`.
+Explicit evaluator settings can override these defaults.
 
 ## Start
 
@@ -236,23 +340,28 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 | `PATCHGATE_MODEL_API` | `openai` | Use `openai` for chat completions or `systemone` for typed choices. |
 | `PATCHGATE_PROTECTED` | the gate files | Glob patterns, with commas between them. A human must accept each change to a path that matches. |
 | `PATCHGATE_POLICY` | `POLICY.md` | The policy file in main. patchgate always protects it. |
-| `PATCHGATE_MAX_CHANGE_CHARS` | `8000` | patchgate escalates a longer change text, or a longer conflict, without the model. |
+| `PATCHGATE_MAX_CHANGE_CHARS` | `8000` | Escalate a longer serialized review object or conflict prompt without the model. |
 | `PATCHGATE_TIMEOUT` | `300` | The seconds to wait for one reply. The first reply includes the time to load the model. |
+| `PATCHGATE_CHECK_TIMEOUT` | `900` | The positive seconds allowed for Nix verification of one candidate. |
 | `PATCHGATE_INBOX`, `PATCHGATE_MAIN` | `inbox`, `main` | The channel names. The `--inbox` and `--main` options also set them. |
 
 ## Limits
 
 - The working copy is on `inbox`, so it contains changes that main does not have. patchgate controls main. It does not isolate the code in the inbox.
-- LM Studio loads a model with a context of 4096 tokens when a request loads it. The limit of 8000 characters keeps a change, the policy, and the reply in that context. For larger changes, load the model with a larger context, and then increase `PATCHGATE_MAX_CHANGE_CHARS`.
+- The character limit applies to the complete serialized review object, not only patch text.
+  A small edit in a large file can exceed it.
+  Policy instructions and replies also need space in the model context.
+  Set the model context and `PATCHGATE_MAX_CHANGE_CHARS` together.
 - patchgate merges only the conflicts in the table above. A merge that needs a new line, for example a line that combines both sides, goes to a human.
 - A local model makes mistakes. Examine `patchgate log` and correct a decision with `patchgate accept` or `patchgate reject`. To remove a merge from main, run `pijul unrecord --channel main <hash>`.
 
 ## Tests
 
-The suite contains 33 [Harbor](https://harborframework.com) tasks in `harbor/tasks`.
+The suite contains 50 [Harbor](https://harborframework.com) tasks in `harbor/tasks`.
 Each task starts with a fixed Pijul history. Its verifier checks channel contents, local files, and decision records.
-The 11 new tasks use `src/bin/patchgate-eval/` for Rust fixtures, oracles, verifiers, controls, and live-model jobs.
-The 22 existing tasks retain their Python runner.
+The 28 Rust tasks use `src/bin/patchgate-eval/` for fixtures, oracles, verifiers, controls, and live-model jobs.
+The 22 earlier tasks retain their Python runner.
+
 
 
 | Task | What patchgate must do |
@@ -296,25 +405,61 @@ The 22 existing tasks retain their Python runner.
 | `rust-model-decisions` | Measure safe acceptance, secret rejection, and human escalation through a scripted or real model. |
 | `rust-model-merge` | Record a model-selected merge, compile the Rust result, and execute both greetings exactly once. |
 
+#### More coverage
+
+| Task | Required result |
+| --- | --- |
+| `storage-full-recovery` | Inject disk-full errors before journal durability and after Pijul application, then recover without false acceptances. |
+| `storage-short-write-recovery` | Write partial bytes into the actual journal and ledger, then recover complete audit records exactly once. |
+| `storage-sync-recovery` | Fail file sync at journal and audit boundaries, then preserve earlier audit bytes and complete records. |
+| `stale-policy-review` | Refuse an old response after an independent policy update, then reject the candidate under the current policy. |
+| `stale-main-review` | Refuse a response after main advances, then review the candidate against the current channel. |
+| `stale-main-merge` | Refuse a merge after main advances, then produce one fresh merge without stale audit records. |
+| `dependency-graph-approved` | Accept the exact closure of a fixed-seed graph with chains, diamonds, and multiple prerequisites. |
+| `dependency-graph-rejected` | Block all descendants of a rejected root while independent branches proceed. |
+| `dependency-graph-removed` | Preserve a removed root acceptance without restoration or dependent decisions. |
+| `rust-merge-contracts` | Merge Rust module APIs and verify public results, errors, and overflow boundaries in both channels. |
+| `rust-merge-errors-order` | Resolve a nested conflict by hand and verify debit-before-scale order, error precedence, and numeric boundaries. |
+| `rust-model-policy-variants` | Apply two policy forms across privacy, accessibility, and dependency license domains. |
+| `rust-model-option-order` | Preserve expected decisions across all six actual wire orders of the three choices. |
+| `rust-model-injection-variants` | Treat instructions in messages, names, added comments, documents, and removed lines as untrusted data. |
+| `structured-review-context` | Review isolated native context, retain full paths and rename text, reject later secrets, and escalate invalid UTF-8. |
+| `structured-review-binding` | Bind decisions to actual candidates, exact policy bytes, and native main states at the HTTP boundary. |
+| `structured-context-limit` | Escalate a small patch when complete file context exceeds the limit, without a model request. |
+
+
 `cargo test --locked --all-targets` checks parser boundaries, path safety, journal recovery, safe merge choices, and model replies.
-`patchgate-eval smoke` exercises all 11 new Rust scenarios with oracle and nop controls.
+`patchgate-eval smoke` exercises all 28 Rust scenarios with oracle and nop controls.
+
+The storage fault cases need Linux, procfs, Rust, a C linker, and a gate binary with dynamic libc.
+They use a Rust `LD_PRELOAD` library against real file descriptors.
+They do not use production fault flags.
+Run the storage cases in the Harbor Docker environment on macOS.
+
 `devenv test` runs `patchgate-harbor check` against the compiled Rust executable.
 It runs every task with the `oracle` and `nop` agents.
 Each oracle trial needs reward 1, and each nop trial needs reward 0.
-It then runs the three stronger negative controls inside Harbor.
+It then runs four oracle baseline jobs and ten stronger negative controls inside Harbor.
+
 
 
 The oracles check failed commands for nonzero exits and unchanged channel hashes and ledger bytes. Verifiers check decision histories, not reason wording.
 
-Local smoke checks and `devenv test --no-tui` passed on 2026-10-19.
-The Docker image build also passed all 30 Rust tests.
+The installed evaluator passed all 25 non-storage Rust scenarios with an empty caller `PATH`.
+The complete `devenv test --no-tui` run passed on 2026-10-19, including Linux storage syscall faults.
 
 
-| Docker control | Trials | Reward per trial | Exceptions |
-| --- | ---: | ---: | ---: |
-| Oracle | 33 | 1 | 0 |
-| Nop | 33 | 0 | 0 |
-| Stronger negative controls | 3 | 0 | 0 |
+The Docker image build also passed all 38 Rust tests.
+Package runtime checks also passed on Darwin and Linux.
+
+
+| Harbor control | Trials | Required reward | Trial exceptions |
+| :--- | ---: | ---: | ---: |
+| Oracle | 50 | 1 | 0 |
+| Nop | 50 | 0 | 0 |
+| Oracle baselines | 4 | 1 | 0 |
+| Stronger negative controls | 10 | 0 | 0 |
+
 
 
 The oracle runs patchgate with a scripted model server in the task. The nop agent changes nothing, which proves that a verifier does not pass an unchanged repository. The tests do not use the local model.
@@ -333,21 +478,67 @@ The oracle runs patchgate with a scripted model server in the task. The nop agen
 
 To run another Harbor agent on the tasks, give its options to `patchgate-harbor run`, for example `patchgate-harbor run --agent nop`. Each task also has `environment/default.nix` for the bubblewrap backend of Harbor. That backend runs only on Linux, so the Docker image is the environment on macOS.
 
+### Trusted Nix checks
+
+The CLI smoke checks used real Pijul repositories and sandboxed Nix builders.
+The installed gate used pinned Nix despite hostile caller `nix` and `nix-store` commands.
+Hostile check replacement did not bypass the existing check.
+Source export excluded unrecorded files and recorded build state.
+A main-channel change during verification prevented candidate acceptance.
+
+A valid recorded merge passed its combined behavior check.
+A failed combined result left main and every existing audit byte unchanged.
+The project check built changed Rust source through `nix/build.nix`.
+The resulting application displayed the candidate-specific `--help` text.
+
+Deadline expiry and an explicit sandbox exception prevented acceptance.
+SIGINT stopped `watch` with exit 130, without a candidate acceptance or audit change.
+The reports retain source hashes, derivations, outputs, native state, and command results.
+
+Reports:
+
+- `.devenv/trusted-nix-installed/report.json`
+- `.devenv/trusted-nix-installed-merge/report.json`
+- `.devenv/trusted-nix-project-context/report.json`
+- `.devenv/trusted-nix-boundaries/report.json`
+- `.devenv/trusted-nix-interrupt-after-1792452634603/report.json`
+
 ### Stronger verifier controls
 
-After the oracle and nop trials, `patchgate-eval verify-harbor` runs three separate Harbor jobs.
-Each control must produce reward 0 without a verifier exception.
-The controls accept every candidate, reject every candidate, or remove the merge audit from an otherwise correct result.
-The report contains trial results under the Harbor jobs directory.
-Each trial retains verifier failure details in `verifier/test-stdout.txt`.
+After the oracle and nop trials, `patchgate-eval verify-harbor` runs four separate oracle baseline jobs.
+Each baseline needs reward 1 before the negative control jobs.
+Ten negative controls must then produce reward 0 without a verifier exception.
+
+| Control | Incorrect result |
+| --- | --- |
+| `accept-all` | Accept every candidate, including prohibited changes. |
+| `reject-all` | Reject every candidate, including permitted changes. |
+| `omit-merge` | Remove the merge audit from an otherwise correct result. |
+| `wrong-history` | Preserve correct files but replace an accepted candidate hash. |
+| `missing-prerequisite` | Remove an approved prerequisite and its dependent closure. |
+| `false-audit-actor` | Claim that a human owns a model merge decision. |
+| `false-audit-linkage` | Link an acceptance to a different change instead of its merge. |
+| `extra-unrelated-change` | Add an unapproved change to both channels. |
+| `false-policy-binding` | Replace a valid policy digest while channel history and file contents remain correct. |
+| `false-main-binding` | Claim a different reviewed native state while channel history and file contents remain correct. |
+
+Each mutation first passes the actual oracle and verifier.
+The report retains baseline results, mutation evidence, and control results under the Harbor jobs directory.
+Each trial retains details in `verifier/test-stdout.txt` and `verifier/patchgate-check.json`.
+The JSON file separates assertion failures from verifier exceptions.
+
 
 
 ### Real-model evaluation inside Harbor
 
-`patchgate-harbor model` runs `rust-model-decisions` and `rust-model-merge` with a real endpoint.
+`patchgate-harbor model` runs the two earlier Rust model tasks and all three variation tasks with a real endpoint.
+The variation tasks contain 51 cases across policy wording, choice order, and injection location.
 The live jobs do not replace scripted CI controls.
-The Rust runner records unsafe acceptances, correct merges, escalations, review times, checkpoint revision, and quantization.
-It also records the actual Harbor trial results and command output.
+
+The Rust runner records expected and actual decisions, unsafe acceptances, unnecessary escalations, correct merges, and review times.
+Reports also retain checkpoint revision, quantization, command output, and actual serialized proxy requests.
+The test proxy changes choice order on the wire without changes to production schemas or trusted policy placement.
+
 
 Unsafe acceptances include secrets and changes that the policy sends to a human.
 The command returns a nonzero exit when the model fails a task, but it retains the report and Harbor results.
@@ -398,6 +589,29 @@ It also checked policies that accept, reject, or request a human for the same ch
 
 The probe requests and replies remain in `.devenv/clef-tests/policy-scope-probe.json`.
 
+
+#### Structured review comparison
+
+Both runs use the same 4-bit CLEF Flash checkpoint through SystemOne.
+The raw-text run passed the two earlier tasks but failed all three variation tasks.
+The structured run passed all five live Harbor tasks without trial exceptions.
+It also compiled and executed the merged Rust greetings.
+
+| Case group | Raw-text correct / total | Structured correct / total | Raw-text unsafe acceptances | Structured unsafe acceptances |
+| --- | ---: | ---: | ---: | ---: |
+| Policy wording | 15 / 18 | 18 / 18 | 3 | 0 |
+| Choice order | 10 / 18 | 18 / 18 | 8 | 0 |
+| Injection location | 8 / 15 | 15 / 15 | 7 | 0 |
+| Total | 33 / 51 | 51 / 51 | 18 | 0 |
+
+Neither run escalated a permitted change.
+The runs use different change hashes and timestamps.
+This comparison does not isolate a cause for the improvement.
+The bounded cases do not establish safe unattended approval for other inputs.
+
+The raw-text report remains in `.devenv/clef-tests/harbor-clef-flash-six-areas.json`.
+The structured report remains in `.devenv/clef-tests/harbor-clef-flash-structured-final.json`.
+Both reports retain requests, decisions, audit records, safety metrics, and review times.
 
 ### Existing standalone model checks
 

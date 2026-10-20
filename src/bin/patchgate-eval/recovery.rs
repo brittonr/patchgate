@@ -180,7 +180,19 @@ fn kill_at_application(
         fs::remove_file(temporary)?;
     }
     let repo_path = repo.path.canonicalize()?;
+    let binary = match repo
+        .env
+        .get(OsStr::new("PATCHGATE_EVAL_UNWRAPPED_BIN"))
+        .or_else(|| repo.env.get(OsStr::new("PATCHGATE_BIN")))
+    {
+        Some(path) => PathBuf::from(path),
+        None => gate_binary()?,
+    };
     let extra = [
+        (
+            "PATCHGATE_BIN",
+            binary.to_str().context("The gate path is not UTF-8")?,
+        ),
         ("PATH", wrapper.path.as_str()),
         ("PATCHGATE_EVAL_INTERCEPTOR", wrapper.executable.as_str()),
         ("PATCHGATE_EVAL_REAL_PIJUL", wrapper.real.as_str()),

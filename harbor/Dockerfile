@@ -7,15 +7,19 @@ COPY devenv.lock /build/devenv.lock
 
 COPY harbor/environment.nix /build/harbor/environment.nix
 
+COPY nix /build/nix
+
 RUN nix-build /build/harbor/environment.nix -A tools --option sandbox false --out-link /tools
 
 COPY Cargo.toml Cargo.lock /build/
 
 COPY src /build/src
 
-COPY nix/package.nix /build/nix/package.nix
 
 COPY harbor/scenarios.py /build/harbor/scenarios.py
+
+# The installed application must pass the runtime check on Linux.
+RUN nix-build /build/harbor/environment.nix -A runtimeCheck --option sandbox false --no-out-link
 
 # The rootfs files become real files that the agent can change.
 # The scripts of the tasks start with #!/bin/bash, and the base image has only /bin/sh.

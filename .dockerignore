@@ -5,6 +5,6 @@
 !src/
 !src/**
 !nix/
-!nix/package.nix
+!nix/**
 !harbor/environment.nix
 !harbor/scenarios.py

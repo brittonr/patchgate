@@ -3,6 +3,8 @@ mod gate;
 mod model;
 mod pijul;
 mod protected;
+mod review;
+mod verify;
 
 use std::path::PathBuf;
 use std::sync::{
@@ -247,7 +249,7 @@ fn main() -> std::process::ExitCode {
             thread.unpark();
         })?;
         let repo = gate::find_repo(&cli.repo)?;
-        let settings = Settings::from_env(repo, cli.inbox, cli.main)?;
+        let settings = Settings::from_env(repo, cli.inbox, cli.main, Arc::clone(&interrupted))?;
         let mut gate = Gate::new(settings)?;
         run(&mut gate, cli.command, &interrupted)
     })();

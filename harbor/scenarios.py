@@ -135,11 +135,44 @@ def escalate(reason: str) -> dict:
     return {"choice": "escalate", "reason": reason}
 
 
+def review_input(body: dict) -> dict:
+    """Return structured review data from either model API."""
+    state = body["state"] if "state" in body else json.loads(body["messages"][-1]["content"])
+    assert isinstance(state, dict), "The review data must be an object."
+    assert type(state["schema_version"]) is int and state["schema_version"] == 1, "The review must use schema version 1."
+    candidate = state["candidate"]
+    assert isinstance(candidate, dict), "The candidate must be an object."
+    assert isinstance(candidate["paths"], list), "Candidate paths must be a list."
+    assert isinstance(candidate["context"]["files"], list), "Native files must be a list."
+    assert isinstance(candidate["metadata_context"], list), "Metadata context must be a list."
+    assert state["binding"]["candidates"] == [candidate["hash"]], "The review must bind its candidate."
+    assert "policy" not in state, "Policy content must remain in trusted instructions."
+    return state
+
+
+def review_contains(state: dict, path: str, text: str) -> bool:
+    """Inspect native vertices and metadata text for a candidate path."""
+    candidate = state["candidate"]
+    if path not in candidate["paths"]:
+        return False
+    return any(
+        text in vertex["text"]
+        for file in candidate["context"]["files"]
+        if file["path"] == path
+        for vertex in file["vertices"]
+        if vertex["kind"] in ("add", "keep")
+    ) or any(
+        entry["path"] == path and entry["after"] is not None and text in entry["after"]
+        for entry in candidate["metadata_context"]
+    )
+
+
+
 class Model:
     """A scripted model server for the OpenAI and SystemOne APIs."""
 
     def __init__(self, verdict=None, merge=None, status=200, api="openai", response=None):
-        self.verdict = verdict or (lambda system, change: accept("No rule applies."))
+        self.verdict = verdict or (lambda system, state: accept("No rule applies."))
         self.merge = merge or (lambda prompt: escalate("This script has no merge."))
         self.status = status
         self.api = api
@@ -153,6 +186,11 @@ class Model:
                     self.send_error(404)
                     return
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if model.api == "systemone":
+                    if "review" in body["questions"]:
+                        review_input(body)
+                elif body["response_format"]["json_schema"]["name"] != "merge":
+                    review_input(body)
                 if model.response is not None:
                     reply = model.response(body)
                 else:
@@ -160,7 +198,7 @@ class Model:
                     if body["response_format"]["json_schema"]["name"] == "merge":
                         content = model.merge(user)
                     else:
-                        content = model.verdict(system, user)
+                        content = model.verdict(system, review_input(body))
                     if not isinstance(content, str):
                         content = json.dumps(content)
                     reply = {"choices": [{"message": {"role": "assistant", "content": content}}]}
@@ -434,8 +472,8 @@ class RejectedDependencyBlocks:
         }
 
     def solve(self, directory: Path) -> None:
-        def verdict(system: str, change: str) -> dict:
-            if "SECRET" in change:
+        def verdict(system: str, state: dict) -> dict:
+            if review_contains(state, "secret.env", "SECRET"):
                 return {"decision": "reject", "summary": "A secret.", "reason": "Rule 1: the change adds a secret."}
             return accept("No rule applies.")
 
@@ -461,8 +499,8 @@ class PolicyChangeNeedsHuman:
         }
 
     def solve(self, directory: Path) -> None:
-        def verdict(system: str, change: str) -> dict:
-            if "Reject a change that adds a TODO" in system and "TODO" in change:
+        def verdict(system: str, state: dict) -> dict:
+            if "Reject a change that adds a TODO" in system and review_contains(state, "notes.txt", "TODO"):
                 return {"decision": "reject", "summary": "A TODO.", "reason": "The policy rejects a TODO."}
             return accept("No rule applies.")
 
@@ -529,7 +567,7 @@ class InvalidReplyEscalates:
         return {"notes": repo.change({"notes.txt": "notes\n"}, "Add notes")}
 
     def solve(self, directory: Path) -> None:
-        with Model(verdict=lambda system, change: "It looks fine to me.") as model:
+        with Model(verdict=lambda system, state: "It looks fine to me.") as model:
             patchgate(directory / "repo", model, "review")
 
     def check(self, c: Check) -> None:
@@ -736,7 +774,7 @@ class HumanDependencyOverride:
     def solve(self, directory: Path) -> None:
         repo = directory / "repo"
         facts = json.loads((directory / "facts.json").read_text())
-        reject = lambda system, change: {"decision": "reject", "summary": "A secret.", "reason": "The policy rejects a secret."}
+        reject = lambda system, state: {"decision": "reject", "summary": "A secret.", "reason": "The policy rejects a secret."}
         with Model(verdict=reject) as model:
             assert patchgate(repo, model, "review").returncode == 0
             c = Check(directory)
@@ -749,7 +787,7 @@ class HumanDependencyOverride:
             assert result.returncode != 0, "Human acceptance must fail while the prerequisite is absent."
             assert workflow_snapshot(repo, ("main", "inbox")) == before, "Refusal must preserve both channels and the ledger."
             assert patchgate(repo, model, "accept", facts["prerequisite"], "--reason", "The owner permits this secret.").returncode == 0
-            model.verdict = lambda system, change: accept("The owner permits this extension.")
+            model.verdict = lambda system, state: accept("The owner permits this extension.")
             assert patchgate(repo, model, "review").returncode == 0
             assert patchgate(repo, model, "review").returncode == 0
 
@@ -823,8 +861,8 @@ class CustomChannelsPolicy:
         facts = json.loads((directory / "facts.json").read_text())
         settings = {"PATCHGATE_MAIN": "stable", "PATCHGATE_INBOX": "proposals", "PATCHGATE_POLICY": "review-rules.txt", "PATCHGATE_PROTECTED": ""}
 
-        def verdict(system: str, change: str) -> dict:
-            if "Reject a change that adds a TODO" in system and "TODO" in change:
+        def verdict(system: str, state: dict) -> dict:
+            if "Reject a change that adds a TODO" in system and review_contains(state, "notes.txt", "TODO"):
                 return {"decision": "reject", "summary": "A TODO.", "reason": "The custom policy rejects a TODO."}
             return accept("No rule applies.")
 
@@ -897,13 +935,12 @@ class SystemOneReviewDecisions:
 
     def solve(self, directory: Path) -> None:
         def response(body: dict) -> dict:
-            state = body["state"]
-            change = state["change"]
-            if "public-note-content" in change:
+            state = review_input(body)
+            if review_contains(state, "notes.txt", "public-note-content"):
                 decision = "accept"
-            elif "private-secret-content" in change:
+            elif review_contains(state, "secret.txt", "private-secret-content"):
                 decision = "reject"
-            elif "manual-review-content" in change:
+            elif review_contains(state, "request.txt", "manual-review-content"):
                 decision = "escalate"
             else:
                 raise AssertionError("The review must contain a known change.")
@@ -1028,10 +1065,10 @@ class SystemOneResponseRecovery:
         ]
         for invalid in malformed:
             def response(body: dict) -> dict:
-                state = body["state"]
-                if "recovery-benign-content" in state["change"]:
+                state = review_input(body)
+                if review_contains(state, "notes.txt", "recovery-benign-content"):
                     return invalid
-                assert "unknown-choice-content" in state["change"], "The request must contain a known change."
+                assert review_contains(state, "later.txt", "unknown-choice-content"), "The request must contain a known change."
                 return _systemone_answer("review", "accept")
 
             before = _systemone_snapshot(repo)
@@ -1041,10 +1078,10 @@ class SystemOneResponseRecovery:
             assert _systemone_snapshot(repo) == before, "A failed review must preserve both channels and all ledger bytes."
 
         def recovered(body: dict) -> dict:
-            state = body["state"]
-            if "recovery-benign-content" in state["change"]:
+            state = review_input(body)
+            if review_contains(state, "notes.txt", "recovery-benign-content"):
                 return _systemone_answer("review", "accept")
-            assert "unknown-choice-content" in state["change"], "The request must contain a known change."
+            assert review_contains(state, "later.txt", "unknown-choice-content"), "The request must contain a known change."
             return _systemone_answer("review", "unlisted-choice")
 
         with Model(api="systemone", response=recovered) as model:

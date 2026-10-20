@@ -5,10 +5,17 @@
   ...
 }:
 
+let
+  # <!-- ste-disable-next-line semicolon -->
+  package = import ./nix/package.nix { inherit pkgs; };
+  # <!-- ste-disable-next-line semicolon -->
+  runtimeCheck = import ./nix/runtime-check.nix { inherit pkgs package; };
+in
 {
   # Pijul stores changes. Cargo runs the Rust gate from the current source.
   packages = [
-    pkgs.pijul
+    # <!-- ste-disable-next-line semicolon -->
+    (import ./nix/pijul.nix { inherit pkgs; })
     pkgs.openssh
     pkgs.cargo
     pkgs.rustc
@@ -18,9 +25,13 @@
   # <!-- ste-disable-next-line semicolon -->
   languages.python.enable = true;
 
-  # `devenv build` builds the same package as Harbor without a second shell build.
+  # Both outputs share one Rust build with the Harbor environment.
   # <!-- ste-disable-next-line semicolon -->
-  outputs.patchgate = import ./nix/package.nix { inherit pkgs; };
+  outputs.patchgate = package;
+  # <!-- ste-disable-next-line semicolon -->
+  outputs.patchgate-eval = package.eval;
+  # <!-- ste-disable-next-line semicolon -->
+  outputs.runtime-check = runtimeCheck;
 
   # patchgate sends each change to a model server with an OpenAI-compatible API.
   # LM Studio gives this API on port 1234. Ollama and llama.cpp also give it.
@@ -67,5 +78,9 @@
   # `devenv test` runs each Harbor task with the oracle agent and with the nop agent.
   # The oracle must get reward 1, and the nop agent must get reward 0.
   # <!-- ste-disable-next-line semicolon -->
-  enterTest = "patchgate-harbor check";
+  enterTest = ''
+    test -f ${runtimeCheck}/result
+    patchgate-harbor check
+  # <!-- ste-disable-next-line semicolon -->
+  '';
 }

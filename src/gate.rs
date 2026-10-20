@@ -4,6 +4,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,7 +18,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::change::{self, Choices, Conflict, ConflictFile, Hunks, Piece, Region, Unmerged, short};
 use crate::model::{Api, Model};
-use crate::pijul::{LogEntry, Pijul, Signer};
+use crate::pijul::{ChannelSnapshot, LogEntry, Pijul, Signer};
+use crate::review::{self, ReviewBinding};
+use crate::verify::{self, Verification};
 
 pub struct Settings {
     pub repo: PathBuf,
@@ -27,11 +33,19 @@ pub struct Settings {
     protected: Vec<String>,
     max_change_chars: usize,
     timeout: Duration,
+    check_timeout: Duration,
+    interrupted: Arc<AtomicBool>,
 }
 
 impl Settings {
-    pub fn from_env(repo: PathBuf, inbox: String, main: String) -> Result<Self> {
+    pub fn from_env(
+        repo: PathBuf,
+        inbox: String,
+        main: String,
+        interrupted: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let timeout: f64 = number("PATCHGATE_TIMEOUT", 300.0)?;
+        let check_timeout: f64 = number("PATCHGATE_CHECK_TIMEOUT", 900.0)?;
         Ok(Self {
             repo,
             inbox,
@@ -53,6 +67,9 @@ impl Settings {
             max_change_chars: number("PATCHGATE_MAX_CHANGE_CHARS", 8000)?,
             timeout: Duration::try_from_secs_f64(timeout)
                 .context("PATCHGATE_TIMEOUT must be a finite, nonnegative number")?,
+            check_timeout: Duration::try_from_secs_f64(check_timeout)
+                .context("PATCHGATE_CHECK_TIMEOUT must be a finite, positive number")?,
+            interrupted,
         })
     }
 }
@@ -158,6 +175,10 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<ReviewBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<Rc<Verification>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     conflict: bool,
@@ -180,6 +201,8 @@ impl Record {
             summary: String::new(),
             at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false),
             model: None,
+            review: None,
+            verification: None,
             user: None,
             conflict: false,
             merge: None,
@@ -467,7 +490,6 @@ pub struct Gate {
     model: Model,
     protected: RegexSet,
     changes: HashMap<String, Rc<str>>,
-    policy: Option<String>,
 }
 
 impl Gate {
@@ -491,7 +513,6 @@ impl Gate {
             settings,
             ledger,
             changes: HashMap::new(),
-            policy: None,
         };
         let _lock = gate.ledger.lock()?;
         gate.recover()?;
@@ -583,7 +604,6 @@ impl Gate {
     pub fn review(&mut self, report: impl FnMut(&Item)) -> Result<Vec<Item>> {
         let _lock = self.ledger.lock()?;
         self.recover()?;
-        self.policy = None;
         self.walk(true, report)
     }
 
@@ -595,7 +615,7 @@ impl Gate {
     ) -> Result<Item> {
         let _lock = self.ledger.lock()?;
         self.recover()?;
-        let main = self.pijul.hashes(&self.settings.main)?;
+        let main = self.pijul.snapshot(&self.settings.main)?;
         let inbox = self.pijul.log(&self.settings.inbox)?;
         let prefix_upper = prefix.to_uppercase();
         let mut matches = inbox
@@ -611,7 +631,7 @@ impl Gate {
         if count > 1 {
             bail!("{prefix} matches {count} changes. Give more of the hash.");
         }
-        if main.contains(&entry.hash) {
+        if main.hashes.contains(&entry.hash) {
             let hint = if decision == "reject" {
                 format!(
                     " To remove it, run: pijul unrecord --channel {} {}",
@@ -660,7 +680,7 @@ impl Gate {
             item.state = State::from_decision(decision);
             return Ok(item);
         }
-        let hashes = self.with_conflicting_dependencies(&item.hash, &main, &inbox)?;
+        let hashes = self.with_conflicting_dependencies(&item.hash, &main.hashes, &inbox)?;
         let records: Vec<_> = hashes.iter().map(|hash| record(hash)).collect();
         match self.land(&hashes, &main, &records) {
             Err(error) => {
@@ -692,14 +712,15 @@ impl Gate {
     ) -> Result<Vec<String>> {
         let records = self.ledger.latest()?;
         let mut needed = HashSet::new();
-        let mut todo: Vec<_> = change::dependencies(&self.change_text(hash)?)
+        // A resolution can reference a conflict without a direct dependency.
+        let mut todo: Vec<_> = change::related_changes(&self.change_text(hash)?)
             .into_iter()
             .filter(|hash| !main.contains(hash))
             .collect();
         while let Some(dependency) = todo.pop() {
             if needed.insert(dependency.clone()) {
                 todo.extend(
-                    change::dependencies(&self.change_text(&dependency)?)
+                    change::related_changes(&self.change_text(&dependency)?)
                         .into_iter()
                         .filter(|hash| !main.contains(hash)),
                 );
@@ -775,18 +796,28 @@ impl Gate {
         text: &str,
         main: &mut HashSet<String>,
     ) -> Result<()> {
-        let mut record = self.decide(item, text)?;
+        let reviewed = self.pijul.snapshot(&self.settings.main)?;
+        if reviewed.hashes != *main {
+            bail!(
+                "Channel {} changed during review. Run patchgate review again before another decision.",
+                self.settings.main
+            );
+        }
+        let mut record = self.decide(item, text, &reviewed)?;
+        self.require_current_main(&reviewed)?;
         let mut extra = BTreeSet::new();
         if record.decision == "accept" {
             match self.land(
                 std::slice::from_ref(&item.hash),
-                main,
+                &reviewed,
                 std::slice::from_ref(&record),
             ) {
                 Err(error) => {
                     let problem = error.downcast::<Unmerged>()?;
                     record.decision = "escalate".into();
                     record.by = "gate".into();
+                    record.model = None;
+                    record.review = None;
                     record.conflict = true;
                     record.reason = format!(
                         "The change conflicts with {}, and patchgate did not merge it. {problem} To merge it by hand, edit the conflict in {}, record the result, and run: patchgate accept <hash of the result>",
@@ -820,7 +851,7 @@ impl Gate {
         self.check_extra(&extra)
     }
 
-    fn decide(&mut self, item: &Item, text: &str) -> Result<Record> {
+    fn decide(&mut self, item: &Item, text: &str, main: &ChannelSnapshot) -> Result<Record> {
         let mut record = Record::new(
             item.hash.clone(),
             item.message.clone(),
@@ -847,8 +878,11 @@ impl Gate {
             return Ok(record);
         }
         let touched: Vec<_> = paths
-            .into_iter()
-            .filter(|path| self.protected.is_match(path))
+            .iter()
+            .filter(|path| {
+                Path::new(path).starts_with(verify::DIRECTORY) || self.protected.is_match(path)
+            })
+            .map(String::as_str)
             .collect();
         if !touched.is_empty() {
             record.reason = format!(
@@ -857,30 +891,51 @@ impl Gate {
             );
             return Ok(record);
         }
-        let length = text.chars().count();
+        let candidate =
+            match self
+                .pijul
+                .review_change(&self.settings.inbox, &item.hash, text, &paths)
+            {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    record.reason = format!(
+                        "The change has no complete text context. A human must review it. {error}"
+                    );
+                    return Ok(record);
+                }
+            };
+        let policy = self
+            .pijul
+            .read_file(&self.settings.main, &self.settings.policy)?
+            .ok_or_else(|| anyhow!(
+                "{} has no {}, so the model has no policy. Accept the change that adds {}: patchgate accept <hash>",
+                self.settings.main, self.settings.policy, self.settings.policy
+            ))?;
+        let binding = ReviewBinding::new(
+            std::slice::from_ref(&item.hash),
+            &self.settings.policy,
+            Some(&policy),
+            &self.settings.main,
+            main,
+        );
+        let input = review::input(&candidate, &binding)?;
+        let length = input.get().chars().count();
         if length > self.settings.max_change_chars {
             record.reason = format!(
-                "The change text has {length} characters. The model limit is {}. A human must review it.",
+                "The structured change context has {length} characters. The model limit is {}. A human must review it.",
                 self.settings.max_change_chars
             );
             return Ok(record);
         }
-        if self.policy.is_none() {
-            self.policy = self
-                .pijul
-                .read_file(&self.settings.main, &self.settings.policy)?;
-        }
-        let policy = self.policy.as_deref().ok_or_else(|| anyhow!(
-            "{} has no {}, so the model has no policy. Accept the change that adds {}: patchgate accept <hash>",
-            self.settings.main, self.settings.policy, self.settings.policy
-        ))?;
-        match self.model.review(policy, &item.hash, text)? {
+        self.require_current_main(main)?;
+        match self.model.review(&policy, &input)? {
             Some(verdict) => {
                 record.decision = verdict.decision;
                 record.summary = verdict.summary;
                 record.reason = verdict.reason;
                 record.by = "model".into();
                 record.model = Some(self.settings.model.clone());
+                record.review = Some(binding);
             }
             None => {
                 record.reason = format!(
@@ -895,7 +950,7 @@ impl Gate {
     fn land(
         &mut self,
         hashes: &[String],
-        main: &HashSet<String>,
+        main: &ChannelSnapshot,
         records: &[Record],
     ) -> Result<Landing> {
         let log_paths: HashMap<_, _> = self
@@ -930,6 +985,12 @@ impl Gate {
             &path,
         ])?;
         let scratch = Pijul::new(path);
+        if scratch.snapshot(&self.settings.main)? != *main {
+            bail!(
+                "The main channel changed before candidate verification. Run patchgate review again."
+            );
+        }
+        let checks = verify::Plan::load(&scratch, &self.settings.main)?;
         let mut reported = Vec::new();
         for hash in hashes {
             let (_, stderr) = scratch.call([Path::new("apply"), &self.pijul.change_file(hash)])?;
@@ -951,7 +1012,7 @@ impl Gate {
             None
         } else {
             remaining.extend(reported.into_iter().filter(|r| files.contains_key(&r.path)));
-            Some(self.merge(&scratch, hashes, &remaining, &files)?)
+            Some(self.merge(&scratch, hashes, main, &remaining, &files)?)
         };
         // Apply the candidate and its resolution in one Pijul transaction.
         let mut args = vec![
@@ -972,9 +1033,32 @@ impl Gate {
             }
             audit.push(merge.clone());
         }
+        if let Some(checks) = checks {
+            self.require_current_main(main)?;
+            let source = directory.path().join("candidate-source");
+            scratch.export_source(&self.settings.main, &source)?;
+            let verification = Rc::new(checks.run(
+                &source,
+                hashes,
+                merge.as_ref().map(|record| record.hash.as_str()),
+                review::MainBinding {
+                    channel: self.settings.main.clone(),
+                    state: main.state.clone(),
+                },
+                self.settings.check_timeout,
+                &self.settings.interrupted,
+            )?);
+            for record in &mut audit {
+                record.verification = Some(Rc::clone(&verification));
+            }
+        }
         self.pijul
             .check_paths(&paths)
             .map_err(|error| Unmerged(error.to_string()))?;
+        self.require_current_main(main)?;
+        if self.settings.interrupted.load(Ordering::Relaxed) {
+            bail!("Interrupted before acceptance");
+        }
         let intent = self
             .ledger
             .prepare(&self.settings.main, &self.settings.inbox, audit)?;
@@ -999,7 +1083,7 @@ impl Gate {
         }
         let extra = after
             .iter()
-            .filter(|hash| !main.contains(*hash) && !expected.contains(hash.as_str()))
+            .filter(|hash| !main.hashes.contains(*hash) && !expected.contains(hash.as_str()))
             .cloned()
             .collect();
         self.ledger.reconcile(&intent, true)?;
@@ -1014,6 +1098,16 @@ impl Gate {
             merge,
             note,
         })
+    }
+
+    fn require_current_main(&self, expected: &ChannelSnapshot) -> Result<()> {
+        if self.pijul.snapshot(&self.settings.main)? != *expected {
+            bail!(
+                "Channel {} changed during review. Run patchgate review again before another decision.",
+                self.settings.main
+            );
+        }
+        Ok(())
     }
 
     fn conflicted_files(
@@ -1047,6 +1141,7 @@ impl Gate {
         &mut self,
         scratch: &Pijul,
         hashes: &[String],
+        main: &ChannelSnapshot,
         report: &[Conflict],
         files: &BTreeMap<String, ConflictFile>,
     ) -> Result<Record> {
@@ -1228,6 +1323,16 @@ impl Gate {
         }
         let mut record = Record::new(hash.into(), message, "merge", "model", reasons.join(" "));
         record.model = Some(self.settings.model.clone());
+        let policy = self
+            .pijul
+            .read_file(&self.settings.main, &self.settings.policy)?;
+        record.review = Some(ReviewBinding::new(
+            hashes,
+            &self.settings.policy,
+            policy.as_deref(),
+            &self.settings.main,
+            main,
+        ));
         record.for_hashes = hashes.to_vec();
         record.files = merged.into_keys().collect();
         Ok(record)
@@ -1238,7 +1343,7 @@ impl Gate {
         let mut todo = hashes.to_vec();
         while let Some(hash) = todo.pop() {
             if known.insert(hash.clone()) {
-                todo.extend(change::dependencies(&self.change_text(&hash)?));
+                todo.extend(change::related_changes(&self.change_text(&hash)?));
             }
         }
         Ok(self

@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "checks": ["build.nix"],
+  "inputs": {
+    "nixpkgs": {
+      "url": "https://github.com/NixOS/nixpkgs/archive/8edc0c72e3a38faf5434e40d1f19431125fe4b30.tar.gz",
+      "nar_hash": "sha256-tqM7xDEsaeK1p6VvRygeZ9LkQRpUUkbRT02BHv6hnTM="
+    }
+  }
+}

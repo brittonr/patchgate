@@ -6,7 +6,11 @@ use regex::Regex;
 use serde_json::Value;
 
 static DEPENDENCY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\[(?:\d+|\*)\]\+?\s*([A-Z2-7]{53})").expect("valid dependency pattern")
+    Regex::new(r"^\[\d+\]\s+([A-Z2-7]{53})(?:\s|$)").expect("valid dependency pattern")
+});
+static CHANGE_REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\[(?:\d+|\*)\]\+?\s*([A-Z2-7]{53})(?:\s|$)")
+        .expect("valid change reference pattern")
 });
 static SECTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^# (?:Hunks|Changes)$").expect("valid section pattern"));
@@ -121,6 +125,14 @@ pub fn short(hash: &str) -> &str {
 }
 
 pub fn dependencies(text: &str) -> Vec<String> {
+    parse_change_hashes(text, &DEPENDENCY)
+}
+
+pub fn related_changes(text: &str) -> Vec<String> {
+    parse_change_hashes(text, &CHANGE_REFERENCE)
+}
+
+fn parse_change_hashes(text: &str, pattern: &Regex) -> Vec<String> {
     let mut found = Vec::new();
     let mut seen = HashSet::new();
     let mut inside = false;
@@ -128,7 +140,7 @@ pub fn dependencies(text: &str) -> Vec<String> {
         if line.starts_with("# ") {
             inside = line.trim_end() == "# Dependencies";
         } else if inside {
-            if let Some(capture) = DEPENDENCY.captures(line) {
+            if let Some(capture) = pattern.captures(line) {
                 let hash = capture.get(1).expect("dependency capture").as_str();
                 if seen.insert(hash) {
                     found.push(hash.to_owned());
@@ -553,12 +565,15 @@ mod tests {
     }
 
     #[test]
-    fn dependencies_respect_sections_and_first_occurrence() {
+    fn dependencies_match_native_prerequisites_not_context() {
         let a = "A".repeat(53);
         let b = "B".repeat(53);
-        let text =
-            format!("[1] {b}\n# Dependencies  \n[2] {a}\n[3]+{b}\n[*] {a}\n# Hunks\n[4] {b}\n");
-        assert_eq!(dependencies(&text), vec![a, b]);
+        let c = "C".repeat(53);
+        let text = format!(
+            "[1] {b}\n# Dependencies  \n[2] {a}\n[3]+{b}\n[*] {b}\n[4] {c}\n[5] {a}\n# Hunks\n[6] {b}\n"
+        );
+        assert_eq!(dependencies(&text), vec![a.clone(), c.clone()]);
+        assert_eq!(related_changes(&text), vec![a, b, c]);
     }
 
     #[test]

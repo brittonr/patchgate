@@ -14,25 +14,35 @@
 }:
 
 let
+  # <!-- ste-disable-next-line semicolon -->
+  pijul = import ../nix/pijul.nix { inherit pkgs; };
+
   # Rust fixtures need a compiler, linker, and process tools.
   # <!-- ste-disable-next-line semicolon -->
   rustTools = (with pkgs; [ cargo rustc stdenv.cc ]) ++ pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.procps ];
 
   # Harbor also retains the runtime of the older tasks.
   # <!-- ste-disable-next-line semicolon -->
-  tools = pkgs.buildEnv { name = "patchgate-harbor-tools"; paths = (with pkgs; [ bashInteractive coreutils findutils gnugrep gnutar gzip openssh pijul python3 ]) ++ rustTools; };
+  shellTools = with pkgs; [ bashInteractive coreutils findutils gnugrep gnutar gzip openssh python3 ];
+
+  # <!-- ste-disable-next-line semicolon -->
+  tools = pkgs.buildEnv { name = "patchgate-harbor-tools"; paths = [ pijul ] ++ shellTools ++ rustTools; };
 
   # The shared Rust package supplies the executable.
   # <!-- ste-disable-next-line semicolon -->
   patchgate = import ../nix/package.nix { inherit pkgs; };
+  # <!-- ste-disable-next-line semicolon -->
+  runtimeCheck = import ../nix/runtime-check.nix { inherit pkgs; package = patchgate; };
 
   # Only the Harbor script enters the task layout.
   # <!-- ste-disable-next-line semicolon -->
   project = pkgs.lib.fileset.toSource { root = ../.; fileset = ./scenarios.py; };
 
   # The rootfs directory gives /opt/patchgate and one repository for each scenario in /scenarios.
-  # <!-- ste-disable-next-line semicolon -->
-  scenarios = pkgs.runCommand "patchgate-harbor-scenarios" { nativeBuildInputs = [ tools patchgate ]; } ''
+  scenarios = pkgs.runCommand "patchgate-harbor-scenarios" {
+    # <!-- ste-disable-next-line semicolon -->
+    nativeBuildInputs = [ tools patchgate patchgate.eval ];
+  } ''
     # The compiled gate starts each repository.
 
     mkdir -p $out/rootfs/opt
@@ -45,8 +55,13 @@ let
 in
 {
   # <!-- ste-disable-next-line semicolon -->
-  inherit tools;
+  inherit tools runtimeCheck;
   # The environment retains the existing task layout.
+  default = pkgs.buildEnv {
+    # <!-- ste-disable-next-line semicolon -->
+    name = "patchgate-harbor-environment";
+    # <!-- ste-disable-next-line semicolon -->
+    paths = [ tools patchgate patchgate.eval scenarios ];
   # <!-- ste-disable-next-line semicolon -->
-  default = pkgs.buildEnv { name = "patchgate-harbor-environment"; paths = [ tools patchgate scenarios ]; };
+  };
 }

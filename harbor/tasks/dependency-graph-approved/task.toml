@@ -1,0 +1,15 @@
+schema_version = "1.4"
+artifacts = [{ source = "/scenarios/dependency-graph-approved/model-metrics.json", destination = "model-metrics.json" }]
+
+[metadata]
+
+[verifier]
+timeout_sec = 120.0
+
+[agent]
+timeout_sec = 300.0
+
+[environment]
+docker_image = "patchgate-harbor:dev"
+workdir = "/scenarios/dependency-graph-approved"
+build_timeout_sec = 900.0

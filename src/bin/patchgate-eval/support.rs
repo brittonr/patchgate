@@ -226,7 +226,15 @@ impl Repo {
         args: &[&str],
         extra: &[(&str, &str)],
     ) -> Result<Command> {
-        let mut command = Command::new(gate_binary()?);
+        let binary =
+            if let Some((_, path)) = extra.iter().rev().find(|(key, _)| *key == "PATCHGATE_BIN") {
+                PathBuf::from(path)
+            } else if let Some(path) = self.env.get(OsStr::new("PATCHGATE_BIN")) {
+                PathBuf::from(path)
+            } else {
+                gate_binary()?
+            };
+        let mut command = Command::new(binary);
         command
             .args(args)
             .current_dir(&self.path)
@@ -466,6 +474,11 @@ fn serve_request(mut stream: TcpStream, handler: &dyn Fn(Request) -> Reply) -> R
         path,
         body: serde_json::from_slice(&bytes[end..end + length])?,
     };
+    if request.body["questions"]["review"].is_object()
+        || request.body["response_format"]["json_schema"]["name"] == "verdict"
+    {
+        review_input(&request.body)?;
+    }
     let reply = handler(request);
     let body = serde_json::to_vec(&reply.body)?;
     write!(
@@ -476,6 +489,107 @@ fn serve_request(mut stream: TcpStream, handler: &dyn Fn(Request) -> Reply) -> R
     )?;
     stream.write_all(&body)?;
     Ok(())
+}
+
+pub fn review_input(body: &Value) -> Result<Value> {
+    let input = if body["questions"]["review"].is_object() {
+        body.get("state").context("Missing review state")?.clone()
+    } else {
+        let content = body["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "user"))
+            .and_then(|message| message["content"].as_str())
+            .context("Missing review user content")?;
+        serde_json::from_str(content).context("Invalid review JSON")?
+    };
+    ensure!(input.is_object(), "Review data must be an object");
+    ensure!(
+        input["schema_version"].as_u64() == Some(1),
+        "Unknown review schema version"
+    );
+    ensure!(input["candidate"].is_object(), "Missing candidate object");
+    ensure!(input["binding"].is_object(), "Missing binding object");
+    ensure!(
+        input.get("change").is_none(),
+        "Raw change aliases are not valid"
+    );
+    ensure!(
+        input["candidate"]["context"].is_object(),
+        "Missing native context object"
+    );
+    ensure!(
+        input["candidate"]["context"]["files"].is_array(),
+        "Missing native context files"
+    );
+    ensure!(
+        input["candidate"]["paths"].is_array(),
+        "Missing candidate paths"
+    );
+    ensure!(
+        input["candidate"]["metadata_context"].is_array(),
+        "Missing metadata context"
+    );
+    ensure!(
+        input["binding"]["candidates"].is_array(),
+        "Missing bound candidate hashes"
+    );
+    ensure!(
+        input["binding"]["policy"].is_object(),
+        "Missing bound policy object"
+    );
+    ensure!(
+        input["binding"]["main"].is_object(),
+        "Missing bound main object"
+    );
+    for file in input["candidate"]["context"]["files"]
+        .as_array()
+        .expect("Native context files")
+    {
+        ensure!(file.is_object(), "Native context file must be an object");
+        ensure!(file["path"].is_string(), "Missing native context path");
+        let vertices = file["vertices"]
+            .as_array()
+            .context("Missing native vertices")?;
+        for vertex in vertices {
+            ensure!(vertex.is_object(), "Native vertex must be an object");
+            ensure!(vertex["text"].is_string(), "Missing native vertex text");
+            ensure!(
+                matches!(vertex["kind"].as_str(), Some("add" | "del" | "keep")),
+                "Unknown native vertex kind"
+            );
+        }
+    }
+    Ok(input)
+}
+
+pub fn review_contains_text(input: &Value, needle: &str) -> bool {
+    let candidate = &input["candidate"];
+    candidate["context"]["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|file| {
+            file["vertices"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|vertex| {
+                    vertex["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(needle))
+                })
+        })
+        || candidate["metadata_context"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|file| {
+                ["before", "after"].iter().any(|side| {
+                    file[*side]
+                        .as_str()
+                        .is_some_and(|text| text.contains(needle))
+                })
+            })
 }
 
 pub fn chat_reply(content: Value) -> Reply {

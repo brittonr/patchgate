@@ -1,0 +1,14 @@
+schema_version = "1.4"
+
+[metadata]
+
+[verifier]
+timeout_sec = 120.0
+
+[agent]
+timeout_sec = 300.0
+
+[environment]
+docker_image = "patchgate-harbor:dev"
+workdir = "/scenarios/rust-merge-errors-order"
+build_timeout_sec = 900.0

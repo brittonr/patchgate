@@ -1,9 +1,15 @@
 mod concurrency;
+mod contracts;
 mod controls;
 mod executable;
+mod generalization;
+mod graphs;
 mod hostile;
 mod real_model;
 mod recovery;
+mod stale;
+mod storage;
+mod structured;
 mod support;
 
 use std::ffi::OsString;
@@ -78,10 +84,16 @@ struct SolveArgs {
 fn scenarios() -> impl Iterator<Item = &'static Scenario> {
     [
         executable::SCENARIOS,
+        contracts::SCENARIOS,
         concurrency::SCENARIOS,
+        graphs::SCENARIOS,
         recovery::SCENARIOS,
         hostile::SCENARIOS,
         real_model::SCENARIOS,
+        generalization::SCENARIOS,
+        stale::SCENARIOS,
+        storage::SCENARIOS,
+        structured::SCENARIOS,
     ]
     .into_iter()
     .flatten()
@@ -102,15 +114,10 @@ fn setup(case: &Scenario, directory: &Path, signer: &Signer) -> Result<()> {
     Ok(())
 }
 
-fn verify(case: &Scenario, directory: &Path) -> Vec<String> {
-    let mut check = match Check::new(directory) {
-        Ok(check) => check,
-        Err(error) => return vec![format!("{error:#}")],
-    };
-    if let Err(error) = (case.check)(&mut check) {
-        check.failures.push(format!("{error:#}"));
-    }
-    check.failures
+fn verify(case: &Scenario, directory: &Path) -> Result<Vec<String>> {
+    let mut check = Check::new(directory)?;
+    (case.check)(&mut check)?;
+    Ok(check.failures)
 }
 
 fn smoke(cases: &[String]) -> Result<()> {
@@ -132,7 +139,7 @@ fn smoke(cases: &[String]) -> Result<()> {
                 if oracle {
                     (case.solve)(&directory, &options)?;
                 }
-                Ok(verify(case, &directory))
+                verify(case, &directory)
             });
             trials += 1;
             match result {
@@ -195,15 +202,32 @@ fn run() -> Result<()> {
             directory,
             reward,
         } => {
-            let failures = verify(find_scenario(&name)?, &directory);
+            let (failures, verifier_error) = match verify(find_scenario(&name)?, &directory) {
+                Ok(failures) => (failures, None),
+                Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+            };
             for failure in &failures {
                 eprintln!("FAIL: {failure}");
             }
+            if let Some(error) = &verifier_error {
+                eprintln!("VERIFIER ERROR: {error}");
+            }
+            let valid = failures.is_empty() && verifier_error.is_none();
             if let Some(parent) = reward.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::write(reward, if failures.is_empty() { "1\n" } else { "0\n" })?;
-            println!("reward: {}", u8::from(failures.is_empty()));
+            let evidence = reward.with_file_name("patchgate-check.json");
+            fs::write(
+                evidence,
+                serde_json::to_vec_pretty(&json!({
+                    "scenario": name,
+                    "reward": u8::from(valid),
+                    "failures": failures,
+                    "verifier_error": verifier_error,
+                }))?,
+            )?;
+            fs::write(reward, if valid { "1\n" } else { "0\n" })?;
+            println!("reward: {}", u8::from(valid));
         }
         Action::Smoke { cases } => smoke(&cases)?,
         Action::VerifyHarbor(args) => controls::verify_harbor(args)?,
