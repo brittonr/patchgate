@@ -42,6 +42,9 @@ RUN cp -R /env/rootfs/. / && \
     chmod -R u+w /opt/patchgate /scenarios && \
     ln -sf /env/bin/bash /bin/bash
 
+# Runtime checks need a real Nix sandbox. Only the Nix tasks receive container privileges.
+RUN printf '\nsandbox = true\n' >> /etc/nix/nix.conf
+
 ENV PATH=/env/bin:$PATH
 
 WORKDIR /scenarios

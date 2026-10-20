@@ -12,6 +12,7 @@ mod stale;
 mod storage;
 mod structured;
 mod support;
+mod trusted_nix;
 
 use std::ffi::OsString;
 
@@ -98,6 +99,7 @@ fn scenarios() -> impl Iterator<Item = &'static Scenario> {
         apply_race::SCENARIOS,
         storage::SCENARIOS,
         structured::SCENARIOS,
+        trusted_nix::SCENARIOS,
     ]
     .into_iter()
     .flatten()

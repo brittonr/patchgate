@@ -1,0 +1,22 @@
+schema_version = "1.4"
+artifacts = [{ source = "/scenarios/nix-main-changed/nix-observations.json", destination = "nix-observations.json" }]
+
+[metadata]
+coverage = "trusted-nix"
+
+[verifier]
+timeout_sec = 180.0
+
+[agent]
+timeout_sec = 300.0
+
+[environment]
+docker_image = "patchgate-harbor:dev"
+workdir = "/scenarios/nix-main-changed"
+build_timeout_sec = 900.0
+
+[environment.healthcheck]
+command = "patchgate-eval setup nix-main-changed /scenarios/nix-main-changed"
+timeout_sec = 900.0
+start_period_sec = 0.0
+retries = 1

@@ -72,6 +72,10 @@ Use HTTPS or an immutable Nix store path.
 The project manifest pins the same Nixpkgs revision and NAR hash as `devenv.lock`.
 No check command updates a lock file.
 
+Store-path inputs retain their registered runtime references during pure import.
+The gate checks the declared NAR hash before it uses an input.
+This preserves the library closure of executable package inputs.
+
 Each check is a `{ src, system, inputs }: derivation` function in the trusted main-channel `nix/` directory.
 Use only trusted definition files and pinned inputs for Nix evaluation.
 Do not import candidate Nix expressions from `src`.
@@ -368,9 +372,9 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
 ## Tests
 
-The suite contains 53 [Harbor](https://harborframework.com) tasks in `harbor/tasks`.
+The suite contains 62 [Harbor](https://harborframework.com) tasks in `harbor/tasks`.
 Each task starts with a fixed Pijul history. Its verifier checks channel contents, local files, and decision records.
-The 31 Rust tasks use `src/bin/patchgate-eval/` for fixtures, oracles, verifiers, controls, and live-model jobs.
+The 40 Rust tasks use `src/bin/patchgate-eval/` for fixtures, oracles, verifiers, controls, and live-model jobs.
 The 22 earlier tasks retain their Python runner.
 
 
@@ -441,9 +445,33 @@ The 22 earlier tasks retain their Python runner.
 | `structured-review-binding` | Bind decisions to actual candidates, exact policy bytes, and native main states at the HTTP boundary. |
 | `structured-context-limit` | Escalate a small patch when complete file context exceeds the limit, without a model request. |
 
+#### Nix acceptance coverage
+
+| Task | Required result |
+| --- | --- |
+| `nix-acceptance` | Accept the combined greetings and bind exact source, definitions, input pins, native state, derivation, and outputs to the recorded merge. |
+| `nix-failed-build` | Refuse a failed build and preserve exact main state and every earlier audit byte. |
+| `nix-combined-failure` | Prove both contributions separately, then refuse their invalid combined result without loss of the first acceptance. |
+| `nix-hostile-definition` | Escalate a protected definition change and enforce the original main-channel check during human acceptance. |
+| `nix-hostile-input` | Refuse candidate authorization through a replacement input pin, although the permissive replacement passes independently. |
+| `nix-main-changed` | Refuse acceptance after an independent native Pijul update during the real sandbox build. |
+| `nix-timeout` | Stop a real slow build at the check deadline without acceptance or audit changes. |
+| `nix-interrupt` | Stop watch with exit 130 within three seconds after SIGINT during a real sandbox build. |
+| `nix-sandbox-exception` | Refuse an explicit sandbox exception before builder execution without main or audit changes. |
+
+These Harbor tasks need Linux Docker with a real nested Nix sandbox.
+Only these nine task definitions request a privileged container.
+Use the dedicated project engine, not an engine with unrelated workloads or credentials.
+The existing bubblewrap backend does not support their privilege declarations.
+
+The fixtures pin local immutable shell, coreutils, and limit inputs.
+Each build checks that gate-private data and caller model variables remain outside the builder.
+Verifiers compare independent source exports, NAR hashes, native state, actual outputs, and complete audit records.
+Trial-local garbage-collection roots retain input and result paths until the trial ends.
+
 
 `cargo test --locked --all-targets` checks parser boundaries, path safety, journal recovery, safe merge choices, and model replies.
-`patchgate-eval smoke` exercises all 31 Rust scenarios with oracle and nop controls.
+`patchgate-eval smoke` exercises all 40 Rust scenarios with oracle and nop controls.
 
 The storage fault cases need Linux, procfs, Rust, a C linker, and a gate binary with dynamic libc.
 They use a Rust `LD_PRELOAD` library against real file descriptors.
@@ -460,8 +488,8 @@ It then runs four oracle baseline jobs and ten stronger negative controls inside
 
 The oracles check failed commands for nonzero exits and unchanged channel hashes and ledger bytes. Verifiers check decision histories, not reason wording.
 
-The installed evaluator passed all 28 non-storage Rust scenarios with an empty caller `PATH`.
-The complete `devenv test --no-tui` run passed on 2026-10-19, including Linux storage syscall faults.
+The earlier installed evaluator check passed all 28 non-storage Rust scenarios with an empty caller `PATH`.
+The complete `devenv --no-eval-cache test --no-tui` run passed on 2026-10-20, including Linux storage syscall faults.
 
 
 The Docker image build also passed all 38 Rust tests.
@@ -470,8 +498,8 @@ Package runtime checks also passed on Darwin and Linux.
 
 | Harbor control | Trials | Required reward | Trial exceptions |
 | :--- | ---: | ---: | ---: |
-| Oracle | 53 | 1 | 0 |
-| Nop | 53 | 0 | 0 |
+| Oracle | 62 | 1 | 0 |
+| Nop | 62 | 0 | 0 |
 | Oracle baselines | 4 | 1 | 0 |
 | Stronger negative controls | 10 | 0 | 0 |
 
@@ -491,7 +519,9 @@ The oracle runs patchgate with a scripted model server in the task. The nop agen
 
 3. It installs Harbor 0.24.0 from the hash-locked `harbor/requirements.txt` in `.devenv/state/harbor`.
 
-To run another Harbor agent on the tasks, give its options to `patchgate-harbor run`, for example `patchgate-harbor run --agent nop`. Each task also has `environment/default.nix` for the bubblewrap backend of Harbor. That backend runs only on Linux, so the Docker image is the environment on macOS.
+Use `patchgate-harbor run --agent nop` to select another Harbor agent.
+The 53 earlier tasks also support the Linux bubblewrap backend through `environment/default.nix`.
+The Nix acceptance tasks need their Docker privilege declarations.
 
 ### Task image closure
 
@@ -502,10 +532,10 @@ A BuildKit bind mount keeps the export archive outside final image layers.
 
 The final image has no `/build` source tree or closure export archive.
 It retains the compiler, linker, Pijul, and Nix commands.
-All 53 scenario workdirs remain empty until startup.
+All 62 scenario workdirs remain empty until startup.
 The registered paths equal the base-image paths plus the complete `/env` closure.
 
-These measurements use an ARM64 Linux image.
+The earlier closure measurements use an ARM64 Linux image.
 GB means 1,000,000,000 bytes.
 Docker image size and registered store NAR size are separate measurements.
 
@@ -515,6 +545,32 @@ Docker image size and registered store NAR size are separate measurements.
 | Registered store NAR size | 4.486 | 3.024 |
 
 Report: `.devenv/image-closure-comparison.json`.
+
+### Task image build times
+
+These Linux ARM64 measurements use one fresh `docker-container` BuildKit builder.
+Upstream image and Nix binary caches remain enabled.
+All three durations include image export and `--load`.
+
+| Build | Seconds |
+| --- | ---: |
+| Cold private BuildKit cache | 364.2 |
+| Unchanged source and reused cache | 21.9 |
+| One Rust comment change and reused cache | 147.5 |
+
+The cached run reused all Nix build layers.
+Image transfer accounted for most of its elapsed time.
+After the source change, Cargo compiled `ring`, `serde`, and the application again.
+A separate Cargo dependency-artifact cache is the next experiment, not part of this change.
+
+The comment changed only a temporary source copy.
+The live source hash remained unchanged.
+The temporary images, private builder, cache, and source copy are removed.
+Logs, metadata, source hashes, and complete JSON evidence remain.
+
+Report: `.devenv/nix-acceptance-build-times.json`.
+Full evidence and logs: `../patchgate-build-times-20261020/`.
+
 
 ### Trial fixture lifecycle
 
@@ -590,6 +646,23 @@ Reports:
 - `.devenv/atomic-native-contract-complete/report.json`
 
 ### Trusted Nix checks
+
+The permanent Nix tasks pass oracle and nop controls on Darwin and Linux Docker.
+The HTTPS-pinned input smoke also passes.
+The scenarios caught a missing-library failure before the immutable-input reference fix.
+
+Current reports:
+
+- `.devenv/nix-acceptance-rust-checks.json`
+- `.devenv/nix-acceptance-native-final-verified.result.json`
+- `.devenv/nix-acceptance-https.json`
+- `.devenv/nix-acceptance-complete-verified.result.json`
+- `.devenv/test-state/harbor-jobs/20261020-012254-oracle/result.json`
+- `.devenv/test-state/harbor-jobs/20261020-012634-nop/result.json`
+- `.devenv/test-state/harbor-jobs/rust-negative-controls-1792474415356646000-77851.json`
+
+Earlier CLI checks:
+
 
 The CLI smoke checks used real Pijul repositories and sandboxed Nix builders.
 The installed gate used pinned Nix despite hostile caller `nix` and `nix-store` commands.

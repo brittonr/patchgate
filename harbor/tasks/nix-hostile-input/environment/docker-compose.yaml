@@ -1,0 +1,4 @@
+# Only this task receives privileges for a real nested Nix sandbox.
+services:
+  main:
+    privileged: true

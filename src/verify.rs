@@ -105,9 +105,10 @@ pub struct StoreTree {
 
 impl StoreTree {
     fn expression(&self) -> Result<String> {
+        // Pure imports can copy a tree. Retain its registered runtime references.
+        let path = nix_string(&self.path)?;
         Ok(format!(
-            "(builtins.fetchTree {{ type = \"path\"; path = {}; narHash = {}; }})",
-            nix_string(&self.path)?,
+            "(builtins.appendContext (builtins.fetchTree {{ type = \"path\"; path = {path}; narHash = {}; }}).outPath {{ {path} = {{ path = true; }}; }})",
             nix_string(&self.nar_hash)?
         ))
     }
@@ -186,24 +187,26 @@ impl Plan {
         let source = runner.add_tree(source)?;
         let mut inputs = BTreeMap::new();
         for (name, input) in &self.manifest.inputs {
-            let hash = input
-                .nar_hash
-                .replace('+', "%2B")
-                .replace('/', "%2F")
-                .replace('=', "%3D");
-            let url = format!(
-                "{}{}narHash={hash}",
-                input.url,
-                if input.url.contains('?') { '&' } else { '?' }
-            );
-            let value = runner.json(&["flake", "prefetch", "--json", &url])?;
-            let path = field(&value, "storePath")?;
-            let hash = field(&value, "hash")?;
-            ensure!(
-                hash == input.nar_hash,
-                "NAR hash differs for Nix input {name}"
-            );
-            let tree = runner.tree(path)?;
+            let tree = if let Some(path) = input.url.strip_prefix("path:") {
+                runner.tree(path)?
+            } else {
+                let hash = input
+                    .nar_hash
+                    .replace('+', "%2B")
+                    .replace('/', "%2F")
+                    .replace('=', "%3D");
+                let url = format!(
+                    "{}{}narHash={hash}",
+                    input.url,
+                    if input.url.contains('?') { '&' } else { '?' }
+                );
+                let value = runner.json(&["flake", "prefetch", "--json", &url])?;
+                ensure!(
+                    field(&value, "hash")? == input.nar_hash,
+                    "NAR hash differs for Nix input {name}"
+                );
+                runner.tree(field(&value, "storePath")?)?
+            };
             ensure!(
                 tree.nar_hash == input.nar_hash,
                 "NAR hash differs for Nix input {name}"
