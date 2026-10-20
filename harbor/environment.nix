@@ -28,6 +28,15 @@ let
   # <!-- ste-disable-next-line semicolon -->
   tools = pkgs.buildEnv { name = "patchgate-harbor-tools"; paths = [ pijul ] ++ shellTools ++ rustTools; };
 
+  # Lifecycle checks use a separate image, not the task runtime.
+  lifecycleTools = pkgs.buildEnv {
+    # <!-- ste-disable-next-line semicolon -->
+    name = "patchgate-harbor-lifecycle-tools";
+    # <!-- ste-disable-next-line semicolon sentence-length -->
+    paths = [ pkgs.python312 pkgs.uv ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.bubblewrap pkgs.util-linux ];
+  # <!-- ste-disable-next-line semicolon -->
+  };
+
   # The shared Rust package supplies the executable.
   # <!-- ste-disable-next-line semicolon -->
   patchgate = import ../nix/package.nix { inherit pkgs; };
@@ -56,7 +65,7 @@ let
 in
 {
   # <!-- ste-disable-next-line semicolon -->
-  inherit tools runtimeCheck;
+  inherit tools runtimeCheck lifecycleTools;
   # The environment retains the existing task layout.
   default = pkgs.buildEnv {
     # <!-- ste-disable-next-line semicolon -->

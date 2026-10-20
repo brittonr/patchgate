@@ -9,6 +9,8 @@
 !harbor/
 !harbor/environment.nix
 !harbor/scenarios.py
+!harbor/requirements.txt
+!harbor/lifecycle.py
 !harbor/tasks/
 !harbor/tasks/*/
 !harbor/tasks/*/task.toml

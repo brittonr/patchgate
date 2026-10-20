@@ -17,6 +17,24 @@
         "type": "github"
       }
     },
+    "harbor-bubblewrap": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1792377617,
+        "narHash": "sha256-djKBKI/75r8BRmOdNXMJVksbk8E6JpmYR8f+aYn+e0A=",
+        "ref": "harbor/bubblewrap-backend",
+        "rev": "08640fcacac5cee5a6c289b4e9e3fc888e5077b0",
+        "revCount": 724,
+        "type": "git",
+        "url": "ssh://git@github.com/jeffreyksmithjr/dev-hell.git"
+      },
+      "original": {
+        "ref": "harbor/bubblewrap-backend",
+        "rev": "08640fcacac5cee5a6c289b4e9e3fc888e5077b0",
+        "type": "git",
+        "url": "ssh://git@github.com/jeffreyksmithjr/dev-hell.git"
+      }
+    },
     "nixpkgs": {
       "inputs": {
         "nixpkgs-src": "nixpkgs-src"
@@ -56,6 +74,7 @@
     "root": {
       "inputs": {
         "devenv": "devenv",
+        "harbor-bubblewrap": "harbor-bubblewrap",
         "nixpkgs": "nixpkgs"
       }
     }

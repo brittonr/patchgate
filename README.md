@@ -229,6 +229,7 @@ patchgate review
 - [devenv](https://devenv.sh) 2.4 or later for source development and Nix builds.
 - A model server with an OpenAI-compatible API or the SystemOne API. The default is LM Studio at `http://127.0.0.1:1234/v1` with the model `google/gemma-4-e4b`. LM Studio loads the model when the first request comes.
 - An SSH agent with an Ed25519 key. `pijul record` signs each change with a key from the agent.
+- SSH read access to `git@github.com:jeffreyksmithjr/dev-hell.git` for the locked Harbor backend input.
 
 ## Build
 
@@ -449,7 +450,8 @@ They use a Rust `LD_PRELOAD` library against real file descriptors.
 They do not use production fault flags.
 Run the storage cases in the Harbor Docker environment on macOS.
 
-`devenv test` runs `patchgate-harbor check` against the compiled Rust executable.
+`devenv test` first runs the maintained `patchgate-harbor lifecycle` checks.
+It then runs `patchgate-harbor check` against the compiled Rust executable.
 It runs every task with the `oracle` and `nop` agents.
 Each oracle trial needs reward 1, and each nop trial needs reward 0.
 It then runs four oracle baseline jobs and ten stronger negative controls inside Harbor.
@@ -491,6 +493,29 @@ The oracle runs patchgate with a scripted model server in the task. The nop agen
 
 To run another Harbor agent on the tasks, give its options to `patchgate-harbor run`, for example `patchgate-harbor run --agent nop`. Each task also has `environment/default.nix` for the bubblewrap backend of Harbor. That backend runs only on Linux, so the Docker image is the environment on macOS.
 
+### Task image closure
+
+`harbor/Dockerfile` uses separate builder and runtime stages with the same digest-pinned Nix base.
+The builder runs the package runtime check.
+The final stage imports only the environment closure and registers its store paths.
+A BuildKit bind mount keeps the export archive outside final image layers.
+
+The final image has no `/build` source tree or closure export archive.
+It retains the compiler, linker, Pijul, and Nix commands.
+All 53 scenario workdirs remain empty until startup.
+The registered paths equal the base-image paths plus the complete `/env` closure.
+
+These measurements use an ARM64 Linux image.
+GB means 1,000,000,000 bytes.
+Docker image size and registered store NAR size are separate measurements.
+
+| Measure | Before, GB | After, GB |
+| --- | ---: | ---: |
+| Docker-reported image size | 1.323 | 0.980 |
+| Registered store NAR size | 4.486 | 3.024 |
+
+Report: `.devenv/image-closure-comparison.json`.
+
 ### Trial fixture lifecycle
 
 Nix derives scenario names from `harbor/tasks/*/task.toml`.
@@ -513,28 +538,41 @@ patchgate-eval setup rust-model-decisions /tmp/rust-fixture
 python3 harbor/scenarios.py setup merge-order-conflict /tmp/python-fixture
 ```
 
-Native smoke checks created two independent Python fixtures and two independent Rust fixtures.
-Each facts file matched its native Pijul history.
-A mutation in one fixture did not affect the other.
-Repeated setup failed without changes to existing state.
+Run the maintained lifecycle smoke with one command:
 
-A Nix check rebuild preserved the fixture asset NAR hash.
-The output contained 53 empty scenario workdirs and no generated repositories or facts.
+```sh
+devenv shell -- patchgate-harbor lifecycle
+```
 
-Real Docker and Linux bubblewrap trials passed for one Python task and one Rust task.
-Both backends created fixtures before agent setup for oracle and `nop` agents.
-Independent live instances retained separate files and facts.
-Repeated setup failed without a reset.
-A startup failure prevented agent setup and execution.
-The complete Docker control suite also passed after this change.
+The command includes real CLI regression tests for parser failure and a successful `nop` trial with reward 0.
+It then checks Docker and the real Linux bubblewrap backend.
+The driver exercises one Python task and one Rust task with oracle and `nop` agents.
+It also checks independent writable state, repeated-setup refusal, and startup failure before agent setup.
+The smoke covers representative tasks, not the complete suite on bubblewrap.
 
-Reports:
+Use `--backend docker` or `--backend bubblewrap` to select one backend.
+Use `--output PATH` to select the summary file.
+The default output directory is `.devenv/state/lifecycle-jobs`, or `DEVENV_STATE/lifecycle-jobs`.
 
-- `.devenv/fixture-start-native-smoke.json`
-- `.devenv/fixture-start-immutable.json`
-- `.devenv/fixture-start-docker-proof/report.json`
-- `.devenv/fixture-start-docker-proof/suite-summary.json`
-- `.devenv/fixture-start-bubble-proof/report.json`
+The `harbor-bubblewrap` input in `devenv.lock` pins revision `08640fcacac5cee5a6c289b4e9e3fc888e5077b0` and its NAR hash.
+`devenv.yaml` declares its SSH URL.
+The host needs repository read access when it fetches the input.
+The check image receives only the pinned Python package, not host SSH credentials or a separate local checkout.
+
+`harbor/lifecycle.Dockerfile` adds Harbor and bubblewrap to a separate check image.
+These dependencies do not enter the task image.
+The bubblewrap check runs inside a privileged Linux Docker container.
+Use a trusted Docker engine.
+This result does not establish rootless support on other hosts.
+
+Both backends passed all lifecycle criteria in the integrated `devenv test --no-tui` run.
+The existing full Docker controls also passed against the final task image.
+Reports from that run:
+
+- `.devenv/improvements-verification.json`
+- `.devenv/test-state/lifecycle-jobs/20261019-231857-900d6530/summary.json`
+- `.devenv/test-state/lifecycle-jobs/20261019-231857-900d6530/docker.json`
+- `.devenv/test-state/lifecycle-jobs/20261019-231857-900d6530/bubblewrap.json`
 
 ### Atomic application checks
 

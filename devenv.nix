@@ -1,4 +1,5 @@
 {
+  inputs,
   pkgs,
   lib,
   config,
@@ -10,6 +11,9 @@ let
   package = import ./nix/package.nix { inherit pkgs; };
   # <!-- ste-disable-next-line semicolon -->
   runtimeCheck = import ./nix/runtime-check.nix { inherit pkgs package; };
+  # The lock fixes the backend source revision and its content hash.
+  # <!-- ste-disable-next-line semicolon sentence-length -->
+  harborBackend = pkgs.runCommand "patchgate-harbor-bubblewrap-source" { } "cp -R ${inputs.harbor-bubblewrap}/python/hell_env $out";
 in
 {
   # Pijul stores changes. Cargo runs the Rust gate from the current source.
@@ -72,14 +76,15 @@ in
   scripts.patchgate-harbor.packages = [ pkgs.colima pkgs.docker-client pkgs.uv ];
 
   # The Compose and Buildx plugins and the Python 3.12 of Harbor come from Nix.
-  # <!-- ste-disable-next-line semicolon -->
-  scripts.patchgate-harbor.exec = ''PATCHGATE_DOCKER_PLUGINS=${pkgs.docker-compose}/libexec/docker/cli-plugins:${pkgs.docker-buildx}/libexec/docker/cli-plugins PATCHGATE_HARBOR_PYTHON=${pkgs.python312}/bin/python3.12 exec python3 "$DEVENV_ROOT/harbor/controls.py" "$@"'';
+  # <!-- ste-disable-next-line semicolon sentence-length -->
+  scripts.patchgate-harbor.exec = ''PATCHGATE_DOCKER_PLUGINS=${pkgs.docker-compose}/libexec/docker/cli-plugins:${pkgs.docker-buildx}/libexec/docker/cli-plugins PATCHGATE_HARBOR_PYTHON=${pkgs.python312}/bin/python3.12 PATCHGATE_HARBOR_BACKEND=${harborBackend} exec python3 "$DEVENV_ROOT/harbor/controls.py" "$@"'';
 
   # `devenv test` runs each Harbor task with the oracle agent and with the nop agent.
   # The oracle must get reward 1, and the nop agent must get reward 0.
   # <!-- ste-disable-next-line semicolon -->
   enterTest = ''
     test -f ${runtimeCheck}/result
+    patchgate-harbor lifecycle
     patchgate-harbor check
   # <!-- ste-disable-next-line semicolon -->
   '';

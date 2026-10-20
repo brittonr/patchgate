@@ -1,5 +1,8 @@
 # yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
 inputs:
+  harbor-bubblewrap:
+    url: git+ssh://git@github.com/jeffreyksmithjr/dev-hell.git?ref=harbor/bubblewrap-backend&rev=08640fcacac5cee5a6c289b4e9e3fc888e5077b0
+    flake: false
   nixpkgs:
     url: github:cachix/devenv-nixpkgs/rolling
 
