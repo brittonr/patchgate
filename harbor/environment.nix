@@ -66,6 +66,8 @@ in
 {
   # <!-- ste-disable-next-line semicolon -->
   inherit tools runtimeCheck lifecycleTools;
+  # <!-- ste-disable-next-line semicolon -->
+  cargoArtifacts = patchgate.cargoArtifacts;
   # The environment retains the existing task layout.
   default = pkgs.buildEnv {
     # <!-- ste-disable-next-line semicolon -->

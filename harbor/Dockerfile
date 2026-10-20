@@ -14,6 +14,9 @@ RUN nix-build /build/harbor/environment.nix -A tools --option sandbox false --ou
 
 COPY Cargo.toml Cargo.lock /build/
 
+# Cache compiled dependencies before Rust source enters the image.
+RUN nix-build /build/harbor/environment.nix -A cargoArtifacts --option sandbox false --out-link /cargo-artifacts
+
 COPY src /build/src
 
 COPY harbor/tasks /build/harbor/tasks

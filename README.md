@@ -80,6 +80,7 @@ Each check is a `{ src, system, inputs }: derivation` function in the trusted ma
 Use only trusted definition files and pinned inputs for Nix evaluation.
 Do not import candidate Nix expressions from `src`.
 `nix/build.nix` reuses `nix/package.nix` with the candidate source, including its Cargo lock file.
+The project check receives Crane through the declared, pinned inputs.
 
 The gate exports the recorded scratch channel after the final merge resolution.
 It excludes `.pijul`, `.git`, `.devenv`, `.direnv`, `target`, `result`, and `result-*` at the source root.
@@ -231,6 +232,7 @@ patchgate review
 ## Requirements
 
 - [devenv](https://devenv.sh) 2.4 or later for source development and Nix builds.
+- Nix 2.31.2 or later for Crane-based source builds.
 - A model server with an OpenAI-compatible API or the SystemOne API. The default is LM Studio at `http://127.0.0.1:1234/v1` with the model `google/gemma-4-e4b`. LM Studio loads the model when the first request comes.
 - An SSH agent with an Ed25519 key. `pijul record` signs each change with a key from the agent.
 - SSH read access to `git@github.com:jeffreyksmithjr/dev-hell.git` for the locked Harbor backend input.
@@ -247,7 +249,21 @@ cargo build --locked --release
 cargo test --locked
 ```
 
-`nix/package.nix` creates separate application and evaluator outputs from one locked Rust build.
+`nix/package.nix` first builds shared Cargo dependency artifacts.
+One application build then creates the application and evaluator outputs.
+
+Crane v0.23.3 provides `buildDepsOnly` and `buildPackage`.
+`nix/checks.json` pins its revision and NAR hash for standalone builds and trusted checks.
+
+`Cargo.toml` declares both binary targets.
+The dependency build receives only materialized `Cargo.toml` and `Cargo.lock` files.
+Rust source changes reuse compiled dependencies.
+Dependency feature changes select new artifacts.
+
+Package tests remain enabled.
+Both outputs exclude build-only vendor directories and compiled artifact archives.
+Docker builds dependency artifacts before it copies Rust source.
+
 devenv exposes these build results:
 
 - `outputs.patchgate` contains the application with pinned Pijul, OpenSSH, and Nix commands.
@@ -548,28 +564,37 @@ Report: `.devenv/image-closure-comparison.json`.
 
 ### Task image build times
 
-These Linux ARM64 measurements use one fresh `docker-container` BuildKit builder.
+Each measurement set uses one fresh Linux ARM64 `docker-container` BuildKit builder.
 Upstream image and Nix binary caches remain enabled.
 All three durations include image export and `--load`.
 
-| Build | Seconds |
-| --- | ---: |
-| Cold private BuildKit cache | 364.2 |
-| Unchanged source and reused cache | 21.9 |
-| One Rust comment change and reused cache | 147.5 |
+| Build | Before artifact reuse, seconds | With artifact reuse, seconds |
+| --- | ---: | ---: |
+| Cold private BuildKit cache | 364.2 | 599.9 |
+| Unchanged source and reused cache | 21.9 | 14.9 |
+| One Rust comment change and reused cache | 147.5 | 238.4 |
 
-The cached run reused all Nix build layers.
-Image transfer accounted for most of its elapsed time.
-After the source change, Cargo compiled `ring`, `serde`, and the application again.
-A separate Cargo dependency-artifact cache is the next experiment, not part of this change.
+The source-change run reused dependency artifacts and compiled only application code.
+Its runtime build check took 44.0 seconds.
+Image export and transfer took 117.1 seconds.
+
+The cold and source-change image builds are slower than before.
+These separate runs do not isolate machine load or filesystem performance.
+Do not treat dependency reuse as an image-build speed improvement.
 
 The comment changed only a temporary source copy.
 The live source hash remained unchanged.
 The temporary images, private builder, cache, and source copy are removed.
 Logs, metadata, source hashes, and complete JSON evidence remain.
 
-Report: `.devenv/nix-acceptance-build-times.json`.
-Full evidence and logs: `../patchgate-build-times-20261020/`.
+Before reuse: `.devenv/nix-acceptance-build-times.json`.
+With reuse: `.devenv/cargo-artifact-build-times.json`.
+Full evidence and logs: `../patchgate-cargo-artifact-build-evidence-closure/`.
+
+An earlier run exposed a vendor-source reference in the evaluator binary.
+The package now removes that reference and rejects build-only references in both outputs.
+The corrected task image contains 127 runtime store paths and no dependency source or artifact paths.
+
 
 
 ### Trial fixture lifecycle
@@ -651,15 +676,30 @@ The permanent Nix tasks pass oracle and nop controls on Darwin and Linux Docker.
 The HTTPS-pinned input smoke also passes.
 The scenarios caught a missing-library failure before the immutable-input reference fix.
 
+The Cargo artifact smoke uses real Pijul acceptance and trusted Nix builds.
+A source-only candidate reuses dependencies, and the installed help reflects its changed source.
+A `clap` feature change selects new artifacts and executes its Cargo metadata macro.
+
+The final package removes build-only vendor references from the evaluator binary.
+Both outputs reject vendor-directory and compiled-artifact references.
+The corrected image passed all 124 Harbor controls and both backend lifecycle checks.
+
 Current reports:
+
+- `.devenv/cargo-artifact-closure-build.result.json`
+- `.devenv/cargo-artifact-package-smoke-verified/report.json`
+- `.devenv/cargo-artifact-closure-check-final.result.json`
+- `.devenv/cargo-artifact-build-times.json`
+- `.devenv/test-state/harbor-jobs/20261020-134650-oracle/result.json`
+- `.devenv/test-state/harbor-jobs/20261020-135104-nop/result.json`
+- `.devenv/test-state/harbor-jobs/rust-negative-controls-1792519157615717000-43216.json`
+- `.devenv/test-state/lifecycle-jobs/20261020-134304-25e84557/summary.json`
+
+Earlier structured-input reports:
 
 - `.devenv/nix-acceptance-rust-checks.json`
 - `.devenv/nix-acceptance-native-final-verified.result.json`
 - `.devenv/nix-acceptance-https.json`
-- `.devenv/nix-acceptance-complete-verified.result.json`
-- `.devenv/test-state/harbor-jobs/20261020-012254-oracle/result.json`
-- `.devenv/test-state/harbor-jobs/20261020-012634-nop/result.json`
-- `.devenv/test-state/harbor-jobs/rust-negative-controls-1792474415356646000-77851.json`
 
 Earlier CLI checks:
 
