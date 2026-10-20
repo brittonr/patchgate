@@ -13,3 +13,9 @@ timeout_sec = 300.0
 docker_image = "patchgate-harbor:dev"
 workdir = "/scenarios/structured-review-binding"
 build_timeout_sec = 900.0
+
+[environment.healthcheck]
+command = "patchgate-eval setup structured-review-binding /scenarios/structured-review-binding"
+timeout_sec = 900.0
+start_period_sec = 0.0
+retries = 1

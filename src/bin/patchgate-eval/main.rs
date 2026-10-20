@@ -32,9 +32,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Action {
     List,
-    SetupAll {
-        directory: PathBuf,
-    },
     Setup {
         name: String,
         directory: PathBuf,
@@ -114,6 +111,11 @@ pub fn find_scenario(name: &str) -> Result<&'static Scenario> {
 
 fn setup(case: &Scenario, directory: &Path, signer: &Signer) -> Result<()> {
     fs::create_dir_all(directory)?;
+    ensure!(
+        !directory.join("repo").try_exists()? && !directory.join("facts.json").try_exists()?,
+        "The scenario already contains fixture state: {}",
+        directory.display()
+    );
     let facts = (case.setup)(directory, signer)?;
     let mut file = fs::File::create(directory.join("facts.json"))?;
     serde_json::to_writer_pretty(&mut file, &facts)?;
@@ -179,12 +181,6 @@ fn run() -> Result<()> {
         Action::List => {
             for case in scenarios() {
                 println!("{}", case.name);
-            }
-        }
-        Action::SetupAll { directory } => {
-            let signer = Signer::new()?;
-            for case in scenarios() {
-                setup(case, &directory.join(case.name), &signer)?;
             }
         }
         Action::Setup { name, directory } => {

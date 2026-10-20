@@ -6,5 +6,9 @@
 !src/**
 !nix/
 !nix/**
+!harbor/
 !harbor/environment.nix
 !harbor/scenarios.py
+!harbor/tasks/
+!harbor/tasks/*/
+!harbor/tasks/*/task.toml

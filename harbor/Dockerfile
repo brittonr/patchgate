@@ -15,7 +15,7 @@ COPY Cargo.toml Cargo.lock /build/
 
 COPY src /build/src
 
-
+COPY harbor/tasks /build/harbor/tasks
 COPY harbor/scenarios.py /build/harbor/scenarios.py
 
 # The installed application must pass the runtime check on Linux.

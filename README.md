@@ -483,13 +483,58 @@ The oracle runs patchgate with a scripted model server in the task. The nop agen
 
 2. It builds `patchgate-harbor:dev` from `harbor/Dockerfile`, with `nix/package.nix` and the nixpkgs revision in `devenv.lock`.
    The image contains the Rust compiler, linker, and process tools.
-   The build runs both `harbor/scenarios.py setup-all` and `patchgate-eval setup-all`.
-   The image copy preserves the hostile fixtures as symbolic links.
+   The image contains immutable fixture code and empty scenario workdirs.
+   It does not contain generated trial repositories or `facts.json`.
 
 
 3. It installs Harbor 0.24.0 from the hash-locked `harbor/requirements.txt` in `.devenv/state/harbor`.
 
 To run another Harbor agent on the tasks, give its options to `patchgate-harbor run`, for example `patchgate-harbor run --agent nop`. Each task also has `environment/default.nix` for the bubblewrap backend of Harbor. That backend runs only on Linux, so the Docker image is the environment on macOS.
+
+### Trial fixture lifecycle
+
+Nix derives scenario names from `harbor/tasks/*/task.toml`.
+It packages fixture code and empty workdirs, not trial repositories, keys, or `facts.json`.
+The same `default` output supplies Docker and bubblewrap.
+
+Each task uses `[environment.healthcheck]` for synchronous fixture creation before agent setup, including `nop`.
+The command creates only that task's repository and facts.
+It uses one attempt, no grace period, and a 900-second timeout.
+A setup failure stops the trial before the agent runs.
+
+Setup creates a new Pijul history with a temporary SSH key.
+An existing `repo/` or `facts.json` causes failure without a reset.
+Backend-owned files, such as `default.nix`, can remain in the workdir.
+
+Use single-task `setup`, not `setup-all`:
+
+```sh
+patchgate-eval setup rust-model-decisions /tmp/rust-fixture
+python3 harbor/scenarios.py setup merge-order-conflict /tmp/python-fixture
+```
+
+Native smoke checks created two independent Python fixtures and two independent Rust fixtures.
+Each facts file matched its native Pijul history.
+A mutation in one fixture did not affect the other.
+Repeated setup failed without changes to existing state.
+
+A Nix check rebuild preserved the fixture asset NAR hash.
+The output contained 53 empty scenario workdirs and no generated repositories or facts.
+
+Real Docker and Linux bubblewrap trials passed for one Python task and one Rust task.
+Both backends created fixtures before agent setup for oracle and `nop` agents.
+Independent live instances retained separate files and facts.
+Repeated setup failed without a reset.
+A startup failure prevented agent setup and execution.
+The complete Docker control suite also passed after this change.
+
+Reports:
+
+- `.devenv/fixture-start-native-smoke.json`
+- `.devenv/fixture-start-immutable.json`
+- `.devenv/fixture-start-docker-proof/report.json`
+- `.devenv/fixture-start-docker-proof/suite-summary.json`
+- `.devenv/fixture-start-bubble-proof/report.json`
 
 ### Atomic application checks
 

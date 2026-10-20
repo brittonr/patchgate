@@ -13,3 +13,9 @@ timeout_sec = 300.0
 docker_image = "patchgate-harbor:dev"
 workdir = "/scenarios/dependency-graph-approved"
 build_timeout_sec = 900.0
+
+[environment.healthcheck]
+command = "patchgate-eval setup dependency-graph-approved /scenarios/dependency-graph-approved"
+timeout_sec = 900.0
+start_period_sec = 0.0
+retries = 1

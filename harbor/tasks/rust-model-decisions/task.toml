@@ -14,3 +14,9 @@ timeout_sec = 900.0
 docker_image = "patchgate-harbor:dev"
 workdir = "/scenarios/rust-model-decisions"
 build_timeout_sec = 900.0
+
+[environment.healthcheck]
+command = "patchgate-eval setup rust-model-decisions /scenarios/rust-model-decisions"
+timeout_sec = 900.0
+start_period_sec = 0.0
+retries = 1

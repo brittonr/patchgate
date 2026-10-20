@@ -38,20 +38,21 @@ let
   # <!-- ste-disable-next-line semicolon -->
   project = pkgs.lib.fileset.toSource { root = ../.; fileset = ./scenarios.py; };
 
-  # The rootfs directory gives /opt/patchgate and one repository for each scenario in /scenarios.
-  scenarios = pkgs.runCommand "patchgate-harbor-scenarios" {
+  # Task metadata defines the workdirs before trial startup.
+  # <!-- ste-disable-next-line semicolon -->
+  taskEntries = builtins.readDir ./tasks;
+  taskNames = builtins.filter
+    (name: taskEntries.${name} == "directory" && builtins.pathExists (./tasks + "/${name}/task.toml"))
     # <!-- ste-disable-next-line semicolon -->
-    nativeBuildInputs = [ tools patchgate patchgate.eval ];
-  } ''
-    # The compiled gate starts each repository.
+    (builtins.attrNames taskEntries);
 
+  # The rootfs contains immutable assets and empty task workdirs.
+  scenarios = pkgs.runCommand "patchgate-harbor-scenarios" { } ''
     mkdir -p $out/rootfs/opt
     cp -R ${project} $out/rootfs/opt/patchgate
-    chmod -R u+w $out/rootfs/opt/patchgate
-    # Both runners use the compiled gate from the shared package.
-    HOME=$TMPDIR python3 ${project}/harbor/scenarios.py setup-all $out/rootfs/scenarios
+    mkdir -p ${pkgs.lib.concatMapStringsSep " " (name: "$out/rootfs/scenarios/${pkgs.lib.escapeShellArg name}") taskNames}
     # <!-- ste-disable-next-line semicolon -->
-    HOME=$TMPDIR patchgate-eval setup-all $out/rootfs/scenarios'';
+  '';
 in
 {
   # <!-- ste-disable-next-line semicolon -->

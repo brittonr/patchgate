@@ -12,3 +12,9 @@ timeout_sec = 300.0
 docker_image = "patchgate-harbor:dev"
 workdir = "/scenarios/rejected-dependency-blocks"
 build_timeout_sec = 900.0
+
+[environment.healthcheck]
+command = "python3 /opt/patchgate/harbor/scenarios.py setup rejected-dependency-blocks /scenarios/rejected-dependency-blocks"
+timeout_sec = 900.0
+start_period_sec = 0.0
+retries = 1

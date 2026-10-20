@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """The scenarios of the patchgate Harbor tasks: the setup, the oracle, and the verifier.
 
-    scenarios.py setup-all DIR    make the repository of each scenario in DIR/<name>
+    scenarios.py setup NAME DIR   make one repository and its facts in DIR
     scenarios.py solve NAME DIR   the oracle: run patchgate with a scripted model
     scenarios.py check NAME DIR   the verifier: write 1 or 0 to /logs/verifier/reward.txt
 
 Each scenario directory holds repo/, a Pijul repository with its working copy on
 the inbox channel, and facts.json, the change hashes that the oracle and the
-verifier use. The Nix build of harbor/environment.nix runs setup-all. Harbor
-runs solve as the oracle agent, and check as the verifier.
+verifier use. Harbor creates the selected fixture before agent setup.
+It runs solve as the oracle agent, and check as the verifier.
 
 The verifier examines the channels, repository files, and patchgate ledger.
 The nop agent changes none of these, so it gets reward 0 on each task.
@@ -1136,13 +1136,13 @@ SCENARIOS = {
 }
 
 
-def setup_all(root: Path) -> None:
+def setup(name: str, directory: Path) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    if (directory / "repo").exists() or (directory / "facts.json").exists():
+        raise RuntimeError(f"The scenario already contains fixture state: {directory}")
     with Signer() as signer:
-        for name, scenario in SCENARIOS.items():
-            directory = root / name
-            directory.mkdir(parents=True)
-            facts = scenario.setup(directory, signer)
-            (directory / "facts.json").write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n")
+        facts = SCENARIOS[name].setup(directory, signer)
+        (directory / "facts.json").write_text(json.dumps(facts, indent=2, sort_keys=True) + "\n")
 
 
 def check(name: str, directory: Path) -> None:
@@ -1160,9 +1160,9 @@ def check(name: str, directory: Path) -> None:
 
 
 def main(argv: list[str]) -> int:
-    usage = "usage: scenarios.py setup-all DIR | solve NAME DIR | check NAME DIR"
-    if len(argv) == 2 and argv[0] == "setup-all":
-        setup_all(Path(argv[1]))
+    usage = "usage: scenarios.py setup NAME DIR | solve NAME DIR | check NAME DIR"
+    if len(argv) == 3 and argv[0] == "setup" and argv[1] in SCENARIOS:
+        setup(argv[1], Path(argv[2]))
     elif len(argv) == 3 and argv[0] == "solve" and argv[1] in SCENARIOS:
         SCENARIOS[argv[1]].solve(Path(argv[2]))
     elif len(argv) == 3 and argv[0] == "check" and argv[1] in SCENARIOS:

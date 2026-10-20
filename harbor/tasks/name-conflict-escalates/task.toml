@@ -12,3 +12,9 @@ timeout_sec = 300.0
 docker_image = "patchgate-harbor:dev"
 workdir = "/scenarios/name-conflict-escalates"
 build_timeout_sec = 900.0
+
+[environment.healthcheck]
+command = "python3 /opt/patchgate/harbor/scenarios.py setup name-conflict-escalates /scenarios/name-conflict-escalates"
+timeout_sec = 900.0
+start_period_sec = 0.0
+retries = 1

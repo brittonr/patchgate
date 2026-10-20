@@ -12,3 +12,9 @@ timeout_sec = 300.0
 docker_image = "patchgate-harbor:dev"
 workdir = "/scenarios/rust-merge-behavior"
 build_timeout_sec = 900.0
+
+[environment.healthcheck]
+command = "patchgate-eval setup rust-merge-behavior /scenarios/rust-merge-behavior"
+timeout_sec = 900.0
+start_period_sec = 0.0
+retries = 1
