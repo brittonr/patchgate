@@ -371,7 +371,7 @@ impl Store {
         Ok(record)
     }
 
-    pub fn export(&self, ids: &[String], variants: &Path, output: &Path) -> Result<ExportReport> {
+    fn export_manifest(&self, ids: &[String], variants: &Path, portable: bool) -> Result<Value> {
         let repo = self.repository()?;
         let records = self.records(&repo)?;
         let selected = if ids.is_empty() {
@@ -423,6 +423,19 @@ impl Store {
         let variants_path = fs::canonicalize(variants).context("Read the replay variants path.")?;
         let mut variants: Vec<Variant> = serde_json::from_slice(&fs::read(&variants_path)?)
             .context("Read the replay variants array.")?;
+        if portable {
+            for variant in &variants {
+                if let Some(policy) = &variant.policy {
+                    crate::bundle::validate_policy(
+                        &repo,
+                        &variants_path
+                            .parent()
+                            .context("The variants parent is absent.")?
+                            .join(policy),
+                    )?;
+                }
+            }
+        }
         validate_variants(
             &mut variants,
             variants_path
@@ -452,6 +465,25 @@ impl Store {
             "cases": cases,
             "variants": variants,
         });
+        Ok(manifest)
+    }
+
+    pub fn bundle(
+        &self,
+        ids: &[String],
+        variants: &Path,
+        output: &Path,
+    ) -> Result<crate::bundle::Export> {
+        ensure!(!ids.is_empty(), "A bundle needs explicit case IDs.");
+        let manifest = self.export_manifest(ids, variants, true)?;
+        let repo = self.repository()?;
+        crate::bundle::write(&repo, manifest, output)
+    }
+
+    pub fn export(&self, ids: &[String], variants: &Path, output: &Path) -> Result<ExportReport> {
+        let manifest = self.export_manifest(ids, variants, false)?;
+        let repo = self.repository()?;
+        let variants_path = fs::canonicalize(variants).context("Read the replay variants path.")?;
         let output = export_path(output, &repo)?;
         ensure!(
             output != variants_path,
@@ -472,8 +504,16 @@ impl Store {
         Ok(ExportReport {
             schema_version: 1,
             output,
-            cases: selected.iter().map(|record| record.id.clone()).collect(),
-            variants: variants.len(),
+            cases: manifest["cases"]
+                .as_array()
+                .context("The export cases are absent.")?
+                .iter()
+                .map(|case| case["id"].as_str().unwrap().to_owned())
+                .collect(),
+            variants: manifest["variants"]
+                .as_array()
+                .context("The export variants are absent.")?
+                .len(),
         })
     }
 }
@@ -869,5 +909,154 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn bundle_retains_selected_data_without_the_source_repository() {
+        let (directory, snapshot) = fixture();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let store = Store::new(&snapshot.repository);
+        let first = store.capture(snapshot.clone()).unwrap();
+        store
+            .label(&first.id, Label::Reject, "The reviewer rejects the change.")
+            .unwrap();
+        let labeled = store
+            .label(
+                &first.id,
+                Label::Accept,
+                "The reviewer approves the change.",
+            )
+            .unwrap();
+        let mut other = snapshot.clone();
+        other.candidate = "B".repeat(53);
+        fs::create_dir_all(snapshot.repository.join(".pijul/changes/BB")).unwrap();
+        fs::write(
+            snapshot
+                .repository
+                .join(".pijul/changes/BB")
+                .join(format!("{}.change", "B".repeat(51))),
+            b"unselected native data",
+        )
+        .unwrap();
+        let other = store.capture(other).unwrap();
+        store
+            .label(&other.id, Label::Reject, "The reviewer rejects the change.")
+            .unwrap();
+        let signer = snapshot.repository.join(".pijul/patchgate/key");
+        fs::write(&signer, b"private signer state").unwrap();
+        fs::write(
+            snapshot.repository.join("private.txt"),
+            b"private source data",
+        )
+        .unwrap();
+        let policy = root.join("variant-policy.txt");
+        fs::write(&policy, b"Use the alternate policy.\n").unwrap();
+        let variants = variants(&root);
+        let mut values: Value = serde_json::from_slice(&fs::read(&variants).unwrap()).unwrap();
+        values[0]["policy"] = json!(policy);
+        fs::write(&variants, serde_json::to_vec(&values).unwrap()).unwrap();
+        let output = root.join("review.tar.gz");
+        assert!(store.bundle(&[], &variants, &output).is_err());
+        let report = store
+            .bundle(&[first.id[..12].into()], &variants, &output)
+            .unwrap();
+        assert_eq!(report.cases, vec![first.id.clone()]);
+        assert_eq!(report.native_changes, 1);
+        assert_eq!(fs::read(&signer).unwrap(), b"private signer state");
+        assert_eq!(store.list().unwrap().len(), 2);
+        fs::remove_dir_all(&snapshot.repository).unwrap();
+        fs::remove_file(&policy).unwrap();
+        fs::remove_file(&variants).unwrap();
+        let loaded = crate::bundle::load(&output).unwrap();
+        assert_eq!(loaded.sha256, report.sha256);
+        assert_eq!(loaded.origin_repository, labeled.snapshot.repository);
+        assert_eq!(
+            loaded.manifest["cases"][0]["snapshot"],
+            json!(labeled.snapshot)
+        );
+        assert_eq!(loaded.manifest["cases"][0]["labels"], json!(labeled.labels));
+        assert_eq!(loaded.manifest["cases"][0]["id"], first.id);
+        assert_eq!(
+            fs::read(
+                loaded
+                    .repository
+                    .join(".pijul/changes/AA")
+                    .join(format!("{}.change", "A".repeat(51)))
+            )
+            .unwrap(),
+            b"native data"
+        );
+        assert!(!loaded.repository.join(".pijul/changes/BB").exists());
+        assert!(!loaded.repository.join(".pijul/patchgate").exists());
+        assert!(!loaded.repository.join("private.txt").exists());
+        let policy = loaded.manifest["variants"][0]["policy"].as_str().unwrap();
+        assert_eq!(
+            fs::read(loaded.directory.path().join(policy)).unwrap(),
+            b"Use the alternate policy.\n"
+        );
+    }
+
+    #[test]
+    fn bundle_refuses_signer_policies_and_destination_aliases() {
+        let (directory, snapshot) = fixture();
+        let root = fs::canonicalize(directory.path()).unwrap();
+        let store = Store::new(&snapshot.repository);
+        let record = store.capture(snapshot.clone()).unwrap();
+        store
+            .label(
+                &record.id,
+                Label::Accept,
+                "The reviewer approves the change.",
+            )
+            .unwrap();
+        let signer = fs::canonicalize(&snapshot.repository)
+            .unwrap()
+            .join(".pijul/patchgate/key");
+        fs::write(&signer, b"private signer state").unwrap();
+        let alias = root.join("policy-alias");
+        fs::hard_link(&signer, &alias).unwrap();
+        let variants = variants(&root);
+        let mut values: Value = serde_json::from_slice(&fs::read(&variants).unwrap()).unwrap();
+        let output = root.join("review.tar.gz");
+        for policy in [&signer, &alias] {
+            values[0]["policy"] = json!(policy);
+            fs::write(&variants, serde_json::to_vec(&values).unwrap()).unwrap();
+            assert!(
+                store
+                    .bundle(&[record.id.clone()], &variants, &output)
+                    .is_err()
+            );
+            assert!(!output.exists());
+        }
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&signer, &alias).unwrap();
+        values[0]["policy"] = json!(alias);
+        fs::write(&variants, serde_json::to_vec(&values).unwrap()).unwrap();
+        assert!(
+            store
+                .bundle(&[record.id.clone()], &variants, &output)
+                .is_err()
+        );
+        values[0]["policy"] = Value::Null;
+        fs::write(&variants, serde_json::to_vec(&values).unwrap()).unwrap();
+        assert!(
+            store
+                .bundle(&[record.id.clone()], &variants, &variants)
+                .is_err()
+        );
+        let source_alias = root.join("source-alias");
+        std::os::unix::fs::symlink(&snapshot.repository, &source_alias).unwrap();
+        assert!(
+            store
+                .bundle(
+                    &[record.id.clone()],
+                    &variants,
+                    &source_alias.join("bundle")
+                )
+                .is_err()
+        );
+        std::os::unix::fs::symlink(&signer, &output).unwrap();
+        assert!(store.bundle(&[record.id], &variants, &output).is_err());
+        assert_eq!(fs::read(signer).unwrap(), b"private signer state");
     }
 }

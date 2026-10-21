@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{Read, Seek};
 use std::os::unix::fs::PermissionsExt;
@@ -277,6 +278,107 @@ impl Plan {
     }
 }
 
+/// Test the configured runtime with fixed private data, not repository inputs.
+pub fn probe_runtime_isolation(timeout: Duration, interrupted: &AtomicBool) -> Result<()> {
+    let mut runner = Runner::new(timeout, interrupted)?;
+    runner.runtime_probe = true;
+    runner.require_sandbox()?;
+    let builder = runner.probe_shell()?;
+    let builder_tree = runner.tree(
+        builder
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::to_str)
+            .context("The probe shell has no store root")?,
+    )?;
+    let shell_name = builder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("The probe shell name is not UTF-8")?;
+    let mut random = [0u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let mut nonce = String::with_capacity(64);
+    for byte in random {
+        write!(&mut nonce, "{byte:02x}")?;
+    }
+    let host = tempfile::Builder::new()
+        .prefix("pg-host-probe-")
+        .tempdir_in("/tmp")?;
+    // The build user can read this harmless marker outside the sandbox.
+    fs::set_permissions(host.path(), fs::Permissions::from_mode(0o755))?;
+    let marker = fs::canonicalize(host.path())?.join("host-marker");
+    fs::write(&marker, b"patchgate harmless host marker\n")?;
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o644))?;
+    let expected = format!("patchgate-doctor-isolated:{nonce}\n");
+    let marker = marker
+        .to_str()
+        .context("The probe marker path is not UTF-8")?;
+    // Shell builtins need no host programs. A visible marker or variable must fail.
+    let script = format!(
+        "if {{ IFS= read -r markerData < \"$hostMarker\"; }} 2>/dev/null; then exit 71; fi\n\
+         if [ \"${{PATCHGATE_DOCTOR_PRIVATE+x}}\" = x ]; then exit 72; fi\n\
+         printf '%s\\n' 'patchgate-doctor-isolated:{nonce}' > \"$out\"\n"
+    );
+    let expression = format!(
+        "builtins.derivation {{ name = \"patchgate-doctor-isolation\"; system = {}; \
+         builder = ({} + {}); args = [ \"-e\" \"-c\" {} ]; \
+         hostMarker = {}; probeNonce = {}; preferLocalBuild = true; allowSubstitutes = false; }}",
+        nix_string(&system()?)?,
+        builder_tree.expression()?,
+        nix_string(&format!("/bin/{shell_name}"))?,
+        nix_string(&script)?,
+        nix_string(marker)?,
+        nix_string(&nonce)?,
+    );
+    let derivations = runner.evaluate(&["derivation", "show", "--expr", &expression])?;
+    let drv_path = checked_derivation(&derivations)?;
+    let built = runner.evaluate(&["build", "--no-link", "--json", "--expr", &expression])?;
+    let output = probe_output(&built, &drv_path)?;
+    ensure!(
+        fs::symlink_metadata(output)?.file_type().is_file(),
+        "The isolation probe output is not a regular file"
+    );
+    ensure!(
+        fs::metadata(output)?.len() == expected.len() as u64,
+        "The isolation probe output has an unexpected size"
+    );
+    ensure!(
+        fs::read(output)? == expected.as_bytes(),
+        "The isolation probe output bytes differ"
+    );
+    Ok(())
+}
+
+fn probe_output<'a>(built: &'a Value, drv_path: &str) -> Result<&'a str> {
+    let results = built
+        .as_array()
+        .context("The isolation probe has no build results")?;
+    ensure!(
+        results.len() == 1,
+        "The isolation probe needs one build result"
+    );
+    ensure!(
+        field(&results[0], "drvPath")? == drv_path,
+        "The isolation probe derivation changed"
+    );
+    let outputs = results[0]
+        .get("outputs")
+        .and_then(Value::as_object)
+        .context("The isolation probe has no outputs")?;
+    ensure!(outputs.len() == 1, "The isolation probe needs one output");
+    let output = outputs
+        .get("out")
+        .and_then(Value::as_str)
+        .context("The isolation probe has no out path")?;
+    ensure!(
+        Path::new(output).parent() == Some(Path::new("/nix/store"))
+            && Path::new(output).file_name().is_some()
+            && !output.ends_with(".drv"),
+        "The isolation probe returned an invalid output path"
+    );
+    Ok(output)
+}
+
 fn checked_derivation(report: &Value) -> Result<String> {
     let derivations = report
         .get("derivations")
@@ -370,6 +472,7 @@ struct Runner<'a> {
     home: TempDir,
     deadline: Instant,
     interrupted: &'a AtomicBool,
+    runtime_probe: bool,
 }
 
 impl<'a> Runner<'a> {
@@ -379,6 +482,7 @@ impl<'a> Runner<'a> {
             .checked_add(timeout)
             .context("The Nix check timeout is too large")?;
         let nix = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .filter(|directory| directory.is_absolute())
             .map(|directory| directory.join("nix"))
             .find(|path| {
                 fs::metadata(path).is_ok_and(|metadata| {
@@ -396,6 +500,7 @@ impl<'a> Runner<'a> {
             home,
             deadline,
             interrupted,
+            runtime_probe: false,
         })
     }
 
@@ -431,7 +536,74 @@ impl<'a> Runner<'a> {
         if let Some(user) = env::var_os("USER") {
             command.env("USER", user);
         }
+        if self.runtime_probe {
+            command.stderr(Stdio::null()).args([
+                "--option",
+                "substitute",
+                "false",
+                "--option",
+                "substituters",
+                "",
+                "--option",
+                "fallback",
+                "false",
+                "--option",
+                "max-jobs",
+                "1",
+                "--option",
+                "sandbox",
+                "true",
+                "--option",
+                "sandbox-fallback",
+                "false",
+            ]);
+        }
         command
+    }
+
+    fn probe_shell(&self) -> Result<PathBuf> {
+        let shell_at = |root: &Path| {
+            ["bash", "sh"]
+                .into_iter()
+                .map(|name| root.join("bin").join(name))
+                .find(|path| {
+                    fs::metadata(path).is_ok_and(|metadata| {
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    })
+                })
+        };
+        for directory in env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .filter(|directory| directory.is_absolute())
+        {
+            for name in ["bash", "sh"] {
+                let Ok(path) = fs::canonicalize(directory.join(name)) else {
+                    continue;
+                };
+                if let Some(root) = path.parent().and_then(Path::parent) {
+                    if root.parent() == Some(Path::new("/nix/store")) {
+                        if let Some(shell) = shell_at(root) {
+                            return Ok(shell);
+                        }
+                    }
+                }
+            }
+        }
+        // The Nix closure can supply a shell when the caller PATH does not.
+        let root: PathBuf = self.nix.components().take(4).collect();
+        ensure!(
+            root.parent() == Some(Path::new("/nix/store")),
+            "The runtime probe needs an existing Nix-store shell"
+        );
+        let mut command = self.command(&self.nix.with_file_name("nix-store"));
+        command.args(["--query", "--requisites"]).arg(root);
+        for root in self.execute(&mut command)?.lines().map(Path::new) {
+            if root.parent() == Some(Path::new("/nix/store")) {
+                if let Some(shell) = shell_at(root) {
+                    return Ok(shell);
+                }
+            }
+        }
+        bail!("The runtime probe needs an existing Nix-store shell")
     }
 
     fn execute(&self, command: &mut Command) -> Result<String> {
@@ -483,6 +655,12 @@ impl<'a> Runner<'a> {
             "Trusted Nix verification failed with {status}. See the Nix output."
         );
         stdout.rewind()?;
+        if self.runtime_probe {
+            ensure!(
+                stdout.metadata()?.len() <= 2 * 1024 * 1024,
+                "The runtime probe output exceeds its limit"
+            );
+        }
         let mut text = String::new();
         stdout.read_to_string(&mut text)?;
         Ok(text)
@@ -512,6 +690,9 @@ impl<'a> Runner<'a> {
                 "false",
             ])
             .args(arguments);
+        if self.runtime_probe {
+            command.env("PATCHGATE_DOCTOR_PRIVATE", "private harmless client data");
+        }
         serde_json::from_str(&self.execute(&mut command)?)
             .context("Nix returned invalid verification JSON")
     }
@@ -571,6 +752,24 @@ impl<'a> Runner<'a> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn isolation_probe_requires_the_exact_derivation_and_one_store_output() -> Result<()> {
+        let drv = "/nix/store/probe.drv";
+        let valid = json!([{"drvPath": drv, "outputs": {"out": "/nix/store/probe"}}]);
+        assert_eq!(probe_output(&valid, drv)?, "/nix/store/probe");
+        for invalid in [
+            json!([]),
+            json!([{"drvPath": "/nix/store/other.drv", "outputs": {"out": "/nix/store/probe"}}]),
+            json!([{"drvPath": drv, "outputs": {"out": "/tmp/probe"}}]),
+            json!([{"drvPath": drv, "outputs": {"out": "/nix/store/.."}}]),
+            json!([{"drvPath": drv, "outputs": {"out": "/nix/store/probe.drv"}}]),
+            json!([{"drvPath": drv, "outputs": {"out": "/nix/store/probe", "extra": "/nix/store/extra"}}]),
+        ] {
+            assert!(probe_output(&invalid, drv).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn invalid_check_requirements_cannot_disable_verification() {

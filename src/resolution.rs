@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
@@ -44,6 +44,13 @@ pub struct Prepared {
     workspace_inode: u64,
 }
 
+#[derive(Serialize)]
+pub struct Refreshed {
+    pub prepared: Prepared,
+    pub previous_id: String,
+    pub preserved: Vec<String>,
+}
+
 pub struct Completed {
     pub pijul: Pijul,
     pub hashes: Vec<String>,
@@ -74,6 +81,30 @@ pub fn prepare(
     workspace: &Path,
     binding: ReviewBinding,
     configuration: configuration::Evidence,
+) -> Result<Prepared> {
+    prepare_plan(
+        source,
+        isolated,
+        main,
+        inbox,
+        candidates,
+        workspace,
+        binding,
+        configuration,
+        None,
+    )
+}
+
+fn prepare_plan(
+    source: &Path,
+    isolated: &Pijul,
+    main: &str,
+    inbox: &str,
+    candidates: &[String],
+    workspace: &Path,
+    binding: ReviewBinding,
+    configuration: configuration::Evidence,
+    supplements: Option<(&Pijul, &[String])>,
 ) -> Result<Prepared> {
     let source = canonical_directory(source)?;
     let workspace = new_workspace_path(&source, workspace)?;
@@ -133,7 +164,7 @@ pub fn prepare(
         _ => bail!("The policy presence binding differs"),
     }
     let mut review = String::new();
-    let permitted: HashSet<_> = base.iter().chain(candidates).map(String::as_str).collect();
+    let mut permitted: HashSet<_> = base.iter().chain(candidates).map(String::as_str).collect();
     for hash in candidates {
         let path = crate::pijul::safe_path(
             &isolated.repo,
@@ -153,6 +184,20 @@ pub fn prepare(
         review.push_str(&text);
         if !text.ends_with('\n') {
             review.push('\n');
+        }
+    }
+    if let Some((previous, hashes)) = supplements {
+        for hash in hashes {
+            validate_hash(hash)?;
+            regular_file(&previous.change_file(hash))?;
+            let text = previous.change(hash)?;
+            ensure!(
+                crate::change::dependencies(&text)
+                    .iter()
+                    .all(|dependency| permitted.contains(dependency.as_str())),
+                "A human record requires a removed change. Restore its dependency explicitly before refresh."
+            );
+            permitted.insert(hash.as_str());
         }
     }
 
@@ -181,21 +226,6 @@ pub fn prepare(
         canonical_directory(&workspace)? == workspace,
         "The workspace path changed"
     );
-    let pijul = Pijul::new(workspace.clone());
-    ensure!(
-        pijul.snapshot(main)? == snapshot,
-        "The cloned main state differs"
-    );
-    for hash in candidates {
-        pijul
-            .call([OsStr::new("apply"), isolated.change_file(hash).as_os_str()])
-            .context("Cannot apply a prepared candidate")?;
-    }
-    let expected: HashSet<_> = base.iter().chain(candidates).cloned().collect();
-    ensure!(
-        pijul.hashes(main)? == expected,
-        "The workspace contains an unprepared change"
-    );
     detach_files(&workspace.join(".pijul"))?;
     // The clone remote is not needed. No editable native configuration can enter record.
     for name in ["config", "config.toml"] {
@@ -209,6 +239,36 @@ pub fn prepare(
             Err(error) => return Err(error.into()),
         }
     }
+    refuse_native_configuration(&workspace)?;
+    validate_native_metadata(&workspace.join(".pijul"))?;
+    let pijul = Pijul::new(workspace.clone());
+    ensure!(
+        pijul.snapshot(main)? == snapshot,
+        "The cloned main state differs"
+    );
+    for hash in candidates {
+        pijul
+            .call([OsStr::new("apply"), isolated.change_file(hash).as_os_str()])
+            .context("Cannot apply a prepared candidate")?;
+        refuse_native_configuration(&workspace)?;
+    }
+    let mut expected: HashSet<_> = base.iter().chain(candidates).cloned().collect();
+    if let Some((previous, hashes)) = supplements {
+        for hash in hashes {
+            if expected.insert(hash.clone()) {
+                pijul
+                    .call([OsStr::new("apply"), previous.change_file(hash).as_os_str()])
+                    .context("Cannot preserve a recorded human change")?;
+                refuse_native_configuration(&workspace)?;
+            }
+        }
+    }
+    ensure!(
+        pijul.hashes(main)? == expected,
+        "The workspace contains an unprepared change"
+    );
+    detach_files(&workspace.join(".pijul"))?;
+    validate_native_metadata(&workspace.join(".pijul"))?;
     let conflicts = pijul
         .conflicts()?
         .into_iter()
@@ -266,6 +326,176 @@ pub fn prepare(
         })?,
     )?;
     Ok(prepared)
+}
+
+/// Preserve native human records on current main. Untracked files remain in the old workspace.
+pub fn refresh(
+    source: &Path,
+    isolated: &Pijul,
+    previous: &Prepared,
+    candidates: &[String],
+    workspace: &Path,
+    binding: ReviewBinding,
+    configuration: configuration::Evidence,
+) -> Result<Refreshed> {
+    let trusted = load(source, &previous.workspace)?;
+    ensure!(
+        identity(previous)? == identity(&trusted)? && previous.id == trusted.id,
+        "The supplied resolution record differs from source authority"
+    );
+    let workspace = new_workspace_path(&trusted.source, workspace)?;
+    ensure!(
+        !workspace.starts_with(&trusted.workspace),
+        "The new workspace must be outside the old workspace. Untracked files remain in the old workspace."
+    );
+    let old = Pijul::new(trusted.workspace.clone());
+    validate_native_metadata(&old.repo.join(".pijul"))?;
+    refuse_native_configuration(&old.repo)?;
+    let (current, _) = old.channels()?;
+    ensure!(
+        current.as_deref() == Some(trusted.main.as_str()),
+        "The workspace current channel differs"
+    );
+    let order = native_order(&old, &trusted)?;
+    ensure!(
+        old.hashes(&trusted.main)? == order.iter().cloned().collect(),
+        "The workspace native membership differs"
+    );
+    validate_prepared_files(&old, &trusted)?;
+    ensure!(
+        tracked_workspace_clean(&old, &trusted.main)?,
+        "Record pending tracked edits before refresh. Untracked files remain in the old workspace."
+    );
+    let original: HashSet<_> = trusted.base.iter().chain(&trusted.candidates).collect();
+    let preserved: Vec<_> = order
+        .into_iter()
+        .filter(|hash| !original.contains(hash))
+        .collect();
+    let prepared = prepare_plan(
+        source,
+        isolated,
+        &trusted.main,
+        &trusted.inbox,
+        candidates,
+        &workspace,
+        binding,
+        configuration,
+        Some((&old, &preserved)),
+    )?;
+    Ok(Refreshed {
+        prepared,
+        previous_id: trusted.id,
+        preserved,
+    })
+}
+
+fn tracked_workspace_clean(old: &Pijul, channel: &str) -> Result<bool> {
+    let isolated = crate::isolation::copy_repository(&old.repo)?;
+    let directory = isolated
+        .pijul
+        .repo
+        .parent()
+        .context("The private repository has no parent")?;
+    let archive_path = directory.join("tracked.tar.gz");
+    isolated.pijul.run([
+        OsStr::new("archive"),
+        OsStr::new("--channel"),
+        OsStr::new(channel),
+        OsStr::new("-o"),
+        archive_path.as_os_str(),
+    ])?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(File::open(archive_path)?));
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let relative = crate::pijul::normalize_path(&entry.path()?)?;
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        ensure!(
+            !relative.starts_with(".pijul"),
+            "Tracked files cannot replace private native metadata."
+        );
+        let source = crate::pijul::safe_path(&old.repo, &relative)?;
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        if entry.header().entry_type().is_dir() {
+            if !metadata.is_dir() {
+                return Ok(false);
+            }
+            continue;
+        }
+        ensure!(
+            entry.header().entry_type().is_file(),
+            "Tracked workspace data must use regular files."
+        );
+        if !metadata.is_file()
+            || metadata.len() != entry.size()
+            || metadata.permissions().mode() & 0o111 != entry.header().mode()? & 0o111
+            || !same_file_bytes(&mut entry, &mut File::open(source)?)?
+        {
+            return Ok(false);
+        }
+    }
+    // A fresh clone excludes staged additions and removals from the path list.
+    let recorded = directory.join("recorded");
+    isolated.pijul.run([
+        OsStr::new("clone"),
+        OsStr::new("--channel"),
+        OsStr::new(channel),
+        isolated.pijul.repo.as_os_str(),
+        recorded.as_os_str(),
+    ])?;
+    Ok(isolated.pijul.run(["list"])? == Pijul::new(recorded).run(["list"])?)
+}
+
+fn same_file_bytes(expected: &mut impl Read, actual: &mut File) -> Result<bool> {
+    let mut left = [0; 8192];
+    let mut right = [0; 8192];
+    loop {
+        let size = expected.read(&mut left)?;
+        if size == 0 {
+            return Ok(actual.read(&mut right[..1])? == 0);
+        }
+        match actual.read_exact(&mut right[..size]) {
+            Ok(()) if left[..size] == right[..size] => {}
+            Ok(()) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn validate_prepared_files(pijul: &Pijul, prepared: &Prepared) -> Result<()> {
+    let review_path = crate::pijul::safe_path(&pijul.repo, Path::new(PRIVATE))?.join("review.txt");
+    regular_file(&review_path)?;
+    let mut review = String::new();
+    for hash in &prepared.candidates {
+        let text = pijul.change(hash)?;
+        review.push_str(&text);
+        if !text.ends_with('\n') {
+            review.push('\n');
+        }
+    }
+    ensure!(
+        fs::read(&review_path)? == review.as_bytes(),
+        "The prepared review data changed"
+    );
+    match (&prepared.binding.policy, &prepared.policy_file) {
+        (None, None) => {}
+        (Some(policy), Some(path)) => {
+            regular_file(path)?;
+            ensure!(
+                policy.path == prepared.configuration.values.policy_path
+                    && digest(&fs::read(path)?) == policy.sha256,
+                "The prepared policy data changed"
+            );
+        }
+        _ => bail!("The prepared policy data is incomplete"),
+    }
+    Ok(())
 }
 
 /// Read authority from source metadata, not from the editable workspace.
@@ -485,14 +715,16 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(path)
     };
-    ensure!(
-        !path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir)),
-        "A resolution path cannot contain parent components"
-    );
     let mut current = PathBuf::new();
     for part in path.components() {
+        if part == Component::ParentDir {
+            ensure!(
+                fs::symlink_metadata(&current)?.is_dir(),
+                "A resolution parent path is not a directory"
+            );
+            current.pop();
+            continue;
+        }
         current.push(part.as_os_str());
         match fs::symlink_metadata(&current) {
             Ok(metadata) => ensure!(
@@ -503,7 +735,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
             Err(error) => return Err(error.into()),
         }
     }
-    Ok(path)
+    Ok(current)
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf> {
@@ -701,7 +933,15 @@ mod tests {
         assert!(new_workspace_path(&source, &source).is_err());
         symlink(&root, root.join("alias"))?;
         assert!(new_workspace_path(&source, &root.join("alias/workspace")).is_err());
-        assert!(new_workspace_path(&source, &root.join("../workspace")).is_err());
+        assert!(new_workspace_path(&source, &root.join("alias/../workspace")).is_err());
+        assert!(new_workspace_path(&source, &root.join("missing/../workspace")).is_err());
+        fs::write(root.join("file"), "A regular file.\n")?;
+        assert!(new_workspace_path(&source, &root.join("file/../workspace")).is_err());
+        assert!(new_workspace_path(&source, &source.join("../source/workspace")).is_err());
+        assert_eq!(
+            new_workspace_path(&source, &source.join("../workspace"))?,
+            root.join("workspace")
+        );
         assert_eq!(
             new_workspace_path(&source, &root.join("workspace"))?,
             root.join("workspace")
@@ -849,6 +1089,312 @@ mod tests {
         let repeated = record(&prepared, &signer, "Retain the existing human records")?;
         assert_eq!(repeated.hashes, completed.hashes);
         assert_eq!(repeated.imported, completed.imported);
+        Ok(())
+    }
+
+    fn refresh_from_source(previous: &Prepared, name: &str) -> Result<Refreshed> {
+        let isolated = crate::isolation::copy_repository(&previous.source)?;
+        let configuration = configuration::load(
+            &isolated.pijul,
+            &previous.main,
+            &configuration::Values::default(),
+        )?;
+        let policy = isolated
+            .pijul
+            .read_file(&previous.main, &configuration.values.policy_path)?;
+        let binding = ReviewBinding::new(
+            &previous.candidates,
+            &configuration.values.policy_path,
+            policy.as_deref(),
+            &previous.main,
+            &isolated.pijul.snapshot(&previous.main)?,
+        );
+        refresh(
+            &previous.source,
+            &isolated.pijul,
+            previous,
+            &previous.candidates,
+            &previous.workspace.parent().unwrap().join(name),
+            binding,
+            configuration,
+        )
+    }
+
+    fn advance_main(previous: &Prepared, signer: &Signer) -> Result<(Pijul, String)> {
+        let source = Pijul::new(previous.source.clone());
+        fs::write(source.repo.join("value.txt"), "candidate\n")?;
+        source.run(["channel", "switch", "main"])?;
+        fs::write(source.repo.join("main.txt"), "Current main content.\n")?;
+        fs::write(source.repo.join("POLICY.md"), "Use the current policy.\n")?;
+        source.run(["add", "main.txt"])?;
+        let hash = native_record(&source, signer, "Advance main")?;
+        Ok((source, hash))
+    }
+
+    #[test]
+    fn refresh_refuses_a_new_workspace_inside_the_old_workspace() -> Result<()> {
+        let (_directory, previous, _signer) = native_fixture(false)?;
+        let pointer = fs::read(previous.workspace.join(POINTER))?;
+        assert!(refresh_from_source(&previous, "workspace/nested").is_err());
+        assert!(!previous.workspace.join("nested").exists());
+        assert_eq!(fs::read(previous.workspace.join(POINTER))?, pointer);
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_preserves_native_human_records_and_current_main() -> Result<()> {
+        let (_directory, previous, signer) = native_fixture(false)?;
+        let old = Pijul::new(previous.workspace.clone());
+        fs::write(old.repo.join("value.txt"), "First human edit.\n")?;
+        let first = native_record(&old, &signer, "Record the first edit")?;
+        fs::write(old.repo.join("value.txt"), "Second human edit.\n")?;
+        fs::write(old.repo.join("human.txt"), "A recorded human file.\n")?;
+        old.run(["add", "human.txt"])?;
+        let second = native_record(&old, &signer, "Record the second edit")?;
+        fs::write(old.repo.join("untracked.txt"), "Retain this old file.\n")?;
+        let pointer = fs::read(old.repo.join(POINTER))?;
+        let old_state = old.snapshot("main")?;
+        let (source, main_hash) = advance_main(&previous, &signer)?;
+        fs::write(source.repo.join("value.txt"), "Dirty source content.\n")?;
+        let refreshed = refresh_from_source(&previous, "fresh")?;
+        assert_eq!(refreshed.previous_id, previous.id);
+        assert_eq!(refreshed.preserved, vec![first.clone(), second.clone()]);
+        assert_ne!(refreshed.prepared.id, previous.id);
+        assert!(refreshed.prepared.base.contains(&main_hash));
+        assert_eq!(
+            fs::read(refreshed.prepared.workspace.join("value.txt"))?,
+            b"Second human edit.\n"
+        );
+        assert_eq!(
+            fs::read(refreshed.prepared.workspace.join("main.txt"))?,
+            b"Current main content.\n"
+        );
+        assert_eq!(
+            fs::read(refreshed.prepared.workspace.join("human.txt"))?,
+            b"A recorded human file.\n"
+        );
+        assert_eq!(
+            fs::read(refreshed.prepared.policy_file.as_ref().unwrap())?,
+            b"Use the current policy.\n"
+        );
+        assert!(!refreshed.prepared.workspace.join("untracked.txt").exists());
+        assert_eq!(fs::read(old.repo.join(POINTER))?, pointer);
+        assert_eq!(old.snapshot("main")?, old_state);
+        assert_eq!(
+            fs::read(old.repo.join("untracked.txt"))?,
+            b"Retain this old file.\n"
+        );
+        assert_eq!(
+            fs::read(source.repo.join("value.txt"))?,
+            b"Dirty source content.\n"
+        );
+        let trusted = load(&previous.source, &refreshed.prepared.workspace)?;
+        assert_eq!(trusted.id, refreshed.prepared.id);
+        let completed = record(&refreshed.prepared, &signer, "Accept the preserved records")?;
+        assert_eq!(
+            completed.hashes,
+            vec![
+                previous.candidates[0].clone(),
+                first.clone(),
+                second.clone()
+            ]
+        );
+        assert_eq!(completed.imported, HashSet::from([first, second]));
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_preserves_old_metadata_after_a_tracked_mtime_change() -> Result<()> {
+        fn metadata_bytes(
+            directory: &Path,
+        ) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+            let mut files = std::collections::BTreeMap::new();
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    files.extend(metadata_bytes(&entry.path())?);
+                } else {
+                    files.insert(entry.path(), fs::read(entry.path())?);
+                }
+            }
+            Ok(files)
+        }
+        let (_directory, previous, _signer) = native_fixture(false)?;
+        let metadata = previous.workspace.join(".pijul");
+        File::open(previous.workspace.join("value.txt"))?.set_times(
+            fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)),
+        )?;
+        let before = metadata_bytes(&metadata)?;
+        let refreshed = refresh_from_source(&previous, "fresh")?;
+        assert_eq!(metadata_bytes(&metadata)?, before);
+        assert_eq!(
+            fs::read(refreshed.prepared.workspace.join("value.txt"))?,
+            b"candidate\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_refuses_tracked_edits_without_a_new_record() -> Result<()> {
+        let (_directory, previous, _signer) = native_fixture(false)?;
+        let old = Pijul::new(previous.workspace.clone());
+        let before = old.snapshot("main")?;
+        fs::write(old.repo.join("value.txt"), "A pending human edit.\n")?;
+        fs::write(old.repo.join("untracked.txt"), "An untracked file.\n")?;
+        assert!(refresh_from_source(&previous, "fresh").is_err());
+        assert!(!old.repo.parent().unwrap().join("fresh").exists());
+        assert_eq!(old.snapshot("main")?, before);
+        assert_eq!(
+            fs::read(old.repo.join("value.txt"))?,
+            b"A pending human edit.\n"
+        );
+        assert!(old.repo.join("untracked.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_refuses_new_tracked_files_without_a_record() -> Result<()> {
+        let (_directory, previous, _signer) = native_fixture(false)?;
+        let old = Pijul::new(previous.workspace.clone());
+        fs::write(old.repo.join("pending.txt"), "A pending human file.\n")?;
+        old.run(["add", "pending.txt"])?;
+        assert!(refresh_from_source(&previous, "fresh").is_err());
+        assert!(!old.repo.parent().unwrap().join("fresh").exists());
+        assert_eq!(
+            fs::read(old.repo.join("pending.txt"))?,
+            b"A pending human file.\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_refuses_hooks_before_native_workspace_commands() -> Result<()> {
+        let (_directory, previous, _signer) = native_fixture(false)?;
+        let marker = previous.workspace.join("hook-marker");
+        let hook = previous.workspace.join("hook");
+        fs::write(&hook, b"#!/bin/sh\ntouch hook-marker\n")?;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
+        for relative in [".pijul/config", ".pijul/config.toml", "pijul.toml"] {
+            let path = previous.workspace.join(relative);
+            let bytes = b"[hooks]\npreHooks = [\"./hook\"]\n";
+            fs::write(&path, bytes)?;
+            assert!(refresh_from_source(&previous, "fresh").is_err());
+            assert!(!marker.exists());
+            assert_eq!(fs::read(&path)?, bytes);
+            fs::remove_file(path)?;
+        }
+        assert!(!previous.workspace.parent().unwrap().join("fresh").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_refuses_removed_supplemental_dependencies() -> Result<()> {
+        let (_directory, original, signer) = native_fixture(false)?;
+        let (source, removed) = advance_main(&original, &signer)?;
+        let previous = refresh_from_source(&original, "second")?.prepared;
+        let old = Pijul::new(previous.workspace.clone());
+        fs::write(old.repo.join("main.txt"), "A human change to old main.\n")?;
+        let human = native_record(&old, &signer, "Change the old main file")?;
+        assert!(crate::change::dependencies(&old.change(&human)?).contains(&removed));
+        source.run(["unrecord", &removed])?;
+        let old_state = old.snapshot("main")?;
+        assert!(refresh_from_source(&previous, "fresh").is_err());
+        assert_eq!(old.snapshot("main")?, old_state);
+        assert!(!previous.workspace.parent().unwrap().join("fresh").exists());
+        assert!(!source.hashes("main")?.contains(&removed));
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_retains_unresolved_conflicts_for_human_review() -> Result<()> {
+        let (_directory, previous, _signer) = native_fixture(true)?;
+        let old = Pijul::new(previous.workspace.clone());
+        let before = old.snapshot("main")?;
+        let refreshed = refresh_from_source(&previous, "fresh")?;
+        assert!(!refreshed.prepared.conflicts.is_empty());
+        assert!(refreshed.preserved.is_empty());
+        assert_eq!(old.snapshot("main")?, before);
+        assert_eq!(
+            Pijul::new(refreshed.prepared.workspace.clone()).hashes("main")?,
+            previous
+                .base
+                .iter()
+                .chain(&previous.candidates)
+                .cloned()
+                .collect()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_refuses_changed_prepared_data_and_missing_native_records() -> Result<()> {
+        for kind in ["review", "policy", "candidate", "authority", "channel"] {
+            let (_directory, previous, _signer) = native_fixture(false)?;
+            let old = Pijul::new(previous.workspace.clone());
+            match kind {
+                "review" => fs::write(&previous.review_file, "Changed review data.\n")?,
+                "policy" => fs::remove_file(previous.policy_file.as_ref().unwrap())?,
+                "candidate" => fs::remove_file(old.change_file(&previous.candidates[0]))?,
+                "authority" => fs::remove_file(
+                    previous
+                        .source
+                        .join(RECORDS)
+                        .join(format!("{}.json", previous.id)),
+                )?,
+                "channel" => {
+                    old.run(["fork", "--channel", "main", "other"])?;
+                    old.run(["channel", "switch", "other"])?;
+                }
+                _ => unreachable!(),
+            }
+            assert!(refresh_from_source(&previous, "fresh").is_err());
+            assert!(!old.repo.parent().unwrap().join("fresh").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_does_not_restore_removed_old_base_changes() -> Result<()> {
+        let (_directory, original, signer) = native_fixture(false)?;
+        let (source, removed) = advance_main(&original, &signer)?;
+        let previous = refresh_from_source(&original, "second")?.prepared;
+        source.run(["unrecord", &removed])?;
+        let refreshed = refresh_from_source(&previous, "fresh")?;
+        assert!(!refreshed.prepared.base.contains(&removed));
+        assert!(!refreshed.prepared.workspace.join("main.txt").exists());
+        assert!(previous.workspace.join("main.txt").exists());
+        assert_eq!(
+            Pijul::new(refreshed.prepared.workspace).hashes("main")?,
+            original
+                .base
+                .iter()
+                .chain(&original.candidates)
+                .cloned()
+                .collect()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_retains_supplements_that_current_main_already_contains() -> Result<()> {
+        let (_directory, previous, signer) = native_fixture(false)?;
+        let old = Pijul::new(previous.workspace.clone());
+        fs::write(old.repo.join("POLICY.md"), "Use the human policy.\n")?;
+        let human = native_record(&old, &signer, "Update the policy")?;
+        assert!(
+            !crate::change::dependencies(&old.change(&human)?).contains(&previous.candidates[0])
+        );
+        let source = Pijul::new(previous.source.clone());
+        fs::write(source.repo.join("value.txt"), "candidate\n")?;
+        source.run(["channel", "switch", "main"])?;
+        source.call([OsStr::new("apply"), old.change_file(&human).as_os_str()])?;
+        let refreshed = refresh_from_source(&previous, "fresh")?;
+        assert_eq!(refreshed.preserved, vec![human.clone()]);
+        assert!(refreshed.prepared.base.contains(&human));
+        let completed = record(&refreshed.prepared, &signer, "Accept the current plan")?;
+        assert_eq!(completed.hashes, previous.candidates);
+        assert!(completed.imported.is_empty());
         Ok(())
     }
 

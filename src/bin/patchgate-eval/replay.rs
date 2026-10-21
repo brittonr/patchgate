@@ -8,11 +8,31 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Component;
 use std::sync::Arc;
 
+#[path = "replay_gate.rs"]
+mod release_gate;
+
 #[derive(Args)]
 pub struct ReplayArgs {
-    pub manifest: PathBuf,
+    #[arg(required_unless_present = "bundle", conflicts_with = "bundle")]
+    pub manifest: Option<PathBuf>,
+    #[arg(
+        long,
+        required_unless_present = "manifest",
+        conflicts_with = "manifest"
+    )]
+    pub bundle: Option<PathBuf>,
     #[arg(long)]
     pub report: Option<PathBuf>,
+    #[arg(long)]
+    pub gate: bool,
+    #[arg(long)]
+    pub baseline: Option<PathBuf>,
+    #[arg(long)]
+    pub max_unsafe_acceptances: Option<usize>,
+    #[arg(long)]
+    pub max_label_mismatches: Option<usize>,
+    #[arg(long)]
+    pub max_regressions: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -94,7 +114,7 @@ struct Variant {
     policy: Option<PathBuf>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct Comparison {
     case_id: String,
     variant_id: String,
@@ -198,6 +218,10 @@ struct Report {
     summaries: Vec<Summary>,
     infrastructure_errors: usize,
     authorizes_acceptance: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bundle_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gate: Option<release_gate::GateResult>,
 }
 
 fn valid_hash(hash: &str) -> bool {
@@ -627,6 +651,7 @@ fn recorded_policy_digest(repo: &Repo, channel: &str, path: &str) -> Result<Opti
 
 fn preflight(
     source: &Path,
+    origin: &Path,
     root: &Path,
     case: &Case,
     manifest: &Manifest,
@@ -642,7 +667,7 @@ fn preflight(
     reconstruct(&repo, case, &manifest.main)?;
     if let Some(snapshot) = &case.snapshot {
         ensure!(
-            snapshot["repository"] == json!(source),
+            snapshot["repository"] == json!(origin),
             "The captured case belongs to a different source repository."
         );
         let states: Vec<Value> = serde_json::from_str(&repo.pijul(&[
@@ -702,6 +727,13 @@ fn apply_policy(repo: &Repo, main: &str, policy_path: &str, text: &str) -> Resul
     let hash = repo.record("Set the replay policy")?;
     ensure!(valid_hash(&hash), "The policy change hash is not valid.");
     Ok(Some(hash))
+}
+
+fn observed_configuration_matches(row: &Comparison) -> bool {
+    row.evidence.as_ref().is_some_and(|report| {
+        Configuration::deserialize(&report["configuration"]["values"])
+            .is_ok_and(|observed| observed == row.configuration)
+    })
 }
 
 fn candidate_decision(report: &Value, hash: &str) -> Result<(Option<Label>, String)> {
@@ -827,6 +859,10 @@ fn execute(
         "The dry-run CLI returned {}.",
         output.status
     );
+    ensure!(
+        observed_configuration_matches(comparison),
+        "The CLI effective review settings differ from the replay settings."
+    );
     let (actual, outcome) = candidate_decision(
         comparison
             .evidence
@@ -951,20 +987,29 @@ fn report_outside_source(path: &Path, source: &Path) -> Result<PathBuf> {
         resolved.push(part);
     }
     ensure!(
-        !resolved.starts_with(source),
+        !crate::bundle::directory_contains(source, &resolved)?,
         "The report path must be outside the source repository."
     );
     Ok(resolved)
 }
 
-fn write_report(path: &Path, source: &Path, bytes: &[u8]) -> Result<()> {
+fn report_outside_repositories(path: &Path, source: &Path, origin: &Path) -> Result<PathBuf> {
     let path = report_outside_source(path, source)?;
+    ensure!(
+        source == origin || !crate::bundle::directory_contains(origin, &path)?,
+        "The report path must be outside the captured source repository."
+    );
+    Ok(path)
+}
+
+fn write_report(path: &Path, source: &Path, origin: &Path, bytes: &[u8]) -> Result<()> {
+    let path = report_outside_repositories(path, source, origin)?;
     let parent = path.parent().context("The report parent is absent.")?;
     fs::create_dir_all(parent)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
-    report_outside_source(&path, source)?;
+    report_outside_repositories(&path, source, origin)?;
     file.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -997,25 +1042,51 @@ fn trusted_runtime_path() -> Result<std::ffi::OsString> {
 }
 
 pub fn run(args: ReplayArgs) -> Result<()> {
-    let manifest_path =
-        fs::canonicalize(&args.manifest).context("Read the replay manifest path.")?;
-    let directory = manifest_path
-        .parent()
-        .context("The manifest directory is absent.")?;
-    let mut manifest: Manifest =
-        serde_json::from_slice(&fs::read(&manifest_path)?).context("Read the replay manifest.")?;
+    let input = args
+        .manifest
+        .as_deref()
+        .or(args.bundle.as_deref())
+        .context("Replay needs one manifest or bundle.")?;
+    ensure!(
+        args.manifest.is_some() != args.bundle.is_some(),
+        "Replay needs exactly one manifest or bundle."
+    );
+    let manifest_path = fs::canonicalize(input).context("Read the replay input path.")?;
+    let mut loaded = args
+        .bundle
+        .as_ref()
+        .map(|_| crate::bundle::load(&manifest_path))
+        .transpose()?;
+    let mut manifest: Manifest = match &mut loaded {
+        Some(bundle) => serde_json::from_value(std::mem::take(&mut bundle.manifest)),
+        None => serde_json::from_slice(&fs::read(&manifest_path)?),
+    }
+    .context("Read the replay manifest.")?;
+    let directory = match &loaded {
+        Some(bundle) => bundle.directory.path(),
+        None => manifest_path
+            .parent()
+            .context("The manifest directory is absent.")?,
+    };
     let policy_path = manifest.configuration.policy_path.clone();
     validate(&manifest, &policy_path)?;
-    let source = fs::canonicalize(directory.join(&manifest.repository))
-        .context("Read the source repository path.")?;
-    ensure!(
-        source.is_dir() && source.join(".pijul").is_dir(),
-        "The source repository has no Pijul metadata."
-    );
+    let (source, origin) = match &loaded {
+        Some(bundle) => (bundle.repository.clone(), bundle.origin_repository.clone()),
+        None => {
+            let source = fs::canonicalize(directory.join(&manifest.repository))
+                .context("Read the source repository path.")?;
+            ensure!(
+                source.is_dir() && source.join(".pijul").is_dir(),
+                "The source repository has no Pijul metadata."
+            );
+            (source.clone(), source)
+        }
+    };
+    let baseline = args.baseline.as_deref().map(release_gate::read_baseline);
     let report_path = args
         .report
         .as_deref()
-        .map(|path| report_outside_source(path, &source))
+        .map(|path| report_outside_repositories(path, &source, &origin))
         .transpose()?;
     let mut policies = BTreeMap::new();
     let mut policy_errors = BTreeMap::new();
@@ -1044,8 +1115,11 @@ pub fn run(args: ReplayArgs) -> Result<()> {
     let home = temporary.path().join("home");
     fs::create_dir(&home)?;
     let mut env: Env = std::env::vars_os().collect();
-    let runtime_path = trusted_runtime_path()?;
-    env.insert("PATH".into(), runtime_path.clone());
+    let runtime_path = trusted_runtime_path();
+    env.insert(
+        "PATH".into(),
+        runtime_path.as_ref().cloned().unwrap_or_default(),
+    );
     env.insert("HOME".into(), home.into_os_string());
     env.remove(std::ffi::OsStr::new("XDG_CONFIG_HOME"));
     env.remove(std::ffi::OsStr::new("SSH_AUTH_SOCK"));
@@ -1054,16 +1128,24 @@ pub fn run(args: ReplayArgs) -> Result<()> {
         .variants
         .iter()
         .any(|variant| variant.policy.is_some())
-        .then(|| Signer::with_path(runtime_path));
+        .then(|| match &runtime_path {
+            Ok(path) => Signer::with_path(path.clone()),
+            Err(error) => Err(anyhow!("Read the trusted runtime PATH: {error:#}")),
+        });
     let mut prerequisites = BTreeMap::new();
     for (index, case) in manifest.cases.iter().enumerate() {
-        if let Err(error) = preflight(
-            &source,
-            &temporary.path().join(format!("preflight-{index}")),
-            case,
-            &manifest,
-            &env,
-        ) {
+        let result = match &runtime_path {
+            Ok(_) => preflight(
+                &source,
+                &origin,
+                &temporary.path().join(format!("preflight-{index}")),
+                case,
+                &manifest,
+                &env,
+            ),
+            Err(error) => Err(anyhow!("Read the trusted runtime PATH: {error:#}")),
+        };
+        if let Err(error) = result {
             prerequisites.insert(case.id.clone(), format!("{error:#}"));
         }
     }
@@ -1122,10 +1204,12 @@ pub fn run(args: ReplayArgs) -> Result<()> {
         .iter()
         .filter(|row| row.execution_error.is_some())
         .count();
+    let gate = release_gate::evaluate(&args, &manifest, &origin, &comparisons, baseline.as_ref());
+    let gate_passed = gate.as_ref().is_none_or(|result| result.passed);
     let report = Report {
         schema_version: 1,
         manifest: manifest_path,
-        repository: source,
+        repository: origin,
         main: manifest.main,
         inbox: manifest.inbox,
         configuration: manifest.configuration,
@@ -1134,13 +1218,19 @@ pub fn run(args: ReplayArgs) -> Result<()> {
         summaries,
         infrastructure_errors,
         authorizes_acceptance: false,
+        bundle_sha256: loaded.as_ref().map(|bundle| bundle.sha256.clone()),
+        gate,
     };
     let mut text = serde_json::to_string_pretty(&report)?;
     text.push('\n');
     print!("{text}");
     if let Some(path) = report_path {
-        write_report(&path, &report.repository, text.as_bytes())?;
+        write_report(&path, &source, &report.repository, text.as_bytes())?;
     }
+    ensure!(
+        gate_passed,
+        "The replay release gate failed. The JSON report contains each failure."
+    );
     ensure!(
         infrastructure_errors == 0,
         "Replay contains {infrastructure_errors} infrastructure errors. The JSON report retains each error."
@@ -1448,6 +1538,7 @@ mod tests {
         })];
         preflight(
             &source_path,
+            &source_path,
             &directory.path().join("preflight"),
             &case,
             &fixture(),
@@ -1534,6 +1625,7 @@ mod tests {
             validate(&manifest, path)?;
             preflight(
                 &source_path,
+                &source_path,
                 &directory.path().join(format!("match-{index}")),
                 &manifest.cases[0],
                 &manifest,
@@ -1580,6 +1672,7 @@ mod tests {
         let main_hashes = source.hashes("main")?;
         let error = preflight(
             &source_path,
+            &source_path,
             &directory.path().join("changed-policy"),
             &manifest.cases[0],
             &manifest,
@@ -1595,6 +1688,7 @@ mod tests {
             Sha256::digest(b"# Policy\nReject a change that adds a secret.\n")
         ));
         preflight(
+            &source_path,
             &source_path,
             &directory.path().join("new-policy-binding"),
             &manifest.cases[0],
@@ -1683,17 +1777,157 @@ mod tests {
         fs::write(&original, b"source bytes")?;
         let alias = directory.path().join("report");
         fs::hard_link(&original, &alias)?;
-        write_report(&alias, &source, b"report bytes")?;
+        write_report(&alias, &source, &source, b"report bytes")?;
         assert_eq!(fs::read(&original)?, b"source bytes");
         assert_eq!(fs::read(&alias)?, b"report bytes");
         let dangling = directory.path().join("dangling");
         std::os::unix::fs::symlink(source.join("missing"), &dangling)?;
-        assert!(write_report(&dangling, &source, b"must not enter source").is_err());
+        assert!(write_report(&dangling, &source, &source, b"must not enter source").is_err());
         assert!(!source.join("missing").exists());
         let parent = directory.path().join("parent-alias");
         std::os::unix::fs::symlink(&source, &parent)?;
-        assert!(write_report(&parent.join("nested/report"), &source, b"no").is_err());
+        assert!(write_report(&parent.join("nested/report"), &source, &source, b"no").is_err());
         assert!(!source.join("nested").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn bundle_reports_cannot_replace_original_source_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let source = root.join("source");
+        let runtime = root.join("runtime");
+        fs::create_dir(&source)?;
+        fs::create_dir(&runtime)?;
+        let original = source.join("POLICY.md");
+        fs::write(&original, b"Retain the original source.\n")?;
+        assert!(write_report(&original, &runtime, &source, b"report").is_err());
+        assert_eq!(fs::read(&original)?, b"Retain the original source.\n");
+        let alias = source.with_file_name("SOURCE").join("POLICY.md");
+        if alias.is_file() {
+            assert!(write_report(&alias, &runtime, &source, b"report").is_err());
+            assert_eq!(fs::read(&original)?, b"Retain the original source.\n");
+        }
+        fs::remove_dir_all(&source)?;
+        assert!(write_report(&original, &runtime, &source, b"report").is_err());
+        assert!(!source.exists());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        replay: ReplayArgs,
+    }
+
+    #[test]
+    fn replay_requires_exactly_one_input() {
+        assert!(Cli::try_parse_from(["replay"]).is_err());
+        assert!(
+            Cli::try_parse_from(["replay", "manifest.json", "--bundle", "cases.tar.gz"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["replay", "manifest.json"]).is_ok());
+        let cli = Cli::try_parse_from([
+            "replay",
+            "--bundle",
+            "cases.tar.gz",
+            "--baseline",
+            "baseline.json",
+            "--max-unsafe-acceptances",
+            "1",
+            "--max-label-mismatches",
+            "2",
+            "--max-regressions",
+            "3",
+        ])
+        .unwrap();
+        assert_eq!(cli.replay.bundle, Some("cases.tar.gz".into()));
+        assert_eq!(cli.replay.max_unsafe_acceptances, Some(1));
+        assert_eq!(cli.replay.max_label_mismatches, Some(2));
+        assert_eq!(cli.replay.max_regressions, Some(3));
+    }
+
+    #[test]
+    fn portable_native_replay_preserves_origin_after_source_deletion() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let signer = Signer::new()?;
+        let source = init_repo(root.join("source"), "main", &signer.env)?;
+        source.change(&[("value.txt", "base\n")], "Define the base value")?;
+        let base: Vec<_> = source
+            .pijul(&["log", "--channel", "main", "--hash-only"])?
+            .split_whitespace()
+            .rev()
+            .map(str::to_owned)
+            .collect();
+        let states: Vec<Value> = serde_json::from_str(&source.pijul(&[
+            "log",
+            "--channel",
+            "main",
+            "--state",
+            "--output-format",
+            "json",
+        ])?)?;
+        source.pijul(&["fork", "--channel", "main", "inbox"])?;
+        let candidate = source.change(&[("value.txt", "candidate\n")], "Change the value")?;
+        let origin = fs::canonicalize(&source.path)?;
+        let configuration = Configuration::default();
+        let snapshot = json!({
+            "repository": origin, "main": "main", "inbox": "inbox",
+            "main_state": states[0]["state"], "base": base, "candidate": candidate,
+            "policy_path": "POLICY.md", "policy_sha256": null,
+            "configuration": {"source": "environment", "path": null, "sha256": null, "values": configuration},
+        });
+        let manifest = json!({
+            "schema_version": 1, "repository": origin, "main": "main", "inbox": "inbox",
+            "configuration": configuration,
+            "cases": [{
+                "id": "portable", "base": base, "candidate": candidate, "expected": "accept",
+                "configuration": configuration, "snapshot": snapshot,
+                "labels": [{
+                    "user": "reviewer", "time": "2026-10-21T00:00:00Z",
+                    "expected": "accept", "reason": "The reviewer approves the change.",
+                }],
+            }],
+            "variants": [{
+                "id": "model", "model_url": "http://localhost:8080",
+                "model": "model", "api": "openai", "revision": "revision",
+            }],
+        });
+        let path = root.join("cases.tar.gz");
+        crate::bundle::write(&origin, manifest, &path)?;
+        fs::remove_dir_all(&source.path)?;
+        let mut loaded = crate::bundle::load(&path)?;
+        let manifest: Manifest = serde_json::from_value(std::mem::take(&mut loaded.manifest))?;
+        validate(&manifest, &manifest.configuration.policy_path)?;
+        assert_eq!(loaded.origin_repository, origin);
+        assert_eq!(manifest.cases[0].snapshot.as_ref().unwrap(), &snapshot);
+        preflight(
+            &loaded.repository,
+            &loaded.origin_repository,
+            &directory.path().join("portable-preflight"),
+            &manifest.cases[0],
+            &manifest,
+            &signer.env,
+        )?;
+        assert!(
+            preflight(
+                &loaded.repository,
+                &directory.path().join("wrong-origin"),
+                &directory.path().join("wrong-origin-preflight"),
+                &manifest.cases[0],
+                &manifest,
+                &signer.env,
+            )
+            .is_err()
+        );
+        assert!(!origin.exists());
         Ok(())
     }
 }

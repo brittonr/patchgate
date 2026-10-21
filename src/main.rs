@@ -1,4 +1,5 @@
 mod budget;
+pub mod bundle;
 mod cases;
 mod change;
 mod configuration;
@@ -24,7 +25,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use change::short;
-use gate::{Gate, Item, Settings, State};
+use gate::{Gate, Item, Selection, Settings, State};
 
 #[derive(Parser)]
 #[command(
@@ -70,7 +71,11 @@ enum Command {
     },
     /// Prepare an isolated workspace for a human resolution.
     Resolve {
-        change: String,
+        #[arg(required_unless_present = "refresh", conflicts_with = "refresh")]
+        change: Option<String>,
+        /// Preserve recorded human work against current main in a new workspace.
+        #[arg(long, required_unless_present = "change", conflicts_with = "change")]
+        refresh: Option<PathBuf>,
         #[arg(long)]
         workspace: PathBuf,
         #[arg(long)]
@@ -92,17 +97,30 @@ enum Command {
         command: CaseCommand,
     },
     /// Review and merge the pending changes one time.
+    #[command(group(clap::ArgGroup::new("review_selection").args(["changes", "authors"]).multiple(true)))]
     Review {
         /// Review in isolation without source acceptance.
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
         json: bool,
+        /// Select a change hash or a unique prefix. Repeat for several changes.
+        #[arg(long = "change")]
+        changes: Vec<String>,
+        /// Select unaccepted changes by an exact native author name.
+        #[arg(long = "author")]
+        authors: Vec<String>,
+        /// Include pending native prerequisites for the explicit selection.
+        #[arg(long, requires = "review_selection")]
+        include_dependencies: bool,
     },
     /// Diagnose setup without repository changes.
     Doctor {
         #[arg(long)]
         json: bool,
+        /// Exercise native state refusal and Nix isolation in private fixtures.
+        #[arg(long)]
+        runtime: bool,
     },
     /// Review and merge new changes until stopped. devenv up runs this command.
     Watch {
@@ -170,6 +188,17 @@ enum CaseCommand {
         #[arg(long)]
         output: PathBuf,
         #[arg(long = "case")]
+        cases: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export explicitly selected cases and native history as a portable bundle.
+    Bundle {
+        #[arg(long)]
+        variants: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long = "case", required = true)]
         cases: Vec<String>,
         #[arg(long)]
         json: bool,
@@ -363,6 +392,27 @@ fn run_cases(settings: Settings, command: CaseCommand) -> Result<()> {
                 );
             }
         }
+        CaseCommand::Bundle {
+            variants,
+            output,
+            cases,
+            json,
+        } => {
+            eprintln!(
+                "patchgate: Bundle history can contain credentials. Store this file as sensitive data."
+            );
+            let report = cases::Store::new(&settings.repo).bundle(&cases, &variants, &output)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "Exported {} selected cases to {}.",
+                    report.cases.len(),
+                    report.output.display()
+                );
+                println!("Bundle SHA-256: {}", report.sha256);
+            }
+        }
     }
     Ok(())
 }
@@ -440,27 +490,58 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
         }
         Command::Resolve {
             change,
+            refresh,
             workspace,
             json,
         } => {
             let repository = settings.repo.clone();
-            let prepared = Gate::prepare_resolution(settings, &change, &workspace)?;
+            let (prepared, refreshed) = if let Some(previous) = refresh {
+                let result = Gate::refresh_resolution(settings, &previous, &workspace)?;
+                (
+                    result.prepared,
+                    Some((result.previous_id, result.preserved)),
+                )
+            } else {
+                (
+                    Gate::prepare_resolution(
+                        settings,
+                        change
+                            .as_deref()
+                            .context("Give a change or an old workspace.")?,
+                        &workspace,
+                    )?,
+                    None,
+                )
+            };
             if json {
                 #[derive(serde::Serialize)]
                 struct ResolutionReport<'a> {
                     schema_version: u8,
                     authorizes_acceptance: bool,
                     prepared: &'a resolution::Prepared,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    refreshed_from: Option<&'a str>,
+                    #[serde(skip_serializing_if = "Option::is_none")]
+                    preserved: Option<&'a [String]>,
                 }
                 print_json(&ResolutionReport {
                     schema_version: 1,
                     authorizes_acceptance: false,
                     prepared: &prepared,
+                    refreshed_from: refreshed.as_ref().map(|(previous, _)| previous.as_str()),
+                    preserved: refreshed.as_ref().map(|(_, hashes)| hashes.as_slice()),
                 })?;
             } else {
                 println!("Resolution: {}", prepared.id);
                 println!("Workspace: {}", prepared.workspace.display());
                 println!("Conflicts: {}", prepared.conflicts.len());
+                if let Some((previous, preserved)) = &refreshed {
+                    println!("Refreshed from: {previous}");
+                    println!("Preserved human records: {}", preserved.len());
+                    println!(
+                        "The old workspace remains unchanged. Its untracked files stay there."
+                    );
+                }
                 if let Some(policy) = &prepared.policy_file {
                     println!("Trusted policy: {}", policy.display());
                 }
@@ -487,8 +568,12 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
             show_review(&report, json)?;
         }
         Command::Cases { command } => run_cases(settings, command)?,
-        Command::Doctor { json } => {
-            let report = doctor::inspect(&settings)?;
+        Command::Doctor { json, runtime } => {
+            let report = if runtime {
+                doctor::inspect_runtime(&settings)?
+            } else {
+                doctor::inspect(&settings)?
+            };
             if json {
                 print_json(&report)?;
             } else {
@@ -498,15 +583,36 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 bail!("Setup diagnostics found errors. Use the repair commands in the report.");
             }
         }
-        Command::Review { dry_run, json } => {
+        Command::Review {
+            dry_run,
+            json,
+            changes,
+            authors,
+            include_dependencies,
+        } => {
+            let selection = Selection {
+                changes,
+                authors,
+                include_dependencies,
+            };
             if dry_run {
-                return show_review(&Gate::dry_run(settings)?, json);
+                return show_review(&Gate::dry_run(settings, &selection)?, json);
             }
             let mut gate = Gate::new(settings)?;
             if json {
-                return show_review(&gate.review_report(false)?, true);
+                return show_review(&gate.review_report(false, &selection)?, true);
             }
-            let items = gate.review(show)?;
+            let (items, selected) = gate.review(&selection, show)?;
+            if let Some(selected) = selected {
+                println!(
+                    "Selected {} change(s), with {} added prerequisite(s).",
+                    selected.selected.len(),
+                    selected.added_dependencies.len()
+                );
+                for item in items.iter().filter(|item| !item.decided) {
+                    show(item);
+                }
+            }
             if !items.iter().any(|item| item.decided) {
                 println!("No change is ready for review.");
             }
@@ -529,7 +635,7 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
             println!("Model: {} at {}", s.model, s.model_url);
             let mut last_error = None;
             while !interrupted.load(Ordering::Relaxed) {
-                match gate.review(show) {
+                match gate.review(&Selection::default(), show) {
                     Ok(_) => last_error = None,
                     Err(error) => {
                         let error = format!("{error:#}");

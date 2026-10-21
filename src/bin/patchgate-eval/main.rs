@@ -1,4 +1,6 @@
 mod apply_race;
+#[path = "../../bundle.rs"]
+pub mod bundle;
 mod concurrency;
 mod contracts;
 mod controls;

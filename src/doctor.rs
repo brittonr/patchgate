@@ -1,10 +1,11 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Seek};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -169,6 +170,383 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
     inspect_model(&mut report, settings, timeout);
     inspect_nix(&mut report, check_timeout);
     Ok(report)
+}
+
+/// Run explicit probes in private fixtures after the read-only checks.
+pub fn inspect_runtime(settings: &Settings) -> Result<Report> {
+    let mut report = inspect(settings)?;
+    match native_runtime_probe() {
+        Ok(()) => report.add(
+            "pijul.runtime_expected_state",
+            Status::Pass,
+            "A private native fixture refused a stale state without state or file changes. The same candidate applied with the current state.",
+            None,
+        ),
+        Err(_) => report.add(
+            "pijul.runtime_expected_state",
+            Status::Error,
+            "The private native transaction probe failed or exceeded its time limit. Native output is omitted.",
+            Some("Use the pinned patched Pijul runtime and OpenSSH tools. Run: devenv shell".into()),
+        ),
+    }
+    let timeout = report
+        .configuration
+        .as_ref()
+        .and_then(|value| Duration::try_from_secs_f64(value.values.check_timeout_seconds).ok())
+        .unwrap_or(settings.check_timeout)
+        .min(PROBE_LIMIT);
+    let interrupted = std::sync::atomic::AtomicBool::new(false);
+    match verify::probe_runtime_isolation(timeout, &interrupted) {
+        Ok(()) => report.add(
+            "nix.runtime_isolation",
+            Status::Pass,
+            "A fresh local derivation could not read the host marker or inherit private client data. Its output matched. This result is not a universal isolation proof.",
+            None,
+        ),
+        Err(_) => report.add(
+            "nix.runtime_isolation",
+            Status::Error,
+            "The private Nix isolation probe failed or exceeded its time limit. Check the local daemon, Nix-store shell, and sandbox-paths. Nix output is omitted.",
+            Some(sandbox_repair()),
+        ),
+    }
+    Ok(report)
+}
+
+type ProbeSnapshot = (Option<String>, BTreeSet<String>);
+
+struct NativeProbe {
+    directory: tempfile::TempDir,
+    repo: PathBuf,
+    home: PathBuf,
+    socket: PathBuf,
+    pijul: PathBuf,
+    deadline: Instant,
+    agent: Option<Child>,
+}
+
+impl Drop for NativeProbe {
+    fn drop(&mut self) {
+        if let Some(agent) = &mut self.agent {
+            unsafe {
+                libc::kill(-(agent.id() as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = agent.wait();
+        }
+    }
+}
+
+fn probe_executable(name: &str) -> Result<PathBuf> {
+    env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find(|path| {
+            fs::metadata(path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .and_then(|path| fs::canonicalize(path).ok())
+        .with_context(|| format!("The runtime probe needs {name} in an absolute PATH directory"))
+}
+
+impl NativeProbe {
+    fn new() -> Result<Self> {
+        let directory = tempfile::Builder::new().prefix("pg-native-").tempdir()?;
+        let repo = directory.path().join("repo");
+        let home = directory.path().join("home");
+        fs::create_dir(&repo)?;
+        fs::create_dir(&home)?;
+        fs::create_dir(home.join("tmp"))?;
+        Ok(Self {
+            repo,
+            home,
+            socket: directory.path().join("agent"),
+            pijul: probe_executable("pijul")?,
+            directory,
+            deadline: Instant::now() + PROBE_LIMIT,
+            agent: None,
+        })
+    }
+
+    fn command(&self, executable: &Path) -> Command {
+        let mut command = Command::new(executable);
+        command
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", self.home.join(".config"))
+            .env("TMPDIR", self.home.join("tmp"))
+            .env("PATH", "")
+            .env("SSH_AUTH_SOCK", &self.socket)
+            .env("NO_COLOR", "1")
+            .current_dir(&self.repo)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        command
+    }
+
+    fn execute(&self, command: &mut Command) -> Result<(ExitStatus, String)> {
+        ensure!(
+            Instant::now() < self.deadline,
+            "The native runtime probe timed out"
+        );
+        let mut stdout = tempfile::tempfile_in(self.directory.path())?;
+        command.stdout(Stdio::from(stdout.try_clone()?));
+        let mut child = command
+            .spawn()
+            .context("Cannot execute the native runtime probe")?;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < self.deadline => {
+                    thread::sleep(Duration::from_millis(20))
+                }
+                result => {
+                    unsafe {
+                        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                    }
+                    let _ = child.wait();
+                    if let Err(error) = result {
+                        return Err(error.into());
+                    }
+                    bail!("The native runtime probe timed out");
+                }
+            }
+        };
+        ensure!(
+            stdout.metadata()?.len() <= OUTPUT_LIMIT,
+            "Native probe output exceeds its limit"
+        );
+        stdout.rewind()?;
+        let mut text = String::new();
+        stdout.take(OUTPUT_LIMIT).read_to_string(&mut text)?;
+        Ok((status, text))
+    }
+
+    fn run(&self, arguments: &[&str]) -> Result<String> {
+        let mut command = self.command(&self.pijul);
+        command.args(arguments);
+        let (status, text) = self.execute(&mut command)?;
+        ensure!(status.success(), "The native fixture command failed");
+        Ok(text)
+    }
+
+    fn signer(&mut self) -> Result<()> {
+        let key = self.directory.path().join("key");
+        let mut keygen = self.command(&probe_executable("ssh-keygen")?);
+        keygen
+            .args([
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "patchgate-doctor",
+                "-f",
+            ])
+            .arg(&key);
+        ensure!(
+            self.execute(&mut keygen)?.0.success(),
+            "Cannot create the private probe key"
+        );
+        let mut agent = self.command(&probe_executable("ssh-agent")?);
+        agent
+            .args(["-D", "-a"])
+            .arg(&self.socket)
+            .stdout(Stdio::null());
+        self.agent = Some(
+            agent
+                .spawn()
+                .context("Cannot start the private probe signer")?,
+        );
+        while !self.socket.exists() {
+            ensure!(
+                Instant::now() < self.deadline,
+                "The private probe signer timed out"
+            );
+            ensure!(
+                self.agent
+                    .as_mut()
+                    .context("Missing private signer")?
+                    .try_wait()?
+                    .is_none(),
+                "The private probe signer exited"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let mut add = self.command(&probe_executable("ssh-add")?);
+        add.arg("-q").arg(&key);
+        ensure!(
+            self.execute(&mut add)?.0.success(),
+            "Cannot load the private probe key"
+        );
+        Ok(())
+    }
+
+    fn snapshot(&self, channel: &str) -> Result<ProbeSnapshot> {
+        let text = self.run(&[
+            "log",
+            "--channel",
+            channel,
+            "--state",
+            "--output-format",
+            "json",
+        ])?;
+        #[derive(Deserialize)]
+        struct Entry {
+            hash: String,
+            state: String,
+        }
+        let entries: Vec<Entry> = serde_json::from_str(&text)?;
+        ensure!(
+            entries
+                .iter()
+                .all(|entry| !entry.hash.is_empty() && !entry.state.is_empty()),
+            "The native probe snapshot is incomplete"
+        );
+        Ok((
+            entries.first().map(|entry| entry.state.clone()),
+            entries.into_iter().map(|entry| entry.hash).collect(),
+        ))
+    }
+
+    fn files(&self) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+        let mut files = BTreeMap::new();
+        for entry in fs::read_dir(&self.repo)? {
+            let entry = entry?;
+            if entry.file_name() == ".pijul" {
+                continue;
+            }
+            ensure!(
+                entry.file_type()?.is_file(),
+                "The native fixture contains an unexpected entry"
+            );
+            files.insert(entry.path(), fs::read(entry.path())?);
+        }
+        Ok(files)
+    }
+
+    fn record(&self, message: &str) -> Result<()> {
+        self.run(&[
+            "record",
+            "-a",
+            "-m",
+            message,
+            "--author",
+            "patchgate-doctor",
+        ])?;
+        Ok(())
+    }
+}
+
+fn native_runtime_probe() -> Result<()> {
+    let mut probe = NativeProbe::new()?;
+    probe.signer()?;
+    probe.run(&["init"])?;
+    // All native configuration and file bytes belong to this private fixture.
+    for name in [".pijul/config", ".pijul/config.toml", "pijul.toml"] {
+        match fs::remove_file(probe.repo.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("Cannot exclude private native fixture configuration");
+            }
+        }
+    }
+    fs::write(probe.repo.join("base.txt"), b"private base\n")?;
+    probe.run(&["add", "base.txt"])?;
+    probe.record("Define the private base")?;
+    let stale = probe.snapshot("main")?;
+    probe.run(&["fork", "--channel", "main", "candidate"])?;
+    probe.run(&["channel", "switch", "candidate"])?;
+    fs::write(probe.repo.join("candidate.txt"), b"private candidate\n")?;
+    probe.run(&["add", "candidate.txt"])?;
+    probe.record("Define the private candidate")?;
+    let candidate = probe
+        .snapshot("candidate")?
+        .1
+        .difference(&stale.1)
+        .cloned()
+        .collect::<Vec<_>>();
+    ensure!(
+        candidate.len() == 1,
+        "The private fixture needs one candidate"
+    );
+    probe.run(&["channel", "switch", "main"])?;
+    fs::write(probe.repo.join("current.txt"), b"private current state\n")?;
+    probe.run(&["add", "current.txt"])?;
+    probe.record("Advance the private main state")?;
+    let current = probe.snapshot("main")?;
+    ensure!(stale.0 != current.0, "The private state did not advance");
+    let before = probe.files()?;
+    let mut command = probe.command(&probe.pijul);
+    command.args([
+        "apply",
+        "--channel",
+        "main",
+        "--expected-state",
+        stale.0.as_deref().context("Missing stale probe state")?,
+        &candidate[0],
+    ]);
+    let (status, _) = probe.execute(&mut command)?;
+    check_native_refusal(
+        status,
+        &current,
+        &probe.snapshot("main")?,
+        &before,
+        &probe.files()?,
+    )?;
+    probe.run(&[
+        "apply",
+        "--channel",
+        "main",
+        "--expected-state",
+        current
+            .0
+            .as_deref()
+            .context("Missing current probe state")?,
+        &candidate[0],
+    ])?;
+    let applied = probe.snapshot("main")?;
+    let mut expected = current.1;
+    expected.insert(candidate[0].clone());
+    ensure!(
+        applied.1 == expected && applied.0 != current.0,
+        "Current-state acceptance failed"
+    );
+    let mut expected_files = before;
+    expected_files.insert(
+        probe.repo.join("candidate.txt"),
+        b"private candidate\n".to_vec(),
+    );
+    ensure!(
+        probe.files()? == expected_files,
+        "Current-state acceptance changed unexpected file bytes"
+    );
+    Ok(())
+}
+
+fn check_native_refusal(
+    status: ExitStatus,
+    before: &ProbeSnapshot,
+    after: &ProbeSnapshot,
+    before_files: &BTreeMap<PathBuf, Vec<u8>>,
+    after_files: &BTreeMap<PathBuf, Vec<u8>>,
+) -> Result<()> {
+    ensure!(
+        status.code() == Some(42),
+        "Pijul did not report an expected-state refusal"
+    );
+    ensure!(
+        before == after,
+        "The refused transaction changed native state"
+    );
+    ensure!(
+        before_files == after_files,
+        "The refused transaction changed file bytes"
+    );
+    Ok(())
 }
 
 fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, command: &str) {
@@ -528,7 +906,7 @@ fn sandbox_repair() -> String {
         "sudo systemctl restart nix-daemon"
     };
     format!(
-        "On the daemon host, run: sudoedit /etc/nix/nix.conf. Set sandbox = true. Restart the daemon with: {restart}"
+        "On the daemon host, run: sudoedit /etc/nix/nix.conf. Set sandbox = true. Remove broad host-directory entries from sandbox-paths. Restart the daemon with: {restart}"
     )
 }
 
@@ -547,6 +925,7 @@ fn nix_configuration(timeout: Duration) -> Result<Value> {
         "PATCHGATE_CHECK_TIMEOUT must be positive"
     );
     let nix = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .filter(|directory| directory.is_absolute())
         .map(|directory| directory.join("nix"))
         .find(|path| {
             fs::metadata(path).is_ok_and(|metadata| {
@@ -655,6 +1034,33 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn native_refusal_requires_its_exit_code_and_no_mutation() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt;
+        let state = (Some("state".into()), BTreeSet::from(["base".into()]));
+        let files = BTreeMap::from([(PathBuf::from("file"), b"original".to_vec())]);
+        let refused = ExitStatus::from_raw(42 << 8);
+        check_native_refusal(refused, &state, &state, &files, &files)?;
+        assert!(
+            check_native_refusal(ExitStatus::from_raw(0), &state, &state, &files, &files).is_err()
+        );
+        assert!(
+            check_native_refusal(ExitStatus::from_raw(1 << 8), &state, &state, &files, &files)
+                .is_err()
+        );
+        let changed = (Some("different".into()), state.1.clone());
+        assert!(check_native_refusal(refused, &state, &changed, &files, &files).is_err());
+        let changed = (
+            state.0.clone(),
+            BTreeSet::from(["base".into(), "candidate".into()]),
+        );
+        assert!(check_native_refusal(refused, &state, &changed, &files, &files).is_err());
+        let changed_files = BTreeMap::from([(PathBuf::from("file"), b"changed".to_vec())]);
+        assert!(check_native_refusal(refused, &state, &state, &files, &changed_files).is_err());
+        assert!(check_native_refusal(refused, &state, &state, &files, &BTreeMap::new()).is_err());
+        Ok(())
+    }
 
     #[test]
     fn expected_state_requires_the_exact_option() {

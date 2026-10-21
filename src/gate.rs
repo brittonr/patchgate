@@ -398,6 +398,33 @@ pub struct StatusReport {
     pub records: Vec<Record>,
 }
 
+#[derive(Default)]
+pub struct Selection {
+    pub changes: Vec<String>,
+    pub authors: Vec<String>,
+    pub include_dependencies: bool,
+}
+
+impl Selection {
+    pub fn targeted(&self) -> bool {
+        !self.changes.is_empty() || !self.authors.is_empty()
+    }
+}
+
+#[derive(Serialize)]
+pub struct SelectionReport {
+    pub requested_changes: Vec<String>,
+    pub requested_authors: Vec<String>,
+    pub include_dependencies: bool,
+    pub selected: Vec<String>,
+    pub added_dependencies: Vec<String>,
+}
+
+struct SelectionPlan {
+    chosen: Vec<bool>,
+    report: SelectionReport,
+}
+
 #[derive(Serialize)]
 pub struct ReviewReport {
     pub schema_version: u8,
@@ -408,6 +435,8 @@ pub struct ReviewReport {
     pub configuration: Rc<crate::configuration::Evidence>,
     pub items: Vec<Item>,
     pub records: Vec<Record>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<SelectionReport>,
 }
 
 #[derive(Debug)]
@@ -1036,6 +1065,53 @@ impl Gate {
         )
     }
 
+    pub fn refresh_resolution(
+        settings: Settings,
+        previous_workspace: &Path,
+        workspace: &Path,
+    ) -> Result<crate::resolution::Refreshed> {
+        let repository = settings.repo.clone();
+        let previous = crate::resolution::load(&repository, previous_workspace)?;
+        if previous.main != settings.main || previous.inbox != settings.inbox {
+            bail!("The old workspace uses different review channels.");
+        }
+        let primary = previous
+            .candidates
+            .last()
+            .context("The old workspace has no primary change.")?;
+        let (_isolated, mut gate) = Self::isolated(settings, false)?;
+        let entry = gate.find_entry(primary, false)?;
+        let main = gate.pijul.snapshot(&gate.settings.main)?;
+        if main.hashes.contains(&entry.hash) {
+            bail!(
+                "The original primary change is already in main. Submit further human records as a new change."
+            );
+        }
+        gate.refresh_configuration(&main)?;
+        let inbox = gate.pijul.log(&gate.settings.inbox)?;
+        let candidates = gate.with_conflicting_dependencies(&entry.hash, &main.hashes, &inbox)?;
+        let policy = gate
+            .pijul
+            .read_file(&gate.settings.main, &gate.settings.policy)?;
+        let binding = ReviewBinding::new(
+            &candidates,
+            &gate.settings.policy,
+            policy.as_deref(),
+            &gate.settings.main,
+            &main,
+        );
+        gate.require_current_main(&main)?;
+        crate::resolution::refresh(
+            &repository,
+            &gate.pijul,
+            &previous,
+            &candidates,
+            workspace,
+            binding,
+            gate.configuration.as_ref().clone(),
+        )
+    }
+
     pub fn reconsider(&mut self, prefix: &str, reason: &str) -> Result<ReviewReport> {
         if reason.trim().is_empty() {
             bail!("Give an explicit reason for reconsideration.");
@@ -1103,6 +1179,7 @@ impl Gate {
             configuration,
             items: vec![item],
             records,
+            selection: None,
         })
     }
 
@@ -1139,7 +1216,8 @@ impl Gate {
     }
 
     pub fn status(&mut self) -> Result<Vec<Item>> {
-        self.walk(false, |_| {})
+        self.walk(false, &Selection::default(), |_| {})
+            .map(|(items, _)| items)
     }
 
     pub fn status_report(&mut self) -> Result<StatusReport> {
@@ -1324,14 +1402,14 @@ impl Gate {
             || self.protected.is_match(path)
     }
 
-    pub fn review_report(&mut self, dry_run: bool) -> Result<ReviewReport> {
+    pub fn review_report(&mut self, dry_run: bool, selection: &Selection) -> Result<ReviewReport> {
         let _lock = self.ledger.lock()?;
         self.recover()?;
         let main = self.pijul.snapshot(&self.settings.main)?;
         self.refresh_configuration(&main)?;
         let inbox = self.pijul.snapshot(&self.settings.inbox)?;
         let boundary = self.ledger.history()?.len();
-        let items = self.walk(true, |_| {})?;
+        let (items, selection) = self.walk(true, selection, |_| {})?;
         let records = self.ledger.history()?.into_iter().skip(boundary).collect();
         Ok(ReviewReport {
             schema_version: 1,
@@ -1348,12 +1426,13 @@ impl Gate {
             },
             items,
             records,
+            selection,
         })
     }
 
-    pub fn dry_run(settings: Settings) -> Result<ReviewReport> {
+    pub fn dry_run(settings: Settings, selection: &Selection) -> Result<ReviewReport> {
         let (_isolated, mut gate) = Self::isolated(settings, true)?;
-        gate.review_report(true)
+        gate.review_report(true, selection)
     }
 
     pub fn behind(&self) -> Result<Vec<LogEntry>> {
@@ -1366,10 +1445,14 @@ impl Gate {
             .collect())
     }
 
-    pub fn review(&mut self, report: impl FnMut(&Item)) -> Result<Vec<Item>> {
+    pub fn review(
+        &mut self,
+        selection: &Selection,
+        report: impl FnMut(&Item),
+    ) -> Result<(Vec<Item>, Option<SelectionReport>)> {
         let _lock = self.ledger.lock()?;
         self.recover()?;
-        self.walk(true, report)
+        self.walk(true, selection, report)
     }
 
     pub fn decide_by_hand(
@@ -1680,15 +1763,142 @@ impl Gate {
         Ok(hashes)
     }
 
-    fn walk(&mut self, decide: bool, mut report: impl FnMut(&Item)) -> Result<Vec<Item>> {
+    fn selection_plan(
+        &mut self,
+        selection: &Selection,
+        inbox: &[LogEntry],
+        main: &HashSet<String>,
+        records: &HashMap<String, Record>,
+    ) -> Result<SelectionPlan> {
+        let mut chosen = vec![false; inbox.len()];
+        for prefix in &selection.changes {
+            if prefix.is_empty() {
+                bail!("Give a nonempty change prefix.");
+            }
+            let mut matches = inbox.iter().enumerate().filter(|(_, entry)| {
+                entry
+                    .hash
+                    .get(..prefix.len())
+                    .is_some_and(|part| part.eq_ignore_ascii_case(prefix))
+            });
+            let (index, entry) = matches
+                .next()
+                .context("A selected change is not in inbox.")?;
+            if matches.next().is_some() {
+                bail!("A selected change prefix is ambiguous.");
+            }
+            if main.contains(&entry.hash) {
+                bail!("A selected change is already in main.");
+            }
+            chosen[index] = true;
+        }
+        let positions: HashMap<_, _> =
+            if !selection.authors.is_empty() || selection.include_dependencies {
+                inbox
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| (entry.hash.as_str(), index))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+        if !selection.authors.is_empty() {
+            let metadata = self.pijul.review_metadata(&self.settings.inbox)?;
+            for author in &selection.authors {
+                if author.trim().is_empty() {
+                    bail!("Give a nonempty author name.");
+                }
+                let mut matched = false;
+                for entry in &metadata {
+                    if !main.contains(&entry.hash)
+                        && entry.authors.iter().any(|name| name == author)
+                    {
+                        let index = positions
+                            .get(entry.hash.as_str())
+                            .context("Selected author metadata differs from the inbox snapshot.")?;
+                        chosen[*index] = true;
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    bail!("A selected author has no unaccepted inbox change.");
+                }
+            }
+        }
+        let mut added = Vec::new();
+        if selection.include_dependencies {
+            let mut scanned = vec![false; inbox.len()];
+            let mut pending: Vec<_> = chosen
+                .iter()
+                .enumerate()
+                .filter_map(|(index, selected)| selected.then_some(index))
+                .collect();
+            while let Some(index) = pending.pop() {
+                if scanned[index] {
+                    continue;
+                }
+                scanned[index] = true;
+                if records.contains_key(&inbox[index].hash) {
+                    continue;
+                }
+                for dependency in change::dependencies(&self.change_text(&inbox[index].hash)?) {
+                    if main.contains(&dependency) {
+                        continue;
+                    }
+                    let dependency_index = *positions
+                        .get(dependency.as_str())
+                        .context("A selected prerequisite is absent from inbox.")?;
+                    if !chosen[dependency_index] {
+                        chosen[dependency_index] = true;
+                        added.push(dependency_index);
+                    }
+                    pending.push(dependency_index);
+                }
+            }
+        }
+        added.sort_unstable();
+        let report = SelectionReport {
+            requested_changes: selection.changes.clone(),
+            requested_authors: selection.authors.clone(),
+            include_dependencies: selection.include_dependencies,
+            selected: inbox
+                .iter()
+                .zip(&chosen)
+                .filter(|(_, selected)| **selected)
+                .map(|(entry, _)| entry.hash.clone())
+                .collect(),
+            added_dependencies: added
+                .into_iter()
+                .map(|index| inbox[index].hash.clone())
+                .collect(),
+        };
+        Ok(SelectionPlan { chosen, report })
+    }
+
+    fn walk(
+        &mut self,
+        decide: bool,
+        selection: &Selection,
+        mut report: impl FnMut(&Item),
+    ) -> Result<(Vec<Item>, Option<SelectionReport>)> {
+        if selection.include_dependencies && !selection.targeted() {
+            bail!("Dependency inclusion needs an explicit change or author selection.");
+        }
         let mut main = self.pijul.hashes(&self.settings.main)?;
         let records = self.ledger.latest()?;
+        let inbox = self.pijul.log(&self.settings.inbox)?;
+        let plan = if selection.targeted() {
+            Some(self.selection_plan(selection, &inbox, &main, &records)?)
+        } else {
+            None
+        };
         let mut states = HashMap::new();
         let mut items = Vec::new();
-        for entry in self.pijul.log(&self.settings.inbox)? {
+        for (index, entry) in inbox.into_iter().enumerate() {
             if main.contains(&entry.hash) {
                 continue;
             }
+            let selected = plan.as_ref().is_none_or(|plan| plan.chosen[index]);
             let mut item = Item::from(entry);
             if let Some(record) = records.get(&item.hash) {
                 item.state = State::from_decision(&record.decision);
@@ -1715,15 +1925,24 @@ impl Gate {
                     } else {
                         State::Waiting
                     };
-                } else if decide {
+                    if selected && selection.targeted() {
+                        item.reason = if item.state == State::Blocked {
+                            "A prerequisite has a blocked or terminal state. Decide it explicitly before this change.".into()
+                        } else {
+                            "A prerequisite is outside the ready selection. Select it explicitly or use --include-dependencies.".into()
+                        };
+                    }
+                } else if decide && selected {
                     self.decide_and_land(&mut item, &text, &mut main, None)?;
                     report(&item);
                 }
             }
             states.insert(item.hash.clone(), item.state);
-            items.push(item);
+            if selected {
+                items.push(item);
+            }
         }
-        Ok(items)
+        Ok((items, plan.map(|plan| plan.report)))
     }
 
     fn decide_and_land(
@@ -2794,6 +3013,188 @@ mod feature_tests {
         Ok((directory, settings, candidate))
     }
 
+    fn fixture_edit(settings: &Settings, file: &str, text: &str, author: &str) -> Result<String> {
+        let pijul = Pijul::new(settings.repo.clone());
+        fs::write(settings.repo.join(file), text)?;
+        pijul.run(["add", file])?;
+        let signer = Signer::new(settings.repo.join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        let (output, _) = pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Record the fixture edit",
+                "--author",
+                author,
+            ],
+            &environment.vars,
+        )?;
+        output
+            .split_whitespace()
+            .next_back()
+            .map(str::to_owned)
+            .context("The fixture edit has no hash")
+    }
+
+    fn independent_fixture_edit(settings: &Settings) -> Result<String> {
+        let pijul = Pijul::new(settings.repo.clone());
+        pijul.run(["fork", "--channel", "main", "other-author"])?;
+        pijul.run(["channel", "switch", "other-author"])?;
+        let hash = fixture_edit(
+            settings,
+            "other.txt",
+            "independent source\n",
+            "other-author",
+        )?;
+        pijul.run(["apply", "--channel", "inbox", &hash])?;
+        pijul.run(["channel", "switch", "inbox"])?;
+        Ok(hash)
+    }
+
+    #[test]
+    fn targeted_review_does_not_decide_unselected_changes() -> Result<()> {
+        let (_directory, mut settings, candidate) =
+            pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let other = independent_fixture_edit(&settings)?;
+        settings.protected = vec!["*.txt".into()];
+        let mut gate = Gate::new(settings)?;
+        let selection = Selection {
+            changes: vec![candidate[..12].to_ascii_lowercase()],
+            ..Selection::default()
+        };
+        let report = gate.review_report(false, &selection)?;
+        assert_eq!(report.items.len(), 1);
+        assert!(report.items[0].state == State::Escalated);
+        let records = gate.ledger.latest()?;
+        assert_eq!(records[&candidate].by, "gate");
+        assert!(!records.contains_key(&other));
+        assert_eq!(report.selection.unwrap().selected, vec![candidate]);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_dependencies_need_explicit_inclusion_and_retain_terminal_decisions() -> Result<()> {
+        let (_directory, mut settings, dependency) =
+            pending_fixture(&[("value.txt", b"dependency\n")])?;
+        let candidate = fixture_edit(&settings, "value.txt", "dependent candidate\n", "patchgate")?;
+        settings.protected = vec!["*.txt".into()];
+        let mut gate = Gate::new(settings)?;
+        let mut selection = Selection {
+            changes: vec![candidate.clone()],
+            ..Selection::default()
+        };
+        let waiting = gate.review_report(false, &selection)?;
+        assert_eq!(waiting.items.len(), 1);
+        assert!(waiting.items[0].state == State::Waiting);
+        assert!(waiting.records.is_empty());
+        assert!(gate.ledger.history()?.is_empty());
+        selection.include_dependencies = true;
+        let included = gate.review_report(false, &selection)?;
+        assert_eq!(
+            included.selection.unwrap().added_dependencies,
+            vec![dependency.clone()]
+        );
+        assert!(
+            included
+                .items
+                .iter()
+                .any(|item| item.hash == candidate && item.state == State::Blocked)
+        );
+        assert_eq!(gate.ledger.latest()?[&dependency].decision, "escalate");
+        assert!(!gate.ledger.latest()?.contains_key(&candidate));
+        gate.decide_by_hand(&dependency, "reject", Some("Retain this human rejection"))?;
+        let before = fs::read(&gate.ledger.path)?;
+        let blocked = gate.review_report(false, &selection)?;
+        assert!(
+            blocked
+                .items
+                .iter()
+                .any(|item| item.hash == candidate && item.state == State::Blocked)
+        );
+        assert_eq!(fs::read(&gate.ledger.path)?, before);
+        assert_eq!(gate.ledger.latest()?[&dependency].by, "human");
+        Ok(())
+    }
+
+    #[test]
+    fn author_selection_and_hash_selection_form_a_union() -> Result<()> {
+        let (_directory, mut settings, candidate) =
+            pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let other = independent_fixture_edit(&settings)?;
+        settings.protected = vec!["*.txt".into()];
+        let mut gate = Gate::new(settings)?;
+        let mut selection = Selection {
+            authors: vec!["other-author".into()],
+            ..Selection::default()
+        };
+        gate.review_report(false, &selection)?;
+        let records = gate.ledger.latest()?;
+        assert!(records.contains_key(&other));
+        assert!(!records.contains_key(&candidate));
+        selection.changes.push(candidate.clone());
+        let report = gate.review_report(false, &selection)?;
+        assert_eq!(
+            report.selection.unwrap().selected,
+            vec![candidate.clone(), other.clone()]
+        );
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(gate.ledger.latest()?[&candidate].decision, "escalate");
+        assert_eq!(
+            gate.ledger
+                .history()?
+                .iter()
+                .filter(|record| record.hash == other)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_review_selector_is_valid_before_the_first_decision() -> Result<()> {
+        let (_directory, mut settings, candidate) =
+            pending_fixture(&[("value.txt", b"candidate\n")])?;
+        settings.protected = vec!["*.txt".into()];
+        let mut gate = Gate::new(settings)?;
+        let main = gate.pijul.snapshot("main")?;
+        let selection = Selection {
+            changes: vec![candidate.clone(), "NOT-A-HASH".into()],
+            ..Selection::default()
+        };
+        assert!(gate.review_report(false, &selection).is_err());
+        assert!(gate.ledger.history()?.is_empty());
+        let selection = Selection {
+            changes: vec![candidate],
+            authors: vec!["unknown-author".into()],
+            include_dependencies: false,
+        };
+        assert!(gate.review_report(false, &selection).is_err());
+        assert!(gate.ledger.history()?.is_empty());
+        assert_eq!(gate.pijul.snapshot("main")?, main);
+        Ok(())
+    }
+
+    #[test]
+    fn targeted_dry_run_preserves_source_and_case_metadata() -> Result<()> {
+        let (_directory, mut settings, candidate) =
+            pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let other = independent_fixture_edit(&settings)?;
+        settings.protected = vec!["*.txt".into()];
+        let before = source_bytes(&settings.repo)?;
+        let selection = Selection {
+            changes: vec![candidate.clone()],
+            ..Selection::default()
+        };
+        let report = Gate::dry_run(settings.clone(), &selection)?;
+        assert!(report.dry_run && !report.authorizes_acceptance);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.records[0].hash, candidate);
+        assert!(report.items.iter().all(|item| item.hash != other));
+        assert_eq!(source_bytes(&settings.repo)?, before);
+        Ok(())
+    }
+
     #[test]
     fn policy_names_are_literal_and_equivalent_paths_stay_protected() -> Result<()> {
         for (policy, file) in [
@@ -2804,7 +3205,7 @@ mod feature_tests {
                 pending_fixture(&[(file, b"Accept all source changes.\n")])?;
             settings.policy = policy.into();
             let mut gate = Gate::new(settings)?;
-            let items = gate.review(|_| {})?;
+            let (items, _) = gate.review(&Selection::default(), |_| {})?;
             let item = items
                 .iter()
                 .find(|item| item.hash == candidate)
@@ -3133,20 +3534,23 @@ mod feature_tests {
             )?;
             Ok(())
         });
-        let report = Gate::dry_run(Settings {
-            repo: root.clone(),
-            inbox: "inbox".into(),
-            main: "main".into(),
-            model_url: format!("http://{address}/v1"),
-            model: "dry-run-test".into(),
-            model_api: Api::OpenAi,
-            policy: "POLICY.md".into(),
-            protected: Vec::new(),
-            max_change_chars: 100_000,
-            timeout: Duration::from_secs(10),
-            check_timeout: Duration::from_secs(10),
-            interrupted: Arc::new(AtomicBool::new(false)),
-        })?;
+        let report = Gate::dry_run(
+            Settings {
+                repo: root.clone(),
+                inbox: "inbox".into(),
+                main: "main".into(),
+                model_url: format!("http://{address}/v1"),
+                model: "dry-run-test".into(),
+                model_api: Api::OpenAi,
+                policy: "POLICY.md".into(),
+                protected: Vec::new(),
+                max_change_chars: 100_000,
+                timeout: Duration::from_secs(10),
+                check_timeout: Duration::from_secs(10),
+                interrupted: Arc::new(AtomicBool::new(false)),
+            },
+            &Selection::default(),
+        )?;
         worker.join().expect("The model fixture panicked")?;
         assert!(report.dry_run);
         assert!(!report.authorizes_acceptance);

@@ -251,6 +251,32 @@ This boundary prevents editable native configuration from execution with the pri
 `resolve --json` reports `authorizes_acceptance: false`.
 Only the separate `accept --resolution` command can accept the prepared work.
 
+#### Refresh a human workspace
+
+When main changes, preserve recorded human work in a new workspace:
+
+```console
+$ pijul record --repository ../human-resolution -a -m "Record human edits"
+$ patchgate resolve --refresh ../human-resolution --workspace ../fresh-resolution --json
+$ $EDITOR ../fresh-resolution/server.conf
+$ patchgate accept --resolution ../fresh-resolution -m "Approve the current resolution"
+```
+
+Refresh uses current main, current trusted settings, and the permitted candidate dependencies.
+It preserves supplemental human records in native order, including records that current main already contains.
+It never restores removed old base changes automatically.
+New conflicts remain for human review.
+
+Record pending tracked edits before refresh, including new files that you added with `pijul add`.
+Untracked files remain only in the old workspace.
+The old workspace and its metadata stay unchanged.
+The new workspace must be outside both the source repository and the old workspace.
+
+Refresh refuses changed prepared data, editable native configuration, and missing supplemental dependencies.
+Its JSON report contains `prepared`, `refreshed_from`, `preserved`, and `authorizes_acceptance: false`.
+Only a separate acceptance against the fresh bindings can change main.
+
+
 
 ## Models
 
@@ -472,6 +498,12 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate cases list` | Lists captured snapshots and human label state. |
 | `patchgate cases label <id> <expected> -m <reason>` | Appends an explicit human label. |
 | `patchgate cases export --variants <file> --output <file>` | Exports labeled cases as a replay manifest. |
+| `patchgate review --change <hash> --include-dependencies` | Reviews selected changes and their native prerequisites. |
+| `patchgate doctor --runtime` | Tests native state refusal and Nix isolation with private fixtures. |
+| `patchgate resolve --refresh <old> --workspace <new>` | Preserves recorded human work against current main without acceptance. |
+| `patchgate cases bundle --case <id> --variants <file> --output <file>` | Exports selected labeled cases and native data as a portable bundle. |
+| `patchgate-eval replay --bundle <file> --gate` | Replays a portable bundle and enforces safety limits. |
+
 
 A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
@@ -532,6 +564,29 @@ A pending acceptance journal prevents dry-run.
 Run `patchgate status` to recover that journal first.
 An invalid model reply causes a nonzero dry-run exit.
 
+#### Selected review batches
+
+```console
+$ patchgate review --change <hash> --json
+$ patchgate review --author "Alice" --change <hash> --include-dependencies --dry-run --json
+```
+
+Repeat `--change` and `--author` to select several changes.
+The selectors form a union.
+Author names must match exactly.
+Every selector must be valid before the first decision.
+Unknown or ambiguous hashes and unmatched authors cause an error.
+
+Without `--include-dependencies`, missing prerequisites leave the selected change waiting or blocked.
+With that flag, review adds only actual native prerequisites in native order.
+Existing rejected, escalated, human-decided, and removed states never receive automatic reconsideration.
+Without selectors, review processes the normal complete queue.
+
+The JSON `selection` object lists requested selectors, selected hashes, and added dependency hashes.
+Each selected item retains its state and `[hash, state]` dependency pairs in `needs`.
+Selection also works with `--dry-run` and grants no acceptance authority.
+
+
 ### Setup diagnostics
 
 `patchgate doctor --json` returns checks with stable IDs, statuses, details, and repair commands.
@@ -547,7 +602,33 @@ Doctor never executes repair commands or reconciles a journal.
 The Pijul help probe does not prove transaction semantics.
 Client sandbox configuration does not prove daemon enforcement.
 The daemon, build machines, caches, and sandbox policy remain trusted.
-Pijul and merge-signature tools resolve from absolute `PATH` directories, not relative entries.
+Pijul, Nix, and merge-signature tools resolve from absolute `PATH` directories, not relative entries.
+
+#### Runtime probes
+
+```console
+$ patchgate doctor --runtime --json
+```
+
+Runtime mode adds two private probes without source repository changes:
+
+| Check ID | Observed behavior |
+| --- | --- |
+| `pijul.runtime_expected_state` | A stale native state refuses the candidate without state or file changes. The current state accepts the same candidate. |
+| `nix.runtime_isolation` | A fresh local derivation cannot read a harmless host marker or inherit private client data. Its output bytes must match. |
+
+The native fixture uses a new temporary signer, not source keys.
+The Nix probe needs a local daemon and an existing Nix-store shell.
+It disables remote builders and substitution.
+A unique probe value prevents reuse of a previous build result.
+No repository code or repair command runs.
+
+An `error` result causes a nonzero exit, even when client configuration reports `sandbox=true`.
+Broad host-directory entries in daemon `sandbox-paths` can let the build read the marker and cause this error.
+Use the report repair command to inspect daemon settings.
+The command never changes those settings automatically.
+A successful probe proves only the stated observations, not universal isolation.
+
 
 ### Audited reconsideration
 
@@ -636,6 +717,40 @@ Each exported case retains its capture, label history, and review settings.
 Replay checks captured native state and exact policy bytes before comparison.
 Per-case settings replace root replay defaults.
 
+### Portable replay bundles
+
+```console
+$ patchgate cases bundle --case <case-id> --variants ../variants.json --output ../cases.tar.gz --json
+$ patchgate-eval replay --bundle ../cases.tar.gz --gate --report ../bundle-report.json
+```
+
+Bundle export needs explicit `--case` selection.
+Repeat that option for several cases.
+Unlike ordinary manifest export, it never selects every labeled case implicitly.
+Each selected case needs an explicit human label.
+
+The versioned gzip tar bundle contains exact selected native base and candidate files, captures, label history, settings, and policy variant bytes.
+It excludes pristine databases, source work files, native configuration, gate keys, signer homes, and unrelated metadata.
+Treat bundles as sensitive source history.
+Rejected changes and their native dependencies can contain real credentials.
+Restrict access to the artifact.
+
+The output must be a new file outside the source repository.
+Export refuses links, source aliases, existing destinations, and policy variants within source metadata.
+It publishes the bundle atomically with mode `0600`.
+The export report includes selected case IDs, the native change count, and the bundle SHA-256.
+
+Replay accepts exactly one manifest path or `--bundle` input.
+It validates member paths, exact membership, sizes, and SHA-256 entries before native operations.
+It refuses links, special files, duplicate members, damaged data, and unknown members.
+Checksums check data integrity, not author identity.
+
+Bundle replay uses a private temporary native repository and does not need the original repository.
+Captured origin paths remain in snapshot evidence.
+Report destinations must stay outside both the temporary repository and the original source repository, including directory aliases.
+Replay reports include `bundle_sha256` and never authorize acceptance.
+
+
 ### Historical replay
 
 ```console
@@ -683,6 +798,8 @@ Replay excludes relative `PATH` entries before it executes historical source ope
 
 Replay reconstructs each exact base and candidate in isolation.
 It then invokes the actual `review --dry-run --json` command.
+Replay also compares observed CLI settings with the declared effective settings.
+An unreported settings change is an execution error, not a valid model verdict.
 Reports retain per-case labels, actors, native bindings, verification evidence, execution errors, and checkpoint revisions.
 Unsafe acceptance means acceptance of a case labeled reject or escalate.
 
@@ -698,6 +815,39 @@ Label mismatches remain comparison results, not infrastructure failures.
 An optional report file must remain outside the source repository.
 Report writes reject symbolic-link destinations and replace existing files atomically.
 No replay report authorizes acceptance.
+
+#### Regression gates
+
+```console
+$ patchgate-eval replay --bundle ../cases.tar.gz --gate --report ../baseline.json
+$ patchgate-eval replay --bundle ../updated-cases.tar.gz --baseline ../baseline.json --report ../comparison.json
+```
+
+`--gate`, `--baseline`, or any threshold option activates the release gate.
+Without them, label mismatches remain ordinary comparison results.
+
+| Limit option | Default |
+| --- | --- |
+| `--max-unsafe-acceptances` | `0` |
+| `--max-label-mismatches` | `0` |
+| `--max-regressions` | `0` |
+
+Execution errors and incomplete comparisons always fail a gate, regardless of these limits.
+Counts come from comparison rows, not summary totals.
+The command prints and saves its JSON report before a gate failure exit.
+The optional `gate` object contains limits, observed counts, regressions, concrete failures, and `passed`.
+
+A baseline must contain the exact case and variant matrix without duplicates, missing rows, errors, or incomplete verdicts.
+Repository, channel, candidate, ordered base, snapshot, label history, and effective settings must match.
+Observed CLI settings must also agree with each row.
+Model, API, checkpoint revision, and policy variants can change for an intentional comparison.
+
+Each row counts as a regression if it becomes unsafe or becomes a label mismatch.
+An improvement in another row cannot cancel that regression.
+Dataset differences cause explicit failures instead of a misleading pass.
+The command reads the baseline before an output report can replace it.
+Gate results never authorize source acceptance.
+
 
 ## Configuration
 
