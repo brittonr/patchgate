@@ -127,6 +127,30 @@ impl Pijul {
         pijul
     }
 
+    pub fn version(&self) -> Result<String> {
+        let executable = self
+            .executable
+            .as_ref()
+            .context("Pijul has no selected executable")?;
+        let mut command = Command::new(executable);
+        command
+            .arg("--version")
+            .current_dir(&self.repo)
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null());
+        let output = timed_output(&mut command, Duration::from_secs(5))
+            .context("Cannot read the Pijul version")?;
+        let (mut version, _) = text_output(output, &command)?;
+        version.truncate(version.trim_end_matches(['\r', '\n']).len());
+        if !version.starts_with("pijul ")
+            || version.len() > 256
+            || version.chars().any(char::is_control)
+        {
+            bail!("Pijul returned invalid version data");
+        }
+        Ok(version)
+    }
+
     pub fn call<I, S>(&self, args: I) -> Result<(String, String)>
     where
         I: IntoIterator<Item = S>,

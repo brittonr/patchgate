@@ -123,6 +123,15 @@ struct CheckResult {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+struct IsolationEvidence {
+    schema_version: u32,
+    nonce: String,
+    shell: String,
+    drv_path: String,
+    output: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Verification {
     schema_version: u32,
     candidates: Vec<String>,
@@ -132,6 +141,16 @@ pub struct Verification {
     definitions: StoreTree,
     inputs: BTreeMap<String, StoreTree>,
     results: Vec<CheckResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    isolation: Option<IsolationEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nix_version: Option<String>,
+}
+
+impl Verification {
+    pub fn observed_nix_version(&self) -> Option<&str> {
+        self.nix_version.as_deref()
+    }
 }
 
 pub struct Plan {
@@ -182,8 +201,20 @@ impl Plan {
         timeout: Duration,
         interrupted: &AtomicBool,
     ) -> Result<Verification> {
-        let runner = Runner::new(timeout, interrupted)?;
-        runner.require_sandbox()?;
+        let mut runner = Runner::new(timeout, interrupted)?;
+        self.run_with_runner(source, candidates, merge, main, &mut runner)
+    }
+
+    fn run_with_runner(
+        &self,
+        source: &Path,
+        candidates: &[String],
+        merge: Option<&str>,
+        main: MainBinding,
+        runner: &mut Runner<'_>,
+    ) -> Result<Verification> {
+        let isolation = runner.probe_runtime_isolation()?;
+        let nix_version = runner.version()?;
         let definitions = runner.add_tree(&self.directory.path().join("main").join(DIRECTORY))?;
         let source = runner.add_tree(source)?;
         let mut inputs = BTreeMap::new();
@@ -265,6 +296,7 @@ impl Plan {
                 outputs,
             });
         }
+        runner.ensure_active()?;
         Ok(Verification {
             schema_version: 1,
             candidates: candidates.to_vec(),
@@ -274,14 +306,20 @@ impl Plan {
             definitions,
             inputs,
             results,
+            isolation: Some(isolation),
+            nix_version: Some(nix_version),
         })
     }
 }
 
 /// Test the configured runtime with fixed private data, not repository inputs.
 pub fn probe_runtime_isolation(timeout: Duration, interrupted: &AtomicBool) -> Result<()> {
-    let mut runner = Runner::new(timeout, interrupted)?;
-    runner.runtime_probe = true;
+    Runner::new(timeout, interrupted)?
+        .probe_runtime_isolation()
+        .map(|_| ())
+}
+
+fn runtime_isolation_probe(runner: &Runner<'_>) -> Result<IsolationEvidence> {
     runner.require_sandbox()?;
     let builder = runner.probe_shell()?;
     let builder_tree = runner.tree(
@@ -346,7 +384,17 @@ pub fn probe_runtime_isolation(timeout: Duration, interrupted: &AtomicBool) -> R
         fs::read(output)? == expected.as_bytes(),
         "The isolation probe output bytes differ"
     );
-    Ok(())
+    runner.ensure_active()?;
+    Ok(IsolationEvidence {
+        schema_version: 1,
+        nonce,
+        shell: builder
+            .to_str()
+            .context("The probe shell path is not UTF-8")?
+            .to_owned(),
+        drv_path,
+        output: output.to_owned(),
+    })
 }
 
 fn probe_output<'a>(built: &'a Value, drv_path: &str) -> Result<&'a str> {
@@ -532,6 +580,12 @@ impl<'a> Runner<'a> {
                 "--option",
                 "access-tokens",
                 "",
+                "--option",
+                "sandbox",
+                "true",
+                "--option",
+                "sandbox-fallback",
+                "false",
             ]);
         if let Some(user) = env::var_os("USER") {
             command.env("USER", user);
@@ -550,12 +604,6 @@ impl<'a> Runner<'a> {
                 "--option",
                 "max-jobs",
                 "1",
-                "--option",
-                "sandbox",
-                "true",
-                "--option",
-                "sandbox-fallback",
-                "false",
             ]);
         }
         command
@@ -606,7 +654,22 @@ impl<'a> Runner<'a> {
         bail!("The runtime probe needs an existing Nix-store shell")
     }
 
-    fn execute(&self, command: &mut Command) -> Result<String> {
+    fn probe_runtime_isolation(&mut self) -> Result<IsolationEvidence> {
+        self.runtime_probe = true;
+        let result = runtime_isolation_probe(self);
+        self.runtime_probe = false;
+        result
+    }
+
+    fn version(&self) -> Result<String> {
+        let mut command = self.command(&self.nix);
+        command.arg("--version");
+        let version = self.execute(&mut command)?.trim().to_owned();
+        ensure!(!version.is_empty(), "Nix returned no executable version");
+        Ok(version)
+    }
+
+    fn ensure_active(&self) -> Result<()> {
         ensure!(
             Instant::now() < self.deadline,
             "Trusted Nix verification timed out"
@@ -615,6 +678,11 @@ impl<'a> Runner<'a> {
             !self.interrupted.load(Ordering::Relaxed),
             "Trusted Nix verification interrupted"
         );
+        Ok(())
+    }
+
+    fn execute(&self, command: &mut Command) -> Result<String> {
+        self.ensure_active()?;
         let mut stdout = tempfile::tempfile_in(self.home.path())?;
         command.stdout(Stdio::from(stdout.try_clone()?));
         let mut child = command
@@ -646,10 +714,7 @@ impl<'a> Runner<'a> {
                 }
             }
         };
-        ensure!(
-            !self.interrupted.load(Ordering::Relaxed),
-            "Trusted Nix verification interrupted"
-        );
+        self.ensure_active()?;
         ensure!(
             status.success(),
             "Trusted Nix verification failed with {status}. See the Nix output."
@@ -752,6 +817,100 @@ impl<'a> Runner<'a> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn fixture_runner<'a>(script: &str, interrupted: &'a AtomicBool) -> Result<Runner<'a>> {
+        let home = tempfile::tempdir()?;
+        let nix = home.path().join("nix");
+        fs::write(&nix, format!("#!/bin/sh\n{script}\n"))?;
+        fs::set_permissions(&nix, fs::Permissions::from_mode(0o700))?;
+        fs::create_dir(home.path().join("tmp"))?;
+        Ok(Runner {
+            nix,
+            home,
+            deadline: Instant::now() + Duration::from_secs(10),
+            interrupted,
+            runtime_probe: false,
+        })
+    }
+
+    fn legacy_verification() -> Value {
+        json!({
+            "schema_version": 1,
+            "candidates": ["candidate"],
+            "merge": null,
+            "main": {"channel": "main", "state": null},
+            "source": {"path": "/nix/store/source", "nar_hash": "source-hash"},
+            "definitions": {"path": "/nix/store/checks", "nar_hash": "checks-hash"},
+            "inputs": {},
+            "results": []
+        })
+    }
+
+    #[test]
+    fn failed_fresh_probes_prevent_candidate_execution() -> Result<()> {
+        let interrupted = AtomicBool::new(false);
+        let mut runner = fixture_runner(
+            "for argument in \"$@\"; do\n\
+             if [ \"$argument\" = config ]; then\n\
+             printf 'probe\\n' >> \"$HOME/probe-attempts\"\n\
+             printf '%s\\n' '{\"sandbox\":{\"value\":false}}'\n\
+             exit 0\n\
+             fi\n\
+             done\n\
+             printf 'candidate\\n' > \"$HOME/candidate-executed\"\n\
+             exit 1",
+            &interrupted,
+        )?;
+        let directory = tempfile::tempdir()?;
+        let plan = Plan {
+            manifest: Manifest::parse(r#"{"schema_version":1,"checks":["build.nix"]}"#)?,
+            directory,
+        };
+        for _ in 0..2 {
+            assert!(
+                plan.run_with_runner(
+                    Path::new("/candidate-must-not-execute"),
+                    &["candidate".into()],
+                    None,
+                    MainBinding {
+                        channel: "main".into(),
+                        state: None,
+                    },
+                    &mut runner,
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(runner.home.path().join("probe-attempts"))?
+                .lines()
+                .count(),
+            2
+        );
+        assert!(!runner.home.path().join("candidate-executed").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn expired_operation_refuses_the_probe_and_later_steps() -> Result<()> {
+        let interrupted = AtomicBool::new(false);
+        let mut runner = fixture_runner("printf 'executed\\n' > \"$HOME/executed\"", &interrupted)?;
+        runner.deadline = Instant::now();
+        assert!(runner.probe_runtime_isolation().is_err());
+        assert!(runner.version().is_err());
+        assert!(!runner.home.path().join("executed").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_audit_data_does_not_invent_runtime_evidence() -> Result<()> {
+        let legacy = legacy_verification();
+        let verification: Verification = serde_json::from_value(legacy.clone())?;
+        assert!(verification.isolation.is_none());
+        assert_eq!(verification.observed_nix_version(), None);
+        assert_eq!(serde_json::to_value(verification)?, legacy);
+        Ok(())
+    }
 
     #[test]
     fn isolation_probe_requires_the_exact_derivation_and_one_store_output() -> Result<()> {

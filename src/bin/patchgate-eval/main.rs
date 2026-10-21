@@ -1,6 +1,10 @@
 mod apply_race;
+#[path = "../../artifact.rs"]
+pub mod artifact;
 #[path = "../../bundle.rs"]
 pub mod bundle;
+#[path = "../../change.rs"]
+pub mod change;
 mod concurrency;
 mod contracts;
 mod controls;
@@ -8,9 +12,13 @@ mod executable;
 mod generalization;
 mod graphs;
 mod hostile;
+#[path = "../../pijul.rs"]
+pub mod pijul;
 mod real_model;
 mod recovery;
 mod replay;
+#[path = "../../secrets.rs"]
+pub mod secrets;
 mod stale;
 mod storage;
 mod structured;

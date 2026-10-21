@@ -71,6 +71,381 @@ struct Stored {
     prepared: Prepared,
 }
 
+#[derive(Serialize)]
+pub struct Blocker {
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Serialize)]
+pub struct PendingCheck {
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Serialize)]
+pub struct Readiness {
+    pub schema_version: u8,
+    pub authorizes_acceptance: bool,
+    pub workspace: PathBuf,
+    pub prepared_id: Option<String>,
+    pub main: Option<String>,
+    pub inbox: Option<String>,
+    pub candidates: Option<Vec<String>>,
+    pub recorded_conflicts: Option<Vec<Conflict>>,
+    pub pending_tracked_edits: Option<bool>,
+    pub stale_main: Option<bool>,
+    pub stale_configuration: Option<bool>,
+    pub stale_policy: Option<bool>,
+    pub blockers: Vec<Blocker>,
+    pub pending_verification: Vec<PendingCheck>,
+}
+
+impl Readiness {
+    pub fn add_blocker(&mut self, code: &str, detail: &str) {
+        if !self.blockers.iter().any(|blocker| blocker.code == code) {
+            self.blockers.push(Blocker {
+                code: code.to_owned(),
+                detail: detail.to_owned(),
+            });
+        }
+    }
+
+    fn add_pending(&mut self, code: &str, detail: &str) {
+        self.pending_verification.push(PendingCheck {
+            code: code.to_owned(),
+            detail: detail.to_owned(),
+        });
+    }
+}
+
+/// Inspect static readiness without acceptance authority or source execution.
+pub fn inspect(
+    source: &Path,
+    workspace: &Path,
+    baseline: &configuration::Values,
+) -> Result<Readiness> {
+    let mut report = Readiness {
+        schema_version: 1,
+        authorizes_acceptance: false,
+        workspace: workspace.to_path_buf(),
+        prepared_id: None,
+        main: None,
+        inbox: None,
+        candidates: None,
+        recorded_conflicts: None,
+        pending_tracked_edits: None,
+        stale_main: None,
+        stale_configuration: None,
+        stale_policy: None,
+        blockers: Vec::new(),
+        pending_verification: Vec::new(),
+    };
+    report.add_pending(
+        "credential_checks",
+        "Explicit acceptance must check supported credential data.",
+    );
+    report.add_pending(
+        "runtime_isolation",
+        "Explicit acceptance must verify runtime isolation before candidate execution.",
+    );
+    report.add_pending(
+        "nix_checks",
+        "Explicit acceptance must execute the required Nix checks.",
+    );
+    report.add_pending(
+        "conditional_acceptance",
+        "Explicit acceptance must verify current authority and native expected state.",
+    );
+    report.add_pending(
+        "conflict_verification",
+        "Explicit acceptance must verify conflicts after any pending tracked edits receive a native record.",
+    );
+    let prepared = match load(source, workspace) {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            report.add_blocker(
+                "invalid_authority",
+                "Source authority or workspace identity is absent, unsafe, or invalid.",
+            );
+            return Ok(report);
+        }
+    };
+    report.workspace = prepared.workspace.clone();
+    report.prepared_id = Some(prepared.id.clone());
+    report.main = Some(prepared.main.clone());
+    report.inbox = Some(prepared.inbox.clone());
+    report.candidates = Some(prepared.candidates.clone());
+    if [&prepared.main, &prepared.inbox].iter().any(|name| {
+        name.is_empty()
+            || name.starts_with('-')
+            || name.trim() != name.as_str()
+            || name.chars().any(char::is_control)
+    }) {
+        report.add_blocker(
+            "unsupported_channels",
+            "The trusted channel names are not supported.",
+        );
+        return Ok(report);
+    }
+    if let Some(source_copy) = inspection_copy(&prepared.source, false, &mut report) {
+        inspect_source(&source_copy.pijul, &prepared, baseline, &mut report);
+    }
+    if let Some(workspace_copy) = inspection_copy(&prepared.workspace, true, &mut report) {
+        inspect_workspace(&workspace_copy.pijul, &prepared, &mut report);
+    }
+    Ok(report)
+}
+
+fn inspection_copy(
+    root: &Path,
+    workspace: bool,
+    report: &mut Readiness,
+) -> Option<crate::isolation::Isolated> {
+    if workspace && refuse_native_configuration(root).is_err() {
+        report.add_blocker(
+            "workspace_native_configuration",
+            "Editable native configuration prevents safe inspection.",
+        );
+        return None;
+    }
+    if crate::pijul::safe_path(root, Path::new(".pijul"))
+        .and_then(|metadata| {
+            ensure!(metadata.is_dir(), "Native metadata is not a directory");
+            validate_native_metadata(&metadata)
+        })
+        .is_err()
+    {
+        report.add_blocker(
+            if workspace {
+                "workspace_metadata"
+            } else {
+                "source_metadata"
+            },
+            "Native metadata is absent or unsafe.",
+        );
+        return None;
+    }
+    let copy = crate::isolation::copy_repository(root).and_then(|mut isolated| {
+        detach_files(&isolated.pijul.repo.join(".pijul"))?;
+        refuse_native_configuration(&isolated.pijul.repo)?;
+        isolated.pijul = Pijul::with_timeout(
+            isolated.pijul.repo.clone(),
+            std::time::Duration::from_secs(30),
+        );
+        Ok(isolated)
+    });
+    match copy {
+        Ok(copy) => Some(copy),
+        Err(_) => {
+            report.add_blocker(
+                if workspace {
+                    "workspace_snapshot"
+                } else {
+                    "source_snapshot"
+                },
+                "A safe private native snapshot is not available.",
+            );
+            None
+        }
+    }
+}
+
+fn inspect_source(
+    source: &Pijul,
+    prepared: &Prepared,
+    baseline: &configuration::Values,
+    report: &mut Readiness,
+) {
+    let channels = match source.channels() {
+        Ok((_, channels)) => channels,
+        Err(_) => {
+            report.add_blocker(
+                "source_native_read",
+                "Source native state is not available.",
+            );
+            return;
+        }
+    };
+    if !channels.contains(&prepared.main) || !channels.contains(&prepared.inbox) {
+        report.add_blocker(
+            "source_channels",
+            "A trusted main or inbox channel is absent.",
+        );
+        return;
+    }
+    match source.snapshot(&prepared.main) {
+        Ok(snapshot) => {
+            let stale = snapshot.state != prepared.binding.main.state
+                || snapshot.hashes != prepared.base.iter().cloned().collect();
+            report.stale_main = Some(stale);
+            if stale {
+                report.add_blocker(
+                    "stale_main",
+                    "Trusted main differs from the prepared binding.",
+                );
+            }
+        }
+        Err(_) => report.add_blocker("main_native_read", "Trusted main state is not available."),
+    }
+    match source.log(&prepared.inbox) {
+        Ok(entries) => {
+            let candidates: Vec<_> = entries
+                .into_iter()
+                .filter(|entry| prepared.candidates.contains(&entry.hash))
+                .map(|entry| entry.hash)
+                .collect();
+            if candidates != prepared.candidates {
+                report.add_blocker(
+                    "source_candidates",
+                    "Prepared candidates are absent or differ from native inbox order.",
+                );
+            }
+        }
+        Err(_) => report.add_blocker("inbox_native_read", "Trusted inbox state is not available."),
+    }
+    for hash in prepared.base.iter().chain(&prepared.candidates) {
+        if regular_file(&source.change_file(hash)).is_err() || source.change(hash).is_err() {
+            report.add_blocker(
+                "source_native_changes",
+                "A prepared source change is absent or incomplete.",
+            );
+            break;
+        }
+    }
+    let configuration = match configuration::load(source, &prepared.main, baseline) {
+        Ok(configuration) => configuration,
+        Err(_) => {
+            report.add_blocker(
+                "configuration_unavailable",
+                "Trusted main configuration is absent, unsafe, or invalid.",
+            );
+            return;
+        }
+    };
+    let stale = configuration != prepared.configuration;
+    report.stale_configuration = Some(stale);
+    if stale {
+        report.add_blocker(
+            "stale_configuration",
+            "Trusted configuration differs from the prepared binding.",
+        );
+    }
+    match source.read_file(&prepared.main, &configuration.values.policy_path) {
+        Ok(policy) => {
+            let stale = match (&prepared.binding.policy, &policy) {
+                (None, None) => false,
+                (Some(binding), Some(text)) => {
+                    binding.path != configuration.values.policy_path
+                        || binding.sha256 != digest(text.as_bytes())
+                }
+                _ => true,
+            };
+            report.stale_policy = Some(stale);
+            if stale {
+                report.add_blocker(
+                    "stale_policy",
+                    "Trusted policy differs from the prepared binding.",
+                );
+            }
+        }
+        Err(_) => report.add_blocker(
+            "policy_unavailable",
+            "Trusted main policy is not available.",
+        ),
+    }
+}
+
+fn inspect_workspace(private: &Pijul, prepared: &Prepared, report: &mut Readiness) {
+    match private.channels() {
+        Ok((current, channels))
+            if current.as_deref() == Some(prepared.main.as_str())
+                && channels.contains(&prepared.main) => {}
+        Ok(_) => {
+            report.add_blocker(
+                "workspace_channels",
+                "The workspace current channel differs from trusted main.",
+            );
+            return;
+        }
+        Err(_) => {
+            report.add_blocker(
+                "workspace_native_read",
+                "Workspace native state is not available.",
+            );
+            return;
+        }
+    }
+    if native_order(private, prepared).is_err() {
+        report.add_blocker(
+            "workspace_native_changes",
+            "Prepared workspace changes are absent, incomplete, or in a different order.",
+        );
+    }
+    if validate_prepared_files(private, prepared).is_err() {
+        report.add_blocker(
+            "prepared_data_changed",
+            "Prepared review or policy data is absent, unsafe, or changed.",
+        );
+    }
+    match private.conflicts() {
+        Ok(conflicts) => {
+            report.recorded_conflicts =
+                Some(conflicts.into_iter().map(readiness_conflict).collect());
+        }
+        Err(_) => report.add_blocker(
+            "workspace_conflicts",
+            "Recorded workspace conflicts are not available.",
+        ),
+    }
+    let workspace = Pijul::new(prepared.workspace.clone());
+    match tracked_workspace_clean_private(&workspace, private, &prepared.main) {
+        Ok(clean) => report.pending_tracked_edits = Some(!clean),
+        Err(_) => report.add_blocker(
+            "tracked_edits_unavailable",
+            "Pending tracked edits cannot be determined safely.",
+        ),
+    }
+    if report.pending_tracked_edits == Some(true) {
+        report.add_pending(
+            "record_tracked_edits",
+            "Explicit acceptance can record pending tracked edits. Inspection does not record them.",
+        );
+    }
+    if report.pending_tracked_edits == Some(false)
+        && report
+            .recorded_conflicts
+            .as_ref()
+            .is_some_and(|conflicts| !conflicts.is_empty())
+    {
+        report.add_blocker(
+            "recorded_conflicts",
+            "Recorded conflicts remain without pending tracked edits.",
+        );
+    }
+}
+
+fn readiness_conflict(conflict: crate::change::Conflict) -> Conflict {
+    let kind = match conflict.kind.as_str() {
+        "Order conflict" | "Deletion conflict" | "Name conflict" | "Zombie conflict"
+        | "Cyclic conflict" => conflict.kind,
+        _ => "Other conflict".to_owned(),
+    };
+    let path = if crate::secrets::scan_text("[conflict.path]", conflict.path.as_bytes()).is_empty()
+        && !conflict.path.chars().any(char::is_control)
+        && crate::pijul::normalize_path(Path::new(&conflict.path)).is_ok()
+    {
+        conflict.path
+    } else {
+        "[redacted-path]".to_owned()
+    };
+    Conflict {
+        kind,
+        path,
+        line: conflict.line,
+    }
+}
+
 /// Prepare native records without source execution or model access.
 pub fn prepare(
     source: &Path,
@@ -391,13 +766,17 @@ pub fn refresh(
 
 fn tracked_workspace_clean(old: &Pijul, channel: &str) -> Result<bool> {
     let isolated = crate::isolation::copy_repository(&old.repo)?;
-    let directory = isolated
-        .pijul
+    tracked_workspace_clean_private(old, &isolated.pijul, channel)
+}
+
+fn tracked_workspace_clean_private(old: &Pijul, private: &Pijul, channel: &str) -> Result<bool> {
+    refuse_native_configuration(&private.repo)?;
+    let directory = private
         .repo
         .parent()
         .context("The private repository has no parent")?;
     let archive_path = directory.join("tracked.tar.gz");
-    isolated.pijul.run([
+    private.run([
         OsStr::new("archive"),
         OsStr::new("--channel"),
         OsStr::new(channel),
@@ -441,14 +820,28 @@ fn tracked_workspace_clean(old: &Pijul, channel: &str) -> Result<bool> {
     }
     // A fresh clone excludes staged additions and removals from the path list.
     let recorded = directory.join("recorded");
-    isolated.pijul.run([
+    private.run([
         OsStr::new("clone"),
         OsStr::new("--channel"),
         OsStr::new(channel),
-        isolated.pijul.repo.as_os_str(),
+        private.repo.as_os_str(),
         recorded.as_os_str(),
     ])?;
-    Ok(isolated.pijul.run(["list"])? == Pijul::new(recorded).run(["list"])?)
+    // Only the private clone can contain native clone configuration.
+    for name in ["config", "config.toml"] {
+        let path = recorded.join(".pijul").join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                regular_file(&path)?;
+                fs::remove_file(path)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    refuse_native_configuration(&recorded)?;
+    let recorded = Pijul::with_timeout(recorded, std::time::Duration::from_secs(30));
+    Ok(private.run(["list"])? == recorded.run(["list"])?)
 }
 
 fn same_file_bytes(expected: &mut impl Read, actual: &mut File) -> Result<bool> {
@@ -1500,5 +1893,291 @@ mod tests {
         fs::hard_link(original.workspace.join(POINTER), root.join("pointer-alias"))?;
         assert!(load(&source, &original.workspace).is_err());
         Ok(())
+    }
+
+    fn readiness(prepared: &Prepared) -> Result<Readiness> {
+        inspect(
+            &prepared.source,
+            &prepared.workspace,
+            &configuration::Values::default(),
+        )
+    }
+
+    fn has_blocker(report: &Readiness, code: &str) -> bool {
+        report.blockers.iter().any(|blocker| blocker.code == code)
+    }
+
+    fn tree_bytes(root: &Path) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                files.extend(tree_bytes(&entry.path())?);
+            } else {
+                files.insert(entry.path(), fs::read(entry.path())?);
+            }
+        }
+        Ok(files)
+    }
+
+    #[test]
+    fn readiness_refuses_editable_authority_without_trusted_fields() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let source = root.join("source");
+        fs::create_dir(&source)?;
+        let mut prepared = prepared(&source, &root.join("workspace"))?;
+        store(&mut prepared)?;
+        fs::write(
+            prepared.workspace.join(POINTER),
+            br#"{"schema_version":1,"id":"untrusted","main":"editable-channel"}"#,
+        )?;
+        let source_before = tree_bytes(&source)?;
+        let workspace_before = tree_bytes(&prepared.workspace)?;
+        let report = readiness(&prepared)?;
+        assert!(has_blocker(&report, "invalid_authority"));
+        assert!(!report.authorizes_acceptance);
+        assert!(report.prepared_id.is_none());
+        assert!(report.main.is_none());
+        assert!(report.inbox.is_none());
+        assert!(report.candidates.is_none());
+        assert!(report.pending_tracked_edits.is_none());
+        assert_eq!(tree_bytes(&source)?, source_before);
+        assert_eq!(tree_bytes(&prepared.workspace)?, workspace_before);
+        assert!(!serde_json::to_string(&report)?.contains("editable-channel"));
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_refuses_unsupported_trusted_channel_names() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let source = root.join("source");
+        fs::create_dir(&source)?;
+        let mut prepared = prepared(&source, &root.join("workspace"))?;
+        prepared.main = "--unsupported".into();
+        prepared.binding.main.channel = prepared.main.clone();
+        store(&mut prepared)?;
+        let report = readiness(&prepared)?;
+        assert!(has_blocker(&report, "unsupported_channels"));
+        assert!(report.pending_tracked_edits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_preserves_all_bytes_and_retains_pending_checks() -> Result<()> {
+        let (_directory, prepared, _signer) = native_fixture(false)?;
+        File::open(prepared.workspace.join("value.txt"))?.set_times(
+            fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1),
+            ),
+        )?;
+        fs::write(
+            prepared.workspace.join("untracked.txt"),
+            "Untracked data.\n",
+        )?;
+        let source_before = tree_bytes(&prepared.source)?;
+        let workspace_before = tree_bytes(&prepared.workspace)?;
+        let report = readiness(&prepared)?;
+        assert!(report.blockers.is_empty());
+        assert!(!report.authorizes_acceptance);
+        assert_eq!(report.prepared_id.as_deref(), Some(prepared.id.as_str()));
+        assert_eq!(report.main.as_deref(), Some("main"));
+        assert_eq!(report.inbox.as_deref(), Some("inbox"));
+        assert_eq!(report.candidates.as_ref(), Some(&prepared.candidates));
+        assert_eq!(report.pending_tracked_edits, Some(false));
+        assert_eq!(report.stale_main, Some(false));
+        assert_eq!(report.stale_configuration, Some(false));
+        assert_eq!(report.stale_policy, Some(false));
+        assert!(report.recorded_conflicts.as_ref().unwrap().is_empty());
+        for code in [
+            "credential_checks",
+            "runtime_isolation",
+            "nix_checks",
+            "conditional_acceptance",
+            "conflict_verification",
+        ] {
+            assert!(
+                report
+                    .pending_verification
+                    .iter()
+                    .any(|check| check.code == code)
+            );
+        }
+        assert_eq!(tree_bytes(&prepared.source)?, source_before);
+        assert_eq!(tree_bytes(&prepared.workspace)?, workspace_before);
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_reports_pending_edits_without_preventing_explicit_record() -> Result<()> {
+        let (_directory, prepared, signer) = native_fixture(false)?;
+        fs::write(
+            prepared.workspace.join("value.txt"),
+            "A pending human edit.\n",
+        )?;
+        let before = tree_bytes(&prepared.workspace)?;
+        let report = readiness(&prepared)?;
+        assert_eq!(report.pending_tracked_edits, Some(true));
+        assert!(report.blockers.is_empty());
+        assert!(
+            report
+                .pending_verification
+                .iter()
+                .any(|check| check.code == "record_tracked_edits")
+        );
+        assert_eq!(tree_bytes(&prepared.workspace)?, before);
+        let completed = record(&prepared, &signer, "Accept the pending human edit")?;
+        assert_eq!(completed.imported.len(), 1);
+        assert_eq!(
+            completed.pijul.read_file(&prepared.main, "value.txt")?,
+            Some("A pending human edit.\n".into()),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_reports_staged_additions_and_tracked_removals() -> Result<()> {
+        let (_directory, prepared, _signer) = native_fixture(false)?;
+        let workspace = Pijul::new(prepared.workspace.clone());
+        fs::write(workspace.repo.join("added.txt"), "A staged file.\n")?;
+        workspace.run(["add", "added.txt"])?;
+        let before = tree_bytes(&workspace.repo)?;
+        let report = readiness(&prepared)?;
+        assert_eq!(report.pending_tracked_edits, Some(true));
+        assert!(report.blockers.is_empty());
+        assert_eq!(tree_bytes(&workspace.repo)?, before);
+        fs::remove_file(workspace.repo.join("value.txt"))?;
+        let report = readiness(&prepared)?;
+        assert_eq!(report.pending_tracked_edits, Some(true));
+        assert!(report.blockers.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_reports_recorded_conflicts_until_explicit_record() -> Result<()> {
+        let (_directory, prepared, signer) = native_fixture(true)?;
+        let report = readiness(&prepared)?;
+        assert!(has_blocker(&report, "recorded_conflicts"));
+        fs::write(
+            prepared.workspace.join("value.txt"),
+            "A human resolution.\n",
+        )?;
+        let before = tree_bytes(&prepared.workspace)?;
+        let report = readiness(&prepared)?;
+        assert_eq!(report.pending_tracked_edits, Some(true));
+        assert!(!report.recorded_conflicts.as_ref().unwrap().is_empty());
+        assert!(!has_blocker(&report, "recorded_conflicts"));
+        assert!(
+            report
+                .pending_verification
+                .iter()
+                .any(|check| check.code == "conflict_verification")
+        );
+        assert_eq!(tree_bytes(&prepared.workspace)?, before);
+        record(&prepared, &signer, "Accept the human resolution")?;
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_reports_main_configuration_and_policy_drift() -> Result<()> {
+        let (_directory, prepared, signer) = native_fixture(false)?;
+        let (source, _) = advance_main(&prepared, &signer)?;
+        fs::write(
+            source.repo.join(configuration::PATH),
+            br#"{"schema_version":1,"settings":{"max_change_chars":5000}}"#,
+        )?;
+        source.run(["add", configuration::PATH])?;
+        native_record(&source, &signer, "Change trusted configuration")?;
+        fs::write(source.repo.join("value.txt"), "Dirty source data.\n")?;
+        let before = tree_bytes(&source.repo)?;
+        let report = readiness(&prepared)?;
+        assert_eq!(report.stale_main, Some(true));
+        assert_eq!(report.stale_configuration, Some(true));
+        assert_eq!(report.stale_policy, Some(true));
+        for code in ["stale_main", "stale_configuration", "stale_policy"] {
+            assert!(has_blocker(&report, code));
+        }
+        assert_eq!(tree_bytes(&source.repo)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_refuses_all_editable_native_configuration_routes() -> Result<()> {
+        let (_directory, prepared, _signer) = native_fixture(false)?;
+        let marker = prepared.workspace.join("hook-marker");
+        let hook = prepared.workspace.join("hook");
+        fs::write(&hook, b"#!/bin/sh\nprintf '%s\\n' unsafe > hook-marker\n")?;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700))?;
+        for relative in [".pijul/config", ".pijul/config.toml", "pijul.toml"] {
+            let path = prepared.workspace.join(relative);
+            fs::write(&path, b"[hooks]\npreHooks = [\"./hook\"]\n")?;
+            let before = tree_bytes(&prepared.workspace)?;
+            let report = readiness(&prepared)?;
+            assert!(has_blocker(&report, "workspace_native_configuration"));
+            assert!(report.pending_tracked_edits.is_none());
+            assert!(report.recorded_conflicts.is_none());
+            assert!(!marker.exists());
+            assert_eq!(tree_bytes(&prepared.workspace)?, before);
+            fs::remove_file(path)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_reports_changed_prepared_data_and_missing_native_changes() -> Result<()> {
+        let (_directory, prepared, _signer) = native_fixture(false)?;
+        fs::write(&prepared.review_file, "Changed review data.\n")?;
+        let report = readiness(&prepared)?;
+        assert!(has_blocker(&report, "prepared_data_changed"));
+        let workspace = Pijul::new(prepared.workspace.clone());
+        fs::remove_file(workspace.change_file(&prepared.candidates[0]))?;
+        let before = tree_bytes(&prepared.workspace)?;
+        let report = readiness(&prepared)?;
+        assert!(has_blocker(&report, "workspace_native_changes"));
+        assert_eq!(tree_bytes(&prepared.workspace)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_reports_unsafe_native_metadata_and_wrong_channel() -> Result<()> {
+        let (_directory, prepared, _signer) = native_fixture(false)?;
+        let workspace = Pijul::new(prepared.workspace.clone());
+        let alias = prepared.workspace.join(".pijul/unsafe-alias");
+        symlink(prepared.source.join("value.txt"), &alias)?;
+        let report = readiness(&prepared)?;
+        assert!(has_blocker(&report, "workspace_metadata"));
+        assert!(report.pending_tracked_edits.is_none());
+        fs::remove_file(alias)?;
+        workspace.run(["fork", "--channel", "main", "other"])?;
+        workspace.run(["channel", "switch", "other"])?;
+        let before = tree_bytes(&prepared.workspace)?;
+        let report = readiness(&prepared)?;
+        assert!(has_blocker(&report, "workspace_channels"));
+        assert!(report.pending_tracked_edits.is_none());
+        assert_eq!(tree_bytes(&prepared.workspace)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_conflicts_hide_unknown_diagnostics_and_unsafe_paths() {
+        let secret = format!("ghp_{}", "A".repeat(36));
+        let conflict = readiness_conflict(crate::change::Conflict {
+            kind: format!("Native diagnostic with {secret}"),
+            path: format!("path/{secret}"),
+            line: 7,
+        });
+        assert_eq!(conflict.kind, "Other conflict");
+        assert_eq!(conflict.path, "[redacted-path]");
+        assert_eq!(conflict.line, 7);
+        for path in ["/private/native-path", "../outside", "control\npath"] {
+            let conflict = readiness_conflict(crate::change::Conflict {
+                kind: "Order conflict".into(),
+                path: path.into(),
+                line: 1,
+            });
+            assert_eq!(conflict.kind, "Order conflict");
+            assert_eq!(conflict.path, "[redacted-path]");
+        }
     }
 }

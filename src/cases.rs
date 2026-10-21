@@ -46,12 +46,24 @@ pub struct LabelRecord {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct TagRecord {
+    pub user: String,
+    pub time: String,
+    pub reason: String,
+    pub policy_rules: Vec<String>,
+    pub conflict_kinds: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaseRecord {
     pub schema_version: u32,
     pub id: String,
     pub snapshot: Snapshot,
     pub captured_at: String,
     pub labels: Vec<LabelRecord>,
+    #[serde(default)]
+    pub tags: Vec<TagRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +110,44 @@ fn identity(snapshot: &Snapshot) -> Result<String> {
 
 fn safe_text(value: &str) -> bool {
     !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+fn validate_tag_set(tags: &[String]) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    for tag in tags {
+        ensure!(
+            !tag.is_empty()
+                && tag.len() <= 64
+                && tag.as_bytes()[0].is_ascii_lowercase()
+                && tag.bytes().all(|byte| byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_'))
+                && unique.insert(tag),
+            "Tags must use unique lowercase identifiers with at most 64 characters."
+        );
+    }
+    Ok(())
+}
+
+fn validate_tags(record: &TagRecord) -> Result<()> {
+    ensure!(
+        safe_text(&record.user) && safe_text(&record.reason),
+        "Human tags need a valid user and an explicit reason without control characters."
+    );
+    chrono::DateTime::parse_from_rfc3339(&record.time).context("The tag time is not valid.")?;
+    validate_tag_set(&record.policy_rules)?;
+    validate_tag_set(&record.conflict_kinds)?;
+    for value in [&record.user, &record.reason]
+        .into_iter()
+        .chain(&record.policy_rules)
+        .chain(&record.conflict_kinds)
+    {
+        ensure!(
+            crate::secrets::scan_text("[case.tags]", value.as_bytes()).is_empty(),
+            "The human tags contain credential data."
+        );
+    }
+    Ok(())
 }
 
 fn validate_values(values: &Values) -> Result<()> {
@@ -260,6 +310,9 @@ impl Store {
             chrono::DateTime::parse_from_rfc3339(&label.time)
                 .context("The label time is not valid.")?;
         }
+        for tags in &record.tags {
+            validate_tags(tags)?;
+        }
         Ok(Some(record))
     }
 
@@ -340,6 +393,7 @@ impl Store {
             snapshot,
             captured_at: now(),
             labels: Vec::new(),
+            tags: Vec::new(),
         };
         self.save(&repo, &record)?;
         Ok(record)
@@ -367,6 +421,30 @@ impl Store {
             expected,
             reason: reason.into(),
         });
+        self.save(&repo, &record)?;
+        Ok(record)
+    }
+
+    pub fn tag(
+        &self,
+        prefix: &str,
+        policy_rules: &[String],
+        conflict_kinds: &[String],
+        reason: &str,
+    ) -> Result<CaseRecord> {
+        let tags = TagRecord {
+            user: std::env::var("USER").unwrap_or_else(|_| "a human".into()),
+            time: now(),
+            reason: reason.into(),
+            policy_rules: policy_rules.into(),
+            conflict_kinds: conflict_kinds.into(),
+        };
+        validate_tags(&tags)?;
+        let repo = self.repository()?;
+        let _lock = self.lock(&repo)?;
+        let records = self.records(&repo)?;
+        let mut record = select(&records, prefix)?.clone();
+        record.tags.push(tags);
         self.save(&repo, &record)?;
         Ok(record)
     }
@@ -453,6 +531,7 @@ impl Store {
                     "configuration": settings(&record.snapshot)?,
                     "snapshot": record.snapshot,
                     "labels": record.labels,
+                    "tags": record.tags,
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -697,6 +776,132 @@ mod tests {
     }
 
     #[test]
+    fn human_tags_retain_history_identity_and_export_data() {
+        let (directory, snapshot) = fixture();
+        let store = Store::new(&snapshot.repository);
+        let first = store.capture(snapshot.clone()).unwrap();
+        let labeled = store
+            .label(&first.id, Label::Reject, "The reviewer rejects the change.")
+            .unwrap();
+        let tagged = store
+            .tag(
+                &first.id[..12],
+                &["protected-path".into()],
+                &["content".into()],
+                "The reviewer identifies the applicable rule and conflict.",
+            )
+            .unwrap();
+        assert_eq!(tagged.id, first.id);
+        assert_eq!(tagged.snapshot, first.snapshot);
+        assert_eq!(tagged.labels, labeled.labels);
+        let cleared = store
+            .tag(&first.id, &[], &[], "The reviewer clears the tags.")
+            .unwrap();
+        assert_eq!(cleared.tags.len(), 2);
+        assert_eq!(cleared.tags[0], tagged.tags[0]);
+        assert!(cleared.tags[1].policy_rules.is_empty());
+        assert!(cleared.tags[1].conflict_kinds.is_empty());
+        assert_eq!(store.capture(snapshot).unwrap(), cleared);
+        let output = directory.path().join("manifest.json");
+        store
+            .export(&[], &variants(directory.path()), &output)
+            .unwrap();
+        let manifest: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        assert_eq!(manifest["cases"][0]["tags"], json!(cleared.tags));
+    }
+
+    #[test]
+    fn tags_refuse_invalid_input_and_record_aliases() {
+        let (directory, snapshot) = fixture();
+        let store = Store::new(&snapshot.repository);
+        let first = store.capture(snapshot).unwrap();
+        for tags in [
+            vec!["Uppercase".into()],
+            vec!["bad tag".into()],
+            vec!["bad\n".into()],
+            vec!["duplicate".into(), "duplicate".into()],
+            vec!["".into()],
+            vec!["-option".into()],
+            vec!["path/name".into()],
+        ] {
+            assert!(
+                store
+                    .tag(&first.id, &tags, &[], "The reviewer identifies the rule.")
+                    .is_err()
+            );
+            assert!(
+                store
+                    .tag(
+                        &first.id,
+                        &[],
+                        &tags,
+                        "The reviewer identifies the conflict."
+                    )
+                    .is_err()
+            );
+        }
+        let credential = ["password = \"", "Ab3dEf5hGj7kLm9nPq2sTu4w", "\""].concat();
+        for reason in ["", "Line\nbreak", credential.as_str()] {
+            assert!(store.tag(&first.id, &[], &[], reason).is_err());
+        }
+        assert!(store.list().unwrap()[0].tags.is_empty());
+        let record = store
+            .repo
+            .join(".pijul/patchgate/cases")
+            .join(format!("{}.json", first.id));
+        fs::hard_link(&record, directory.path().join("alias")).unwrap();
+        assert!(
+            store
+                .tag(&first.id, &[], &[], "The reviewer clears the tags.")
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::from_slice::<CaseRecord>(&fs::read(record).unwrap()).unwrap(),
+            first
+        );
+    }
+
+    #[test]
+    fn concurrent_tags_retain_each_human_record() {
+        let (_directory, snapshot) = fixture();
+        let first = Store::new(&snapshot.repository)
+            .capture(snapshot.clone())
+            .unwrap();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let repo = snapshot.repository.clone();
+                let id = first.id.clone();
+                std::thread::spawn(move || {
+                    Store::new(&repo)
+                        .tag(
+                            &id,
+                            &["policy".into()],
+                            &[],
+                            "The reviewer identifies the rule.",
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let records = Store::new(&snapshot.repository).list().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tags.len(), 8);
+    }
+
+    #[test]
+    fn historical_cases_default_to_empty_tag_history() {
+        let (_directory, snapshot) = fixture();
+        let record = Store::new(&snapshot.repository).capture(snapshot).unwrap();
+        let mut value = serde_json::to_value(&record).unwrap();
+        value.as_object_mut().unwrap().remove("tags");
+        let historical: CaseRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(historical, record);
+    }
+
+    #[test]
     fn concurrent_capture_and_labels_retain_every_human_record() {
         let (_directory, snapshot) = fixture();
         let threads: Vec<_> = (0..8)
@@ -927,6 +1132,14 @@ mod tests {
                 "The reviewer approves the change.",
             )
             .unwrap();
+        let labeled = store
+            .tag(
+                &labeled.id,
+                &["protected-path".into()],
+                &["content".into()],
+                "The reviewer identifies the applicable rule and conflict.",
+            )
+            .unwrap();
         let mut other = snapshot.clone();
         other.candidate = "B".repeat(53);
         fs::create_dir_all(snapshot.repository.join(".pijul/changes/BB")).unwrap();
@@ -975,6 +1188,7 @@ mod tests {
             json!(labeled.snapshot)
         );
         assert_eq!(loaded.manifest["cases"][0]["labels"], json!(labeled.labels));
+        assert_eq!(loaded.manifest["cases"][0]["tags"], json!(labeled.tags));
         assert_eq!(loaded.manifest["cases"][0]["id"], first.id);
         assert_eq!(
             fs::read(

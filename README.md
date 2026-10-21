@@ -135,6 +135,12 @@ Enable the Nix sandbox in both client and daemon configuration.
 The gate refuses a disabled client sandbox and explicit check-level sandbox exceptions.
 The daemon, sandbox policy, build machines, and binary caches remain trusted.
 
+Before each candidate verification, the gate executes a fresh local isolation probe.
+The probe must show that a build cannot read the host marker or receive private client data.
+A failed probe stops candidate Nix evaluation and acceptance, including human acceptance.
+Unique probe values prevent reuse of probe build results.
+The probe and checks share one operation deadline.
+
 Every declared check must pass before the acceptance journal or main application.
 A failed check prevents both model acceptance and `patchgate accept`.
 Nix can reuse valid cached build results.
@@ -146,6 +152,11 @@ It binds candidate hashes, the merge hash, native main state, source NAR hash, t
 It also records check names, derivation paths, and output paths.
 The durable acceptance journal includes this evidence.
 Nix garbage collection can remove store paths later. The recorded hashes remain in the ledger.
+
+Successful verification also records `isolation` and `nix_version`.
+Isolation data identifies the fresh nonce, selected shell, probe derivation, and exact output.
+Older records can lack runtime evidence.
+Missing evidence does not prove runtime isolation.
 
 Record the initial trusted check files on main before intake.
 An existing requirement also applies to human approval of a check change.
@@ -250,6 +261,27 @@ This boundary prevents editable native configuration from execution with the pri
 
 `resolve --json` reports `authorizes_acceptance: false`.
 Only the separate `accept --resolution` command can accept the prepared work.
+
+#### Workspace readiness
+
+```console
+$ patchgate workspace-status ../human-resolution --json
+```
+
+The command reports conflicts, pending tracked edits, stale main/configuration/policy bindings, and acceptance blockers.
+It reads authoritative source records, not editable workspace claims.
+Source files, native metadata, ledger bytes, journals, and keys remain unchanged.
+It does not create a signer, call a model, record a change, or execute candidate Nix code.
+
+Pending tracked edits do not alone block acceptance.
+Explicit acceptance must record and verify those edits.
+Editable native configuration prevents workspace inspection.
+A blocker causes a nonzero exit after the report.
+Invalid authority leaves trusted binding fields `null`.
+
+`pending_verification` lists credential, isolation, Nix, conflict, and native conditional checks.
+A clear static report never authorizes acceptance or proves that those checks pass.
+
 
 #### Refresh a human workspace
 
@@ -503,6 +535,10 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate resolve --refresh <old> --workspace <new>` | Preserves recorded human work against current main without acceptance. |
 | `patchgate cases bundle --case <id> --variants <file> --output <file>` | Exports selected labeled cases and native data as a portable bundle. |
 | `patchgate-eval replay --bundle <file> --gate` | Replays a portable bundle and enforces safety limits. |
+| `patchgate workspace-status <path>` | Reports human workspace readiness without records or acceptance. |
+| `patchgate cases tag <id> --policy-rule <tag> --conflict-kind <tag> -m <reason>` | Records human policy and conflict tags. |
+| `patchgate artifact sign <file> --kind bundle --key <key> --output <signature>` | Signs an artifact digest with a separate reviewer key. |
+| `patchgate artifact verify <file> --kind bundle --signature <signature> --allowed-signers <file> --identity <name>` | Verifies an artifact against explicit trusted signers. |
 
 
 A hash can be the start of a hash, for example `FTH4472WYKIZ`.
@@ -518,7 +554,7 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
 ### Decision evidence and JSON
 
-`status`, `explain`, `log`, `review`, `reconsider`, `resolve`, `budget`, and the `cases` subcommands accept `--json`.
+`status`, `explain`, `log`, `review`, `reconsider`, `resolve`, `workspace-status`, `budget`, `artifact`, and the `cases` subcommands accept `--json`.
 Every report declares `schema_version: 1`.
 JSON uses full change hashes and the existing lowercase state names.
 
@@ -537,8 +573,28 @@ Their dependency graph contains direct prerequisites and complete unmet chains.
 
 Model records retain their original `review` binding.
 Successful verified acceptances retain `verification` evidence with source, input, derivation, and output identities.
-Gate and human records do not claim model review evidence.
+A gate or human decision does not claim a model verdict.
 An invalid model reply uses `execution_error: \"invalid-model-reply\"`.
+
+#### Decision provenance
+
+New decision records include `provenance` with request evidence and verifier versions.
+`requests` identifies each review or merge request by operation, API, requested model name, and declared revision.
+It records separate SHA-256 digests for the actual API prompt and response schema or typed criteria.
+It stores no prompt, policy, state, or response payload.
+An invalid model reply can retain request evidence without a model verdict.
+Transport failures remain errors and never become verdicts.
+
+`PATCHGATE_MODEL_REVISION` supplies caller-declared checkpoint evidence.
+`revision_verified` remains `false`.
+The client does not verify backend weights or server identity.
+Omitted revisions remain `null`.
+
+`verifiers` records patchgate and Pijul versions.
+A successful Nix verification adds the observed Nix version.
+Gate refusals can retain earlier request evidence without a claim of model approval.
+Older records can lack provenance.
+Missing old evidence is not a claim that verification occurred.
 
 ### Isolated review
 
@@ -717,6 +773,24 @@ Each exported case retains its capture, label history, and review settings.
 Replay checks captured native state and exact policy bytes before comparison.
 Per-case settings replace root replay defaults.
 
+#### Human coverage tags
+
+```console
+$ patchgate cases tag <case-id> --policy-rule secrets --conflict-kind order-conflict -m "Identify this case"
+$ patchgate cases tag <case-id> -m "Clear these tags"
+```
+
+Tag options identify the complete new set.
+Omit both options to clear the set.
+The store retains all tag updates with user, time, and reason.
+Tags never alter the case ID, snapshot, or human verdict labels.
+Tags are human metadata, not automatically verified policy results.
+
+Use unique lowercase identifiers, at most 64 characters.
+Tags start with a letter and can contain letters, digits, hyphens, and underscores.
+Reasons and tags must not contain supported credentials or control characters.
+Ordinary manifests, portable bundles, replay reports, and baseline bindings retain the complete tag history.
+
 ### Portable replay bundles
 
 ```console
@@ -838,7 +912,7 @@ The command prints and saves its JSON report before a gate failure exit.
 The optional `gate` object contains limits, observed counts, regressions, concrete failures, and `passed`.
 
 A baseline must contain the exact case and variant matrix without duplicates, missing rows, errors, or incomplete verdicts.
-Repository, channel, candidate, ordered base, snapshot, label history, and effective settings must match.
+Repository, channel, candidate, ordered base, snapshot, label and tag histories, and effective settings must match.
 Observed CLI settings must also agree with each row.
 Model, API, checkpoint revision, and policy variants can change for an intentional comparison.
 
@@ -847,6 +921,69 @@ An improvement in another row cannot cancel that regression.
 Dataset differences cause explicit failures instead of a misleading pass.
 The command reads the baseline before an output report can replace it.
 Gate results never authorize source acceptance.
+
+#### Coverage minimums
+
+```console
+$ patchgate-eval replay --bundle ../cases.tar.gz --min-policy-rule secrets=3 --min-conflict-kind order-conflict=2 --report ../coverage.json
+```
+
+Either coverage option activates the release gate.
+Requirements use `TAG=COUNT` and can repeat for different tags.
+The report exposes counts by tag and variant under `gate.coverage`.
+Every selected variant must satisfy every minimum.
+
+Coverage counts unique captured cases with explicit human labels and complete, successful comparisons.
+Duplicate case IDs or captures cannot increase coverage.
+Failed, missing, or repeated comparison rows do not supply coverage.
+Only the latest tag set supplies counts.
+Earlier tag updates remain in reports and baseline bindings.
+Tag coverage does not prove model quality.
+
+### Signed replay artifacts
+
+Create a separate reviewer key with OpenSSH:
+
+```console
+$ ssh-keygen -t ed25519 -N "" -f ../reviewer-key
+```
+
+Keep reviewer keys and allowed-signers files outside the source repository.
+The allowed-signers file selects trusted public keys for the supplied identity.
+Each line contains the identity, a space, and an OpenSSH public key.
+The command never imports trust from the bundle or working copy.
+Trust options are explicit caller input.
+
+```console
+$ patchgate artifact sign ../cases.tar.gz --kind bundle --key ../reviewer-key --output ../cases.sig
+$ patchgate artifact sign ../baseline.json --kind baseline --key ../reviewer-key --output ../baseline.sig
+$ patchgate artifact verify ../cases.tar.gz --kind bundle --signature ../cases.sig --allowed-signers ../allowed-signers --identity reviewer
+$ patchgate-eval replay --bundle ../cases.tar.gz --bundle-signature ../cases.sig --baseline ../baseline.json --baseline-signature ../baseline.sig --allowed-signers ../allowed-signers --signer reviewer --gate
+```
+
+Signatures cover a versioned SHA-256 envelope, not a mutable path.
+Bundle and baseline signatures use `patchgate-bundle-v1` and `patchgate-baseline-v1` namespaces.
+An explicit reviewer key must differ from the enclosing source repository gate identity.
+Signing checks the enclosing repository even from a source subdirectory.
+The command refuses gate-key paths, aliases, and copies with the same public identity.
+It does not read the source gate private key.
+
+Any signature or signer option selects strict mode.
+Supply the allowed-signers file, identity, and signatures for all selected bundle and baseline inputs.
+Partial trust options fail.
+A plain manifest can accompany a signed baseline.
+CI artifact commands also work without the original repository.
+
+Strict replay authenticates an exact private bundle snapshot before archive extraction.
+It authenticates exact baseline bytes before JSON parsing.
+Invalid signatures stop replay before native operations.
+Replay reports retain artifact digests, trusted identities, allowed-signers digests, and signature namespaces.
+
+Inputs must be regular files.
+Signature output is new, private, and atomic.
+Verification shows that an allowed key signed the artifact digest.
+It does not establish source safety or grant acceptance authority.
+
 
 
 ## Configuration
@@ -903,6 +1040,7 @@ Removal of the file restores those original values, including within an active w
 | `PATCHGATE_MODEL_URL` | `http://127.0.0.1:1234/v1` | The API base URL, including `/v1`. Ollama uses `http://127.0.0.1:11434/v1`. |
 | `PATCHGATE_MODEL` | `google/gemma-4-e4b` | The name of the model on the server. |
 | `PATCHGATE_MODEL_API` | `openai` | Use `openai` for chat completions or `systemone` for typed choices. |
+| `PATCHGATE_MODEL_REVISION` | unset | The declared checkpoint revision. The client does not verify server weights or identity. |
 | `PATCHGATE_PROTECTED` | the gate files | Glob patterns, with commas between them. A human must accept each change to a path that matches. |
 | `PATCHGATE_POLICY` | `POLICY.md` | The policy file in main. patchgate always protects it. |
 | `PATCHGATE_MAX_CHANGE_CHARS` | `8000` | Escalate a longer serialized review object or conflict prompt without the model. |

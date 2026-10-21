@@ -11,7 +11,7 @@ pub struct Isolated {
     pub pijul: Pijul,
 }
 
-/// Copy native metadata without source writes or gate-private keys.
+/// Copy native metadata without source writes, gate keys, or native configuration.
 pub fn copy_repository(source: &Path) -> Result<Isolated> {
     let metadata = crate::pijul::safe_path(source, Path::new(".pijul"))?;
     let directory = tempfile::Builder::new()
@@ -36,7 +36,11 @@ fn copy_metadata(source: &Path, target: &Path, immutable: bool, root: bool) -> R
         for entry in fs::read_dir(source)? {
             let entry = entry?;
             let name = entry.file_name();
-            if root && name == "patchgate" {
+            if root
+                && [b"patchgate".as_slice(), b"config", b"config.toml"]
+                    .iter()
+                    .any(|excluded| name.as_encoded_bytes().eq_ignore_ascii_case(excluded))
+            {
                 continue;
             }
             copy_metadata(

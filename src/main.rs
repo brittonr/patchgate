@@ -1,3 +1,4 @@
+pub mod artifact;
 mod budget;
 pub mod bundle;
 mod cases;
@@ -9,6 +10,7 @@ mod isolation;
 mod model;
 mod pijul;
 mod protected;
+pub mod provenance;
 mod resolution;
 mod review;
 mod secrets;
@@ -80,6 +82,17 @@ enum Command {
         workspace: PathBuf,
         #[arg(long)]
         json: bool,
+    },
+    /// Inspect a human workspace without records or acceptance.
+    WorkspaceStatus {
+        workspace: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sign or verify replay artifacts with an explicit reviewer identity.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
     },
     /// Review an earlier gate or model decision without loss of its evidence.
     Reconsider {
@@ -181,6 +194,18 @@ enum CaseCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Replace human case tags and retain their history.
+    Tag {
+        case: String,
+        #[arg(long = "policy-rule")]
+        policy_rules: Vec<String>,
+        #[arg(long = "conflict-kind")]
+        conflict_kinds: Vec<String>,
+        #[arg(short = 'm', long)]
+        reason: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Export labeled cases and explicit model variants for replay.
     Export {
         #[arg(long)]
@@ -200,6 +225,36 @@ enum CaseCommand {
         output: PathBuf,
         #[arg(long = "case", required = true)]
         cases: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArtifactCommand {
+    /// Sign an artifact digest with a separate reviewer key.
+    Sign {
+        artifact: PathBuf,
+        #[arg(long, value_enum)]
+        kind: artifact::Kind,
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify an artifact digest against explicit trusted signers.
+    Verify {
+        artifact: PathBuf,
+        #[arg(long, value_enum)]
+        kind: artifact::Kind,
+        #[arg(long)]
+        signature: PathBuf,
+        #[arg(long)]
+        allowed_signers: PathBuf,
+        #[arg(long)]
+        identity: String,
         #[arg(long)]
         json: bool,
     },
@@ -376,6 +431,21 @@ fn run_cases(settings: Settings, command: CaseCommand) -> Result<()> {
             let record = cases::Store::new(&settings.repo).label(&case, expected, &reason)?;
             show_case(&record, json)?;
         }
+        CaseCommand::Tag {
+            case,
+            policy_rules,
+            conflict_kinds,
+            reason,
+            json,
+        } => {
+            let record = cases::Store::new(&settings.repo).tag(
+                &case,
+                &policy_rules,
+                &conflict_kinds,
+                &reason,
+            )?;
+            show_case(&record, json)?;
+        }
         CaseCommand::Export {
             variants,
             output,
@@ -417,12 +487,81 @@ fn run_cases(settings: Settings, command: CaseCommand) -> Result<()> {
     Ok(())
 }
 
+fn run_artifact(source: &std::path::Path, command: ArtifactCommand) -> Result<()> {
+    match command {
+        ArtifactCommand::Sign {
+            artifact,
+            kind,
+            key,
+            output,
+            json,
+        } => {
+            let report = artifact::sign(source, &artifact, kind, &key, &output)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!("Signature: {}", report.signature.display());
+                println!("Artifact SHA-256: {}", report.sha256);
+                println!("Reviewer key: {}", report.signer_fingerprint);
+            }
+        }
+        ArtifactCommand::Verify {
+            artifact,
+            kind,
+            signature,
+            allowed_signers,
+            identity,
+            json,
+        } => {
+            let trust = artifact::Trust {
+                signature,
+                allowed_signers,
+                identity,
+            };
+            let report = artifact::verify(&artifact, kind, &trust)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!("Verified reviewer: {}", report.identity);
+                println!("Artifact SHA-256: {}", report.sha256);
+                println!("The signature grants no acceptance authority.");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn quote_path(path: &std::path::Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result<()> {
     match command {
+        Command::Artifact { command } => run_artifact(&settings.repo, command)?,
+        Command::WorkspaceStatus { workspace, json } => {
+            let report = Gate::workspace_status(settings, &workspace)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!("Workspace: {}", report.workspace.display());
+                for blocker in &report.blockers {
+                    println!("Blocked [{}]: {}", blocker.code, blocker.detail);
+                }
+                if let Some(pending) = report.pending_tracked_edits {
+                    println!("Pending tracked edits: {pending}");
+                }
+                if let Some(conflicts) = &report.recorded_conflicts {
+                    println!("Recorded conflicts: {}", conflicts.len());
+                }
+                for check in &report.pending_verification {
+                    println!("Pending [{}]: {}", check.code, check.detail);
+                }
+                println!("The report grants no acceptance authority.");
+            }
+            if !report.blockers.is_empty() {
+                bail!("Workspace inspection found acceptance blockers.");
+            }
+        }
         Command::Init => {
             let gate = Gate::new(settings)?;
             for line in gate.init()? {
@@ -737,9 +876,15 @@ fn main() -> std::process::ExitCode {
             stop.store(true, Ordering::Relaxed);
             thread.unpark();
         })?;
-        let repo = gate::find_repo(&cli.repo)?;
-        let settings = Settings::from_env(repo, cli.inbox, cli.main, Arc::clone(&interrupted))?;
-        run(settings, cli.command, &interrupted)
+        match cli.command {
+            Command::Artifact { command } => run_artifact(&cli.repo, command),
+            command => {
+                let repo = gate::find_repo(&cli.repo)?;
+                let settings =
+                    Settings::from_env(repo, cli.inbox, cli.main, Arc::clone(&interrupted))?;
+                run(settings, command, &interrupted)
+            }
+        }
     })();
     if interrupted.load(Ordering::Relaxed) {
         return std::process::ExitCode::from(130);

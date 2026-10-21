@@ -848,12 +848,14 @@ fn inspect_model(report: &mut Report, settings: &Settings, timeout: Duration) {
             &settings.model,
             timeout,
             settings.model_api,
+            settings.model_revision.as_deref(),
         )?;
         Ok(model
             .review(
                 "Accept this harmless readiness probe. It contains no source changes.",
                 &state,
             )?
+            .value
             .is_some())
     })();
     match result {
@@ -1034,6 +1036,63 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn model_readiness_uses_response_values_without_revision_identity_claims() -> Result<()> {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let directory = tempfile::tempdir()?;
+        for api in [Api::OpenAi, Api::SystemOne] {
+            let valid = match api {
+                Api::OpenAi => json!({"choices": [{"message": {
+                    "content": "{\"decision\":\"accept\",\"summary\":\"Probe.\",\"reason\":\"Rule.\"}"
+                }}]}),
+                Api::SystemOne => json!({"answers": {"review": {
+                    "type": "choice", "choice": "accept", "confidence": 0.9
+                }}}),
+            };
+            let valid = valid.to_string();
+            for (status, reply, expected) in [
+                (200, valid.as_str(), Status::Pass),
+                (200, "PRIVATE_INVALID_REPLY", Status::Error),
+                (503, "PRIVATE_SERVER_REPLY", Status::Error),
+            ] {
+                let (url, worker) = crate::model::tests::reply_server(status, reply)?;
+                let mut settings = Settings::from_env(
+                    directory.path().to_path_buf(),
+                    "inbox".into(),
+                    "main".into(),
+                    Arc::new(AtomicBool::new(false)),
+                )?;
+                settings.model_url = url;
+                settings.model = "model".into();
+                settings.model_api = api;
+                settings.model_revision = Some("DECLARED_REVISION_ONLY".into());
+                let mut report = Report {
+                    schema_version: 1,
+                    ok: true,
+                    checks: Vec::new(),
+                    configuration: None,
+                };
+                inspect_model(&mut report, &settings, Duration::from_secs(5));
+                let request = worker.join().expect("The model fixture panicked")?;
+                assert_eq!(request["model"], "model");
+                assert_eq!(report.checks.len(), 1);
+                assert_eq!(report.checks[0].id, "model.readiness");
+                assert!(report.checks[0].status == expected);
+                assert_eq!(report.ok, expected == Status::Pass);
+                let encoded = serde_json::to_string(&report)?;
+                for private in [
+                    "DECLARED_REVISION_ONLY",
+                    "PRIVATE_INVALID_REPLY",
+                    "PRIVATE_SERVER_REPLY",
+                ] {
+                    assert!(!encoded.contains(private));
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn native_refusal_requires_its_exit_code_and_no_mutation() -> Result<()> {

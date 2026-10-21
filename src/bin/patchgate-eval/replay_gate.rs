@@ -1,5 +1,44 @@
 use super::*;
 
+#[derive(Clone, Debug, Serialize)]
+pub struct Requirement {
+    tag: String,
+    count: usize,
+}
+
+pub(super) fn parse_requirement(value: &str) -> std::result::Result<Requirement, String> {
+    let (tag, count) = value.split_once('=').ok_or("Coverage needs TAG=COUNT.")?;
+    if !valid_tag(tag) || count.is_empty() || !count.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Coverage needs a lowercase tag and a nonnegative integer count.".into());
+    }
+    Ok(Requirement {
+        tag: tag.into(),
+        count: count
+            .parse()
+            .map_err(|_| "The coverage count is too large.")?,
+    })
+}
+
+pub(super) fn validate_requirements(args: &ReplayArgs) -> Result<()> {
+    for requirements in [&args.min_policy_rule, &args.min_conflict_kind] {
+        let mut unique = BTreeSet::new();
+        ensure!(
+            requirements
+                .iter()
+                .all(|entry| valid_tag(&entry.tag) && unique.insert(&entry.tag)),
+            "Coverage requirements must use unique lowercase tags."
+        );
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct Coverage {
+    variant_id: String,
+    policy_rules: BTreeMap<String, usize>,
+    conflict_kinds: BTreeMap<String, usize>,
+}
+
 #[derive(Deserialize)]
 pub(super) struct Baseline {
     schema_version: u32,
@@ -15,10 +54,12 @@ pub(super) struct Baseline {
 pub(super) struct GateResult {
     schema_version: u32,
     pub(super) passed: bool,
+    authorizes_acceptance: bool,
     limits: Limits,
     observed: Observed,
     regressions: Vec<Regression>,
     failures: Vec<Failure>,
+    coverage: Vec<Coverage>,
 }
 
 #[derive(Serialize)]
@@ -26,6 +67,8 @@ struct Limits {
     unsafe_acceptances: usize,
     label_mismatches: usize,
     regressions: usize,
+    policy_rules: Vec<Requirement>,
+    conflict_kinds: Vec<Requirement>,
 }
 
 #[derive(Default, Serialize)]
@@ -64,9 +107,23 @@ impl GateResult {
     }
 }
 
-pub(super) fn read_baseline(path: &Path) -> Result<Baseline> {
-    serde_json::from_slice(&fs::read(path).context("Read the replay baseline file.")?)
-        .context("Read the replay baseline report.")
+pub(super) fn baseline_bytes(path: &Path) -> Result<Vec<u8>> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .context("Read the replay baseline file.")?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "The replay baseline must use a regular file."
+    );
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn read_baseline(bytes: &[u8]) -> Result<Baseline> {
+    serde_json::from_slice(bytes).context("Read the replay baseline report.")
 }
 
 fn unsafe_acceptance(row: &Comparison) -> bool {
@@ -78,7 +135,11 @@ fn label_mismatch(row: &Comparison) -> bool {
 }
 
 fn complete(row: &Comparison) -> bool {
-    row.actual.is_some() && row.outcome == "verdict" && row.cli_executed && row.exit_code == Some(0)
+    row.actual.is_some()
+        && row.outcome == "verdict"
+        && row.cli_executed
+        && row.exit_code == Some(0)
+        && row.execution_error.is_none()
 }
 
 type Matrix<'a> = BTreeMap<(&'a str, &'a str), &'a Comparison>;
@@ -99,6 +160,11 @@ fn matrix<'a>(
                 .iter()
                 .map(move |variant| (case.id.as_str(), variant.id.as_str()))
         })
+        .collect();
+    let cases: BTreeMap<_, _> = manifest
+        .cases
+        .iter()
+        .map(|case| (case.id.as_str(), case))
         .collect();
     let mut matrix = BTreeMap::new();
     for row in rows {
@@ -138,6 +204,17 @@ fn matrix<'a>(
                 format!("The {name} CLI evidence does not match its declared effective settings."),
             );
         }
+        if let Some(case) = cases.get(row.case_id.as_str()) {
+            if !matches_case(row, case, &manifest.configuration) {
+                result.failure(
+                    "incompatible_dataset",
+                    Some(row),
+                    format!(
+                        "The {name} comparison differs from its captured case and human histories."
+                    ),
+                );
+            }
+        }
     }
     for (case_id, variant_id) in expected {
         if !matrix.contains_key(&(case_id, variant_id)) {
@@ -158,7 +235,118 @@ fn compatible(row: &Comparison, previous: &Comparison) -> bool {
         && row.expected == previous.expected
         && row.snapshot == previous.snapshot
         && row.labels == previous.labels
+        && row.tags == previous.tags
         && row.configuration == previous.configuration
+}
+
+fn matches_case(row: &Comparison, case: &Case, default: &Configuration) -> bool {
+    row.candidate == case.candidate
+        && row.base == case.base
+        && row.expected == case.expected
+        && row.snapshot == case.snapshot
+        && row.labels == case.labels
+        && row.tags == case.tags
+        && row.configuration == *case.configuration.as_ref().unwrap_or(default)
+}
+
+fn coverage(
+    args: &ReplayArgs,
+    manifest: &Manifest,
+    comparisons: &[Comparison],
+    current: &Matrix<'_>,
+    result: &mut GateResult,
+) {
+    let mut multiplicity = BTreeMap::new();
+    for row in comparisons {
+        *multiplicity
+            .entry((row.case_id.as_str(), row.variant_id.as_str()))
+            .or_insert(0usize) += 1;
+    }
+    let captures: Vec<_> = manifest
+        .cases
+        .iter()
+        .map(|case| {
+            let labeled = case
+                .labels
+                .last()
+                .is_some_and(|label| label["expected"] == json!(case.expected))
+                && validate_tag_history(&case.tags).is_ok();
+            (case, capture_identity(case), labeled)
+        })
+        .collect();
+    for variant in &manifest.variants {
+        let mut observed = Coverage {
+            variant_id: variant.id.clone(),
+            policy_rules: args
+                .min_policy_rule
+                .iter()
+                .map(|entry| (entry.tag.clone(), 0))
+                .collect(),
+            conflict_kinds: args
+                .min_conflict_kind
+                .iter()
+                .map(|entry| (entry.tag.clone(), 0))
+                .collect(),
+        };
+        let mut counted = BTreeSet::new();
+        for (case, identity, labeled) in &captures {
+            let Some(tags) = case.tags.last() else {
+                continue;
+            };
+            for tag in &tags.policy_rules {
+                observed.policy_rules.entry(tag.clone()).or_insert(0);
+            }
+            for tag in &tags.conflict_kinds {
+                observed.conflict_kinds.entry(tag.clone()).or_insert(0);
+            }
+            let Some(identity) = identity.as_deref() else {
+                continue;
+            };
+            let key = (case.id.as_str(), variant.id.as_str());
+            let Some(row) = current.get(&key) else {
+                continue;
+            };
+            if !*labeled
+                || multiplicity.get(&key) != Some(&1)
+                || !complete(row)
+                || !observed_configuration_matches(row)
+                || !matches_case(row, case, &manifest.configuration)
+                || !counted.insert(identity)
+            {
+                continue;
+            }
+            for tag in &tags.policy_rules {
+                *observed.policy_rules.entry(tag.clone()).or_default() += 1;
+            }
+            for tag in &tags.conflict_kinds {
+                *observed.conflict_kinds.entry(tag.clone()).or_default() += 1;
+            }
+        }
+        for (kind, requirements, counts) in [
+            ("policy_rule", &args.min_policy_rule, &observed.policy_rules),
+            (
+                "conflict_kind",
+                &args.min_conflict_kind,
+                &observed.conflict_kinds,
+            ),
+        ] {
+            for requirement in requirements {
+                let count = counts.get(&requirement.tag).copied().unwrap_or(0);
+                if count < requirement.count {
+                    result.failures.push(Failure {
+                        code: "coverage_minimum",
+                        case_id: None,
+                        variant_id: Some(variant.id.clone()),
+                        message: format!(
+                            "The {kind} tag {} has {count} unique labeled captures. The minimum is {}.",
+                            requirement.tag, requirement.count,
+                        ),
+                    });
+                }
+            }
+        }
+        result.coverage.push(observed);
+    }
 }
 
 pub(super) fn evaluate(
@@ -173,21 +361,30 @@ pub(super) fn evaluate(
         && args.max_unsafe_acceptances.is_none()
         && args.max_label_mismatches.is_none()
         && args.max_regressions.is_none()
+        && args.min_policy_rule.is_empty()
+        && args.min_conflict_kind.is_empty()
     {
         return None;
     }
     let mut result = GateResult {
         schema_version: 1,
         passed: false,
+        authorizes_acceptance: false,
         limits: Limits {
             unsafe_acceptances: args.max_unsafe_acceptances.unwrap_or(0),
             label_mismatches: args.max_label_mismatches.unwrap_or(0),
             regressions: args.max_regressions.unwrap_or(0),
+            policy_rules: args.min_policy_rule.clone(),
+            conflict_kinds: args.min_conflict_kind.clone(),
         },
         observed: Observed::default(),
         regressions: Vec::new(),
         failures: Vec::new(),
+        coverage: Vec::new(),
     };
+    if let Err(error) = validate_requirements(args) {
+        result.failure("invalid_coverage", None, format!("{error:#}"));
+    }
     for row in comparisons {
         result.observed.unsafe_acceptances += usize::from(unsafe_acceptance(row));
         result.observed.label_mismatches += usize::from(label_mismatch(row));
@@ -195,6 +392,7 @@ pub(super) fn evaluate(
         result.observed.incomplete_comparisons += usize::from(!complete(row));
     }
     let current = matrix(comparisons, manifest, false, &mut result);
+    coverage(args, manifest, comparisons, &current, &mut result);
     match baseline {
         Some(Err(error)) => result.failure(
             "invalid_baseline",
@@ -245,7 +443,7 @@ pub(super) fn evaluate(
                     continue;
                 };
                 if !compatible(row, previous) {
-                    result.failure("incompatible_dataset", Some(row), "The baseline candidate, ordered base, label, snapshot, label history, or effective settings differ.".into());
+                    result.failure("incompatible_dataset", Some(row), "The baseline candidate, ordered base, label, snapshot, human histories, or effective settings differ.".into());
                     continue;
                 }
                 if row.execution_error.is_none()
@@ -326,6 +524,12 @@ mod tests {
             max_unsafe_acceptances: None,
             max_label_mismatches: None,
             max_regressions: None,
+            min_policy_rule: Vec::new(),
+            min_conflict_kind: Vec::new(),
+            bundle_signature: None,
+            baseline_signature: None,
+            allowed_signers: None,
+            signer: None,
         }
     }
 
@@ -471,7 +675,7 @@ mod tests {
     fn baseline_bindings_cannot_change() {
         let manifest = manifest();
         let current = rows(&manifest, [Label::Reject, Label::Reject]);
-        for field in 0..10 {
+        for field in 0..11 {
             let mut previous = baseline(&manifest, &current);
             let row = &mut previous.comparisons[0];
             match field {
@@ -484,7 +688,14 @@ mod tests {
                 6 => previous.main = "another-main".into(),
                 7 => previous.inbox = "another-inbox".into(),
                 8 => previous.repository = "/another/source".into(),
-                _ => previous.schema_version = 99,
+                9 => previous.schema_version = 99,
+                _ => row.tags.push(TagRecord {
+                    user: "reviewer".into(),
+                    time: "2026-10-21T00:00:00Z".into(),
+                    reason: "The reviewer identifies a policy rule.".into(),
+                    policy_rules: vec!["policy".into()],
+                    conflict_kinds: Vec::new(),
+                }),
             }
             let result = evaluate_rows(&args(), &manifest, &current, Some(&Ok(previous)));
             assert!(!result.passed, "{field}");
@@ -529,7 +740,8 @@ mod tests {
             "authorizes_acceptance": false
         });
         fs::write(&path, serde_json::to_vec(&value)?)?;
-        let previous = read_baseline(&path);
+        let bytes = baseline_bytes(&path)?;
+        let previous = read_baseline(&bytes);
         fs::write(&path, b"replacement report")?;
         let mut args = args();
         args.gate = false;
@@ -572,5 +784,141 @@ mod tests {
                 .iter()
                 .any(|failure| failure.code == "observed_settings")
         );
+    }
+
+    fn captured_manifest() -> Manifest {
+        let mut manifest = manifest();
+        let configuration = manifest.configuration.clone();
+        for case in &mut manifest.cases {
+            case.snapshot = Some(json!({
+                "repository": manifest.repository,
+                "main": manifest.main,
+                "inbox": manifest.inbox,
+                "base": case.base,
+                "candidate": case.candidate,
+                "configuration": {"values": configuration},
+            }));
+            case.labels = vec![json!({
+                "user": "reviewer", "time": "2026-10-21T00:00:00Z",
+                "expected": "reject", "reason": "The reviewer rejects the change.",
+            })];
+            case.tags = vec![TagRecord {
+                user: "reviewer".into(),
+                time: "2026-10-21T00:00:00Z".into(),
+                reason: "The reviewer identifies the applicable rule and conflict.".into(),
+                policy_rules: vec!["protected-path".into()],
+                conflict_kinds: vec!["content".into()],
+            }];
+        }
+        manifest
+    }
+
+    #[test]
+    fn coverage_requires_unique_captures_and_activates_the_gate() {
+        let mut manifest = captured_manifest();
+        let mut args = args();
+        args.gate = false;
+        args.min_policy_rule = vec![parse_requirement("protected-path=2").unwrap()];
+        args.min_conflict_kind = vec![parse_requirement("content=2").unwrap()];
+        let current = rows(&manifest, [Label::Reject, Label::Reject]);
+        let result = evaluate_rows(&args, &manifest, &current, None);
+        assert!(result.passed);
+        assert_eq!(result.coverage[0].policy_rules["protected-path"], 2);
+        manifest.cases[1].snapshot = manifest.cases[0].snapshot.clone();
+        manifest.cases[1].candidate = manifest.cases[0].candidate.clone();
+        let current = rows(&manifest, [Label::Reject, Label::Reject]);
+        let result = evaluate_rows(&args, &manifest, &current, None);
+        assert!(!result.passed);
+        assert_eq!(result.coverage[0].policy_rules["protected-path"], 1);
+        assert_eq!(result.coverage[0].conflict_kinds["content"], 1);
+        assert!(
+            result
+                .failures
+                .iter()
+                .any(|failure| failure.code == "coverage_minimum")
+        );
+    }
+
+    #[test]
+    fn coverage_excludes_errors_missing_rows_duplicates_and_unlabeled_cases() {
+        let manifest = captured_manifest();
+        let mut args = args();
+        args.min_policy_rule = vec![parse_requirement("protected-path=2").unwrap()];
+        for defect in 0..7 {
+            let mut manifest = captured_manifest();
+            let mut current = rows(&manifest, [Label::Reject, Label::Reject]);
+            match defect {
+                0 => current[0].execution_error = Some("The model is unavailable.".into()),
+                1 => {
+                    current.remove(0);
+                }
+                2 => {
+                    let duplicate =
+                        serde_json::from_value(serde_json::to_value(&current[0]).unwrap()).unwrap();
+                    current.push(duplicate);
+                }
+                3 => current[0].exit_code = Some(1),
+                4 => {
+                    manifest.cases[0].labels.clear();
+                    current[0].labels.clear();
+                }
+                5 => {
+                    manifest.cases[0].snapshot = None;
+                    current[0].snapshot = None;
+                }
+                _ => current[0].evidence = None,
+            }
+            let result = evaluate_rows(&args, &manifest, &current, None);
+            assert!(!result.passed, "{defect}");
+            assert_eq!(
+                result.coverage[0].policy_rules["protected-path"], 1,
+                "{defect}"
+            );
+        }
+        assert!(validate(&manifest, "POLICY.md").is_ok());
+    }
+
+    #[test]
+    fn coverage_uses_latest_tag_set_and_each_variant() {
+        let mut manifest = captured_manifest();
+        manifest.cases[0].tags.push(TagRecord {
+            user: "reviewer".into(),
+            time: "2026-10-21T01:00:00Z".into(),
+            reason: "The reviewer clears the tags.".into(),
+            policy_rules: Vec::new(),
+            conflict_kinds: Vec::new(),
+        });
+        let mut second: Variant =
+            serde_json::from_value(serde_json::to_value(&manifest.variants[0]).unwrap()).unwrap();
+        second.id = "second-model".into();
+        manifest.variants.push(second);
+        let mut current = rows(&manifest, [Label::Reject, Label::Reject]);
+        let mut more = rows(&manifest, [Label::Reject, Label::Reject]);
+        for row in &mut more {
+            row.variant_id = "second-model".into();
+        }
+        more[1].execution_error = Some("The model is unavailable.".into());
+        current.extend(more);
+        let mut args = args();
+        args.min_policy_rule = vec![parse_requirement("protected-path=1").unwrap()];
+        let result = evaluate_rows(&args, &manifest, &current, None);
+        assert!(!result.passed);
+        assert_eq!(result.coverage[0].policy_rules["protected-path"], 1);
+        assert_eq!(result.coverage[1].policy_rules["protected-path"], 0);
+    }
+
+    #[test]
+    fn malformed_and_duplicate_coverage_requirements_fail() {
+        for value in [
+            "", "TAG=1", "tag", "tag=-1", "tag=+1", "tag=1=2", "tag=", "tag= 1",
+        ] {
+            assert!(parse_requirement(value).is_err(), "{value}");
+        }
+        let mut args = args();
+        args.min_policy_rule = vec![
+            parse_requirement("tag=1").unwrap(),
+            parse_requirement("tag=2").unwrap(),
+        ];
+        assert!(validate_requirements(&args).is_err());
     }
 }

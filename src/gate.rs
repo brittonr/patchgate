@@ -32,6 +32,7 @@ pub struct Settings {
     pub model_url: String,
     pub model: String,
     pub model_api: Api,
+    pub model_revision: Option<String>,
     pub policy: String,
     protected: Vec<String>,
     max_change_chars: usize,
@@ -49,6 +50,12 @@ impl Settings {
     ) -> Result<Self> {
         let timeout: f64 = number("PATCHGATE_TIMEOUT", 300.0)?;
         let check_timeout: f64 = number("PATCHGATE_CHECK_TIMEOUT", 900.0)?;
+        let model_revision = match env::var("PATCHGATE_MODEL_REVISION") {
+            Ok(value) if value.trim().is_empty() => None,
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(_) => bail!("The declared model revision is not valid UTF-8"),
+        };
         Ok(Self {
             repo,
             inbox,
@@ -59,6 +66,7 @@ impl Settings {
             model_api: env::var("PATCHGATE_MODEL_API")
                 .unwrap_or_else(|_| "openai".into())
                 .parse()?,
+            model_revision,
             policy: env::var("PATCHGATE_POLICY").unwrap_or_else(|_| "POLICY.md".into()),
             protected: env::var("PATCHGATE_PROTECTED")
                 .unwrap_or_default()
@@ -205,6 +213,8 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::provenance::Decision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_error: Option<String>,
@@ -243,6 +253,7 @@ impl Record {
             summary: String::new(),
             at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false),
             model: None,
+            provenance: None,
             review: None,
             execution_error: None,
             findings: Vec::new(),
@@ -743,6 +754,7 @@ pub struct Gate {
     baseline: crate::configuration::Values,
     configuration: Rc<crate::configuration::Evidence>,
     capture_enabled: bool,
+    verifiers: Option<crate::provenance::VerifierVersions>,
 }
 
 impl Gate {
@@ -770,6 +782,7 @@ impl Gate {
                 &settings.model,
                 settings.timeout,
                 settings.model_api,
+                settings.model_revision.as_deref(),
             )?,
             protected,
             policy_path,
@@ -779,12 +792,27 @@ impl Gate {
             baseline,
             configuration,
             capture_enabled: true,
+            verifiers: None,
         };
         let _lock = gate.ledger.lock()?;
         gate.recover()?;
         let main = gate.pijul.snapshot(&gate.settings.main)?;
         gate.refresh_configuration(&main)?;
         Ok(gate)
+    }
+
+    fn decision_provenance(&mut self) -> Result<crate::provenance::Decision> {
+        if self.verifiers.is_none() {
+            self.verifiers = Some(crate::provenance::verifier_versions(&self.pijul)?);
+        }
+        Ok(crate::provenance::Decision {
+            requests: Vec::new(),
+            verifiers: self
+                .verifiers
+                .as_ref()
+                .context("Verifier versions are absent")?
+                .clone(),
+        })
     }
 
     fn refresh_configuration(&mut self, main: &ChannelSnapshot) -> Result<()> {
@@ -813,6 +841,7 @@ impl Gate {
                 &self.settings.model,
                 timeout,
                 self.settings.model_api,
+                self.settings.model_revision.as_deref(),
             )?;
         }
         self.settings.policy.clone_from(&values.policy_path);
@@ -898,6 +927,92 @@ impl Gate {
             }
         }
         found.context("No change matches this hash prefix")
+    }
+
+    pub fn workspace_status(
+        settings: Settings,
+        workspace: &Path,
+    ) -> Result<crate::resolution::Readiness> {
+        let mut report =
+            crate::resolution::inspect(&settings.repo, workspace, &settings.baseline_values())?;
+        let original = Ledger::new(&settings.repo);
+        match original.pending() {
+            Ok(Some(_)) => report.add_blocker(
+                "acceptance_journal",
+                "The source acceptance journal needs recovery before acceptance.",
+            ),
+            Ok(None) => {}
+            Err(_) => report.add_blocker(
+                "invalid_journal",
+                "The source acceptance journal cannot be read safely.",
+            ),
+        }
+        let history = match original.history() {
+            Ok(history) => Some(history),
+            Err(_) => {
+                report.add_blocker(
+                    "invalid_ledger",
+                    "The source decision history cannot be read safely.",
+                );
+                None
+            }
+        };
+        if report
+            .main
+            .as_deref()
+            .is_some_and(|main| main != settings.main)
+            || report
+                .inbox
+                .as_deref()
+                .is_some_and(|inbox| inbox != settings.inbox)
+        {
+            report.add_blocker(
+                "selected_channels",
+                "The selected channels differ from the trusted workspace channels.",
+            );
+        }
+        if let (Some(main), Some(inbox), Some(candidates), Some(history)) =
+            (&report.main, &report.inbox, &report.candidates, history)
+        {
+            let dependency_state = (|| -> Result<bool> {
+                let isolated = crate::isolation::copy_repository(&settings.repo)?;
+                let mut settings = settings;
+                settings.repo = isolated.pijul.repo.clone();
+                settings.main.clone_from(main);
+                settings.inbox.clone_from(inbox);
+                let mut gate = Self::new(settings)?;
+                gate.capture_enabled = false;
+                for record in history {
+                    gate.ledger.append(&record)?;
+                }
+                let current = gate.pijul.snapshot(main)?;
+                let inbox = gate.pijul.log(inbox)?;
+                let primary = candidates
+                    .last()
+                    .context("The workspace has no primary candidate")?;
+                if current.hashes.contains(primary)
+                    || !inbox.iter().any(|entry| entry.hash == *primary)
+                {
+                    return Ok(false);
+                }
+                Ok(
+                    gate.with_conflicting_dependencies(primary, &current.hashes, &inbox)?
+                        == *candidates,
+                )
+            })();
+            match dependency_state {
+                Ok(true) => {}
+                Ok(false) => report.add_blocker(
+                    "candidate_dependencies",
+                    "The permitted source candidate set differs from the prepared workspace.",
+                ),
+                Err(_) => report.add_blocker(
+                    "candidate_dependencies",
+                    "Current source dependencies or decisions prevent this prepared acceptance.",
+                ),
+            }
+        }
+        Ok(report)
     }
 
     fn isolated(
@@ -1518,6 +1633,7 @@ impl Gate {
             None
         };
         let configuration = Rc::clone(&self.configuration);
+        let provenance = self.decision_provenance()?;
         let record = |hash: &str| {
             let message = inbox
                 .iter()
@@ -1530,6 +1646,7 @@ impl Gate {
                 format!("{reason} It lands with {}.", short(&item.hash))
             };
             let mut record = Record::new(hash.into(), message, decision, "human", explanation);
+            record.provenance = Some(provenance.clone());
             record.user = Some(user.clone());
             record.configuration = Some(Rc::clone(&configuration));
             if hash == item.hash {
@@ -1545,10 +1662,17 @@ impl Gate {
         }
         let hashes = self.with_conflicting_dependencies(&item.hash, &main.hashes, &inbox)?;
         let records: Vec<_> = hashes.iter().map(|hash| record(hash)).collect();
-        match self.land(&hashes, &main, &records, None) {
+        let mut merge_requests = Vec::new();
+        match self.land(&hashes, &main, &records, None, &mut merge_requests) {
             Err(error) if error.is::<SecretViolation>() => {
                 let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
                 let mut refusal = record(&item.hash);
+                refusal
+                    .provenance
+                    .as_mut()
+                    .context("Decision provenance is absent")?
+                    .requests
+                    .extend(merge_requests);
                 refusal.reject_secrets(findings);
                 self.ledger.append(&refusal)?;
                 bail!("{}", refusal.reason);
@@ -1620,6 +1744,7 @@ impl Gate {
             .map(|entry| (entry.hash.clone(), entry))
             .collect();
         let mut findings = Vec::new();
+        let provenance = self.decision_provenance()?;
         let records = completed
             .hashes
             .iter()
@@ -1649,6 +1774,7 @@ impl Gate {
                     "human",
                     reason.clone(),
                 );
+                record.provenance = Some(provenance.clone());
                 record.user = Some(user.clone());
                 record.configuration = Some(Rc::clone(&self.configuration));
                 record.resolution = Some(ResolutionAcceptance {
@@ -1694,6 +1820,7 @@ impl Gate {
                 pijul: &completed.pijul,
                 imported: &completed.imported,
             }),
+            &mut Vec::new(),
         ) {
             Err(error) if error.is::<SecretViolation>() => {
                 let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
@@ -1969,12 +2096,14 @@ impl Gate {
         record.reconsideration = reconsideration;
         self.require_current_main(&reviewed)?;
         let mut extra = BTreeSet::new();
+        let mut merge_requests = Vec::new();
         if record.decision == "accept" {
             match self.land(
                 std::slice::from_ref(&item.hash),
                 &reviewed,
                 std::slice::from_ref(&record),
                 None,
+                &mut merge_requests,
             ) {
                 Err(error) if error.is::<SecretViolation>() => {
                     let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
@@ -1985,8 +2114,6 @@ impl Gate {
                     let problem = error.downcast::<Unmerged>()?;
                     record.decision = "escalate".into();
                     record.by = "gate".into();
-                    record.model = None;
-                    record.review = None;
                     if invalid_reply {
                         record.execution_error = Some("invalid-model-reply".into());
                     }
@@ -2009,6 +2136,14 @@ impl Gate {
                     item.note = note;
                 }
             }
+        }
+        if !merge_requests.is_empty() {
+            record
+                .provenance
+                .as_mut()
+                .context("Decision provenance is absent")?
+                .requests
+                .extend(merge_requests);
         }
         if record.reconsideration.is_some() && record.execution_error.is_some() {
             return Err(InvalidModelReply.into());
@@ -2038,6 +2173,7 @@ impl Gate {
             "gate",
             String::new(),
         );
+        record.provenance = Some(self.decision_provenance()?);
         record.configuration = Some(Rc::clone(&self.configuration));
         let paths = match self
             .pijul
@@ -2115,13 +2251,20 @@ impl Gate {
             return Ok(record);
         }
         self.require_current_main(main)?;
-        match self.model.review(&policy, &input)? {
+        let response = self.model.review(&policy, &input)?;
+        record
+            .provenance
+            .as_mut()
+            .context("Decision provenance is absent")?
+            .requests
+            .push(response.evidence);
+        record.model = Some(self.settings.model.clone());
+        match response.value {
             Some(verdict) => {
                 record.decision = verdict.decision;
                 record.summary = verdict.summary;
                 record.reason = verdict.reason;
                 record.by = "model".into();
-                record.model = Some(self.settings.model.clone());
                 record.review = Some(binding);
             }
             None => {
@@ -2141,6 +2284,7 @@ impl Gate {
         main: &ChannelSnapshot,
         records: &[Record],
         resolution: Option<ResolutionInput<'_>>,
+        merge_requests: &mut Vec<crate::provenance::RequestEvidence>,
     ) -> Result<Landing> {
         let entries = if let Some(input) = &resolution {
             input.pijul.log(&self.settings.main)?
@@ -2225,7 +2369,7 @@ impl Gate {
                 .into());
             }
             remaining.extend(reported.into_iter().filter(|r| files.contains_key(&r.path)));
-            Some(self.merge(&scratch, hashes, main, &remaining, &files)?)
+            Some(self.merge(&scratch, hashes, main, &remaining, &files, merge_requests)?)
         };
         // The native transaction checks main before it applies this candidate.
         let mut args: Vec<_> = hashes
@@ -2277,6 +2421,12 @@ impl Gate {
             )?);
             for record in &mut audit {
                 record.verification = Some(Rc::clone(&verification));
+                record
+                    .provenance
+                    .as_mut()
+                    .context("Decision provenance is absent")?
+                    .verifiers
+                    .nix = verification.observed_nix_version().map(str::to_owned);
             }
         }
         self.pijul
@@ -2384,6 +2534,7 @@ impl Gate {
         main: &ChannelSnapshot,
         report: &[Conflict],
         files: &BTreeMap<String, ConflictFile>,
+        requests: &mut Vec<crate::provenance::RequestEvidence>,
     ) -> Result<Record> {
         let other: BTreeSet<_> = report
             .iter()
@@ -2485,7 +2636,9 @@ impl Gate {
                 }
                 let mut labels: Vec<_> = choices.iter().map(|(label, _)| label.as_str()).collect();
                 labels.push("escalate");
-                let result = self.model.merge(&prompt, &labels)?.ok_or_else(|| {
+                let response = self.model.merge(&prompt, &labels)?;
+                requests.push(response.evidence);
+                let result = response.value.ok_or_else(|| {
                     anyhow::Error::new(InvalidModelReply).context(Unmerged(format!(
                         "The reply of {} for {path} is not one of the choices.",
                         self.settings.model
@@ -2566,6 +2719,9 @@ impl Gate {
             );
         }
         let mut record = Record::new(hash.into(), message, "merge", "model", reasons.join(" "));
+        let mut provenance = self.decision_provenance()?;
+        provenance.requests.clone_from(requests);
+        record.provenance = Some(provenance);
         record.model = Some(self.settings.model.clone());
         let policy = self
             .pijul
@@ -3003,6 +3159,7 @@ mod feature_tests {
             model_url: "http://127.0.0.1:9/v1".into(),
             model: "feature-test".into(),
             model_api: Api::OpenAi,
+            model_revision: None,
             policy: "POLICY.md".into(),
             protected: Vec::new(),
             max_change_chars: 100_000,
@@ -3542,6 +3699,7 @@ mod feature_tests {
                 model_url: format!("http://{address}/v1"),
                 model: "dry-run-test".into(),
                 model_api: Api::OpenAi,
+                model_revision: None,
                 policy: "POLICY.md".into(),
                 protected: Vec::new(),
                 max_change_chars: 100_000,

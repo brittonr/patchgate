@@ -1,9 +1,10 @@
-use std::io::Read;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use serde_json::{Value, json, value::RawValue};
+
+use crate::provenance::RequestEvidence;
 
 const REVIEW_RULES: &str = "You are patchgate. You guard the main channel of a Pijul repository.\n\
 You review one structured JSON object with schema_version 1, candidate, and binding fields. The candidate contains native metadata, paths, context files, and metadata_context.\n\
@@ -42,6 +43,21 @@ pub struct Verdict {
 pub struct MergeChoice {
     pub choice: String,
     pub reason: String,
+}
+
+#[derive(Debug)]
+pub struct Response<T> {
+    pub value: Option<T>,
+    pub evidence: RequestEvidence,
+}
+
+impl<T> Response<T> {
+    fn map<U>(self, parse: impl FnOnce(T) -> Option<U>) -> Response<U> {
+        Response {
+            value: self.value.and_then(parse),
+            evidence: self.evidence,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -86,10 +102,33 @@ pub struct Model {
     name: String,
     agent: ureq::Agent,
     api: Api,
+    declared_revision: Option<String>,
 }
 
 impl Model {
-    pub fn new(url: &str, name: &str, timeout: Duration, api: Api) -> Result<Self> {
+    pub fn new(
+        url: &str,
+        name: &str,
+        timeout: Duration,
+        api: Api,
+        declared_revision: Option<&str>,
+    ) -> Result<Self> {
+        ensure!(
+            !name.trim().is_empty()
+                && !name.chars().any(char::is_control)
+                && crate::secrets::scan_text("model name", name.as_bytes()).is_empty(),
+            "The model name is empty, unsafe, or contains supported credential data"
+        );
+        if let Some(revision) = declared_revision {
+            ensure!(
+                !revision.chars().any(char::is_control),
+                "The declared model revision contains control characters"
+            );
+            ensure!(
+                crate::secrets::scan_text("model revision", revision.as_bytes()).is_empty(),
+                "The declared model revision contains supported credential data"
+            );
+        }
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
@@ -104,10 +143,11 @@ impl Model {
             name: name.to_owned(),
             agent,
             api,
+            declared_revision: declared_revision.map(str::to_owned),
         })
     }
 
-    pub fn review(&self, policy: &str, state: &RawValue) -> Result<Option<Verdict>> {
+    pub fn review(&self, policy: &str, state: &RawValue) -> Result<Response<Verdict>> {
         if let Api::SystemOne = self.api {
             let criteria = json!({
                 "accept": "The change satisfies the policy. No reject or escalate rule applies.",
@@ -117,10 +157,12 @@ impl Model {
             let instructions = review_instructions(self.api, policy);
             return Ok(self
                 .systemone("review", &instructions, state, criteria)?
-                .map(|choice| Verdict {
-                    decision: choice.choice,
-                    summary: String::new(),
-                    reason: choice.reason,
+                .map(|choice| {
+                    Some(Verdict {
+                        decision: choice.choice,
+                        summary: String::new(),
+                        reason: choice.reason,
+                    })
                 }));
         }
         let schema = json!({
@@ -134,15 +176,16 @@ impl Model {
             "additionalProperties": false
         });
         let content = self.chat(
+            "review",
             &review_instructions(self.api, policy),
             state.get(),
             "verdict",
             schema,
         )?;
-        Ok(parse_verdict(&content))
+        Ok(content.map(|content| parse_verdict(&content)))
     }
 
-    pub fn merge(&self, prompt: &str, labels: &[&str]) -> Result<Option<MergeChoice>> {
+    pub fn merge(&self, prompt: &str, labels: &[&str]) -> Result<Response<MergeChoice>> {
         if let Api::SystemOne = self.api {
             let criteria = labels
                 .iter()
@@ -160,15 +203,23 @@ impl Model {
             "additionalProperties": false
         });
         let content = self.chat(
+            "merge",
             &format!("{MERGE_RULES}{MERGE_REPLY}"),
             prompt,
             "merge",
             schema,
         )?;
-        Ok(parse_merge(&content, labels))
+        Ok(content.map(|content| parse_merge(&content, labels)))
     }
 
-    fn chat(&self, system: &str, user: &str, name: &str, schema: Value) -> Result<Value> {
+    fn chat(
+        &self,
+        operation: &str,
+        system: &str,
+        user: &str,
+        name: &str,
+        schema: Value,
+    ) -> Result<Response<Value>> {
         let body = json!({
             "model": self.name,
             "temperature": 0,
@@ -181,13 +232,18 @@ impl Model {
                 "json_schema": {"name": name, "strict": true, "schema": schema}
             }
         });
-        let reply = self.post(&body)?;
-        response_content(reply).with_context(|| {
-            format!(
-                "{} gave a reply without choices[0].message.content",
-                self.url
-            )
-        })
+        let evidence = RequestEvidence::new(
+            operation,
+            "openai",
+            &self.name,
+            self.declared_revision.as_deref(),
+            &body["messages"],
+            &body["response_format"],
+        )?;
+        let value = self
+            .post(&body)?
+            .and_then(|reply| response_content(reply).ok());
+        Ok(Response { value, evidence })
     }
 
     fn systemone<S: Serialize>(
@@ -196,7 +252,7 @@ impl Model {
         instructions: &str,
         state: S,
         criteria: Value,
-    ) -> Result<Option<MergeChoice>> {
+    ) -> Result<Response<MergeChoice>> {
         #[derive(Serialize)]
         struct Request<'a, S> {
             model: &'a str,
@@ -217,36 +273,61 @@ impl Model {
             questions,
             truncate: false,
         };
-        let reply = self.post(&body)?;
-        systemone_choice(
-            &reply,
+        #[derive(Serialize)]
+        struct Prompt<'a, S> {
+            instructions: &'a str,
+            state: &'a S,
+        }
+        #[derive(Serialize)]
+        struct Schema<'a> {
+            criteria: &'a Value,
+            #[serde(rename = "type")]
+            kind: &'a Value,
+        }
+        let schema = Schema {
+            criteria: &body.questions[question]["criteria"],
+            kind: &body.questions[question]["type"],
+        };
+        let evidence = RequestEvidence::new(
             question,
-            body.questions[question]["criteria"]
-                .as_object()
-                .expect("choice criteria"),
-        )
-        .with_context(|| self.url.clone())
+            "systemone",
+            &self.name,
+            self.declared_revision.as_deref(),
+            &Prompt {
+                state: &body.state,
+                instructions,
+            },
+            &schema,
+        )?;
+        let value = self.post(&body)?.and_then(|reply| {
+            systemone_choice(
+                &reply,
+                question,
+                body.questions[question]["criteria"]
+                    .as_object()
+                    .expect("choice criteria"),
+            )
+            .ok()
+            .flatten()
+        });
+        Ok(Response { value, evidence })
     }
 
-    fn post(&self, body: &impl Serialize) -> Result<Value> {
+    fn post(&self, body: &impl Serialize) -> Result<Option<Value>> {
         let mut response = self
             .agent
             .post(&self.url)
             .send_json(body)
-            .with_context(|| self.url.clone())?;
+            .context("Model request failed")?;
         let status = response.status().as_u16();
         if status >= 400 {
-            let mut bytes = Vec::new();
-            response
-                .body_mut()
-                .as_reader()
-                .read_to_end(&mut bytes)
-                .with_context(|| self.url.clone())?;
-            let decoded = String::from_utf8_lossy(&bytes);
-            let detail: String = trim_python(&decoded).chars().take(300).collect();
-            bail!("{} answered HTTP {}: {}", self.url, status, detail);
+            bail!("Model server answered HTTP {status}");
         }
-        serde_json::from_reader(response.body_mut().as_reader()).with_context(|| self.url.clone())
+        match serde_json::from_reader(response.body_mut().as_reader()) {
+            Ok(reply) => Ok(Some(reply)),
+            Err(error) if error.is_io() => Err(error).context("Model response could not be read"),
+            Err(_) => Ok(None),
+        }
     }
 }
 
@@ -361,8 +442,214 @@ fn parse_merge(content: &Value, labels: &[&str]) -> Option<MergeChoice> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread::{self, JoinHandle};
+    use std::time::Instant;
+
+    use sha2::{Digest, Sha256};
+
+    pub(crate) fn reply_server(
+        status: u16,
+        reply: &str,
+    ) -> Result<(String, JoinHandle<Result<Value>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let url = format!("http://{}/v1", listener.local_addr()?);
+        let reply = reply.to_owned();
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        ensure!(Instant::now() < deadline, "No model request arrived");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            let mut length = None;
+            loop {
+                line.clear();
+                ensure!(
+                    stream.read_line(&mut line)? > 0,
+                    "The request is incomplete"
+                );
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = Some(value.trim().parse::<usize>()?);
+                    }
+                }
+            }
+            let mut bytes = vec![0; length.context("The request has no length")?];
+            stream.read_exact(&mut bytes)?;
+            let body = serde_json::from_slice(&bytes)?;
+            if status != 0 {
+                write!(
+                    stream.get_mut(),
+                    "HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )?;
+            }
+            Ok(body)
+        });
+        Ok((url, worker))
+    }
+
+    fn sha256(value: &Value) -> String {
+        format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
+    }
+
+    #[test]
+    fn provenance_binds_the_actual_requests_for_each_api_and_operation() -> Result<()> {
+        for api in [Api::OpenAi, Api::SystemOne] {
+            for operation in ["review", "merge"] {
+                let answer = match (api, operation) {
+                    (Api::OpenAi, "review") => json!({"choices": [{"message": {
+                        "content": "{\"decision\":\"accept\",\"summary\":\"Safe.\",\"reason\":\"Rule.\"}"
+                    }}]}),
+                    (Api::OpenAi, _) => json!({"choices": [{"message": {
+                        "content": "{\"choice\":\"keep both\",\"reason\":\"Both apply.\"}"
+                    }}]}),
+                    (Api::SystemOne, _) => json!({"answers": {operation: {
+                        "type": "choice",
+                        "choice": if operation == "review" { "accept" } else { "keep both" },
+                        "confidence": 0.75
+                    }}}),
+                };
+                let (url, worker) = reply_server(200, &answer.to_string())?;
+                let model = Model::new(
+                    &url,
+                    "model",
+                    Duration::from_secs(5),
+                    api,
+                    Some("revision-7"),
+                )?;
+                let evidence = if operation == "review" {
+                    let state = RawValue::from_string("{\"candidate\":\"PRIVATE_STATE\"}".into())?;
+                    let response = model.review("PRIVATE_POLICY", &state)?;
+                    assert_eq!(response.value.unwrap().decision, "accept");
+                    response.evidence
+                } else {
+                    let response = model.merge("PRIVATE_CONFLICT", &["keep both", "escalate"])?;
+                    assert_eq!(response.value.unwrap().choice, "keep both");
+                    response.evidence
+                };
+                let request = worker.join().expect("The model fixture panicked")?;
+                let (prompt, schema, api_name) = match api {
+                    Api::OpenAi => (
+                        request["messages"].clone(),
+                        request["response_format"].clone(),
+                        "openai",
+                    ),
+                    Api::SystemOne => (
+                        json!({
+                            "instructions": request["questions"][operation]["instructions"],
+                            "state": request["state"],
+                        }),
+                        json!({
+                            "type": request["questions"][operation]["type"],
+                            "criteria": request["questions"][operation]["criteria"],
+                        }),
+                        "systemone",
+                    ),
+                };
+                assert_eq!(evidence.operation, operation);
+                assert_eq!(evidence.api, api_name);
+                assert_eq!(evidence.model, request["model"]);
+                assert_eq!(evidence.declared_revision.as_deref(), Some("revision-7"));
+                assert!(!evidence.revision_verified);
+                assert_eq!(evidence.prompt_sha256, sha256(&prompt));
+                assert_eq!(evidence.schema_sha256, sha256(&schema));
+                let encoded = serde_json::to_string(&evidence)?;
+                for private in ["PRIVATE_STATE", "PRIVATE_POLICY", "PRIVATE_CONFLICT"] {
+                    assert!(!encoded.contains(private));
+                }
+                assert!(!encoded.contains(&url));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_successful_replies_retain_request_evidence() -> Result<()> {
+        for api in [Api::OpenAi, Api::SystemOne] {
+            for operation in ["review", "merge"] {
+                for reply in [
+                    "PRIVATE_INVALID_PAYLOAD",
+                    "{}",
+                    r#"{"choices":[{"message":{"content":"PRIVATE_INVALID_PAYLOAD"}}],"answers":{"review":{"type":"choice","choice":"unknown","confidence":1},"merge":{"type":"choice","choice":"unknown","confidence":1}}}"#,
+                ] {
+                    let (url, worker) = reply_server(200, reply)?;
+                    let model = Model::new(&url, "model", Duration::from_secs(5), api, None)?;
+                    let evidence = if operation == "review" {
+                        let state = RawValue::from_string("{}".into())?;
+                        let response = model.review("Accept safe changes.", &state)?;
+                        assert!(response.value.is_none());
+                        response.evidence
+                    } else {
+                        let response = model.merge("Conflict.", &["keep both", "escalate"])?;
+                        assert!(response.value.is_none());
+                        response.evidence
+                    };
+                    worker.join().expect("The model fixture panicked")?;
+                    assert_eq!(evidence.operation, operation);
+                    assert_eq!(evidence.declared_revision, None);
+                    assert!(!evidence.revision_verified);
+                    assert!(!serde_json::to_string(&evidence)?.contains("PRIVATE_INVALID_PAYLOAD"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn transport_and_http_failures_remain_errors() -> Result<()> {
+        for api in [Api::OpenAi, Api::SystemOne] {
+            for status in [0, 503] {
+                for operation in ["review", "merge"] {
+                    let (url, worker) = reply_server(status, "PRIVATE_SERVER_PAYLOAD")?;
+                    let model = Model::new(&url, "model", Duration::from_secs(5), api, None)?;
+                    let error = if operation == "review" {
+                        let state = RawValue::from_string("{}".into())?;
+                        model.review("Accept safe changes.", &state).unwrap_err()
+                    } else {
+                        model.merge("Conflict.", &["escalate"]).unwrap_err()
+                    };
+                    worker.join().expect("The model fixture panicked")?;
+                    assert!(!format!("{error:#}").contains("PRIVATE_SERVER_PAYLOAD"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn declared_revisions_refuse_controls_and_supported_credentials() {
+        let credential = ["-----BEGIN OPENSSH ", "PRIVATE KEY-----"].concat();
+        for revision in ["revision\n7", "revision\u{0}7", credential.as_str()] {
+            let error = Model::new(
+                "http://127.0.0.1:1/v1",
+                "model",
+                Duration::from_secs(1),
+                Api::OpenAi,
+                Some(revision),
+            )
+            .err()
+            .expect("An unsafe revision must fail");
+            assert!(!format!("{error:#}").contains(revision));
+        }
+    }
 
     #[test]
     fn review_instruction_count_uses_exact_api_text() {

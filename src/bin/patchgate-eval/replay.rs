@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Component;
 use std::sync::Arc;
 
@@ -33,6 +33,18 @@ pub struct ReplayArgs {
     pub max_label_mismatches: Option<usize>,
     #[arg(long)]
     pub max_regressions: Option<usize>,
+    #[arg(long, value_parser = release_gate::parse_requirement)]
+    pub min_policy_rule: Vec<release_gate::Requirement>,
+    #[arg(long, value_parser = release_gate::parse_requirement)]
+    pub min_conflict_kind: Vec<release_gate::Requirement>,
+    #[arg(long)]
+    pub bundle_signature: Option<PathBuf>,
+    #[arg(long)]
+    pub baseline_signature: Option<PathBuf>,
+    #[arg(long)]
+    pub allowed_signers: Option<PathBuf>,
+    #[arg(long)]
+    pub signer: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -93,6 +105,66 @@ struct Case {
     snapshot: Option<Value>,
     #[serde(default)]
     labels: Vec<Value>,
+    #[serde(default)]
+    tags: Vec<TagRecord>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TagRecord {
+    user: String,
+    time: String,
+    reason: String,
+    policy_rules: Vec<String>,
+    conflict_kinds: Vec<String>,
+}
+
+fn valid_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag.len() <= 64
+        && tag.as_bytes()[0].is_ascii_lowercase()
+        && tag.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn validate_tag_history(tags: &[TagRecord]) -> Result<()> {
+    for record in tags {
+        ensure!(
+            [&record.user, &record.reason]
+                .iter()
+                .all(|value| { !value.trim().is_empty() && !value.chars().any(char::is_control) })
+                && chrono::DateTime::parse_from_rfc3339(&record.time).is_ok(),
+            "Human tags need a valid user, time, and explicit reason."
+        );
+        for set in [&record.policy_rules, &record.conflict_kinds] {
+            let mut unique = BTreeSet::new();
+            ensure!(
+                set.iter().all(|tag| valid_tag(tag) && unique.insert(tag)),
+                "Human tags must use unique lowercase identifiers."
+            );
+        }
+        for value in [&record.user, &record.reason]
+            .into_iter()
+            .chain(&record.policy_rules)
+            .chain(&record.conflict_kinds)
+        {
+            ensure!(
+                crate::secrets::scan_text("[case.tags]", value.as_bytes()).is_empty(),
+                "The human tags contain credential data."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn capture_identity(case: &Case) -> Option<String> {
+    case.snapshot.as_ref().map(|snapshot| {
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(snapshot).expect("JSON snapshot"))
+        )
+    })
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,6 +212,8 @@ struct Comparison {
     configuration: Configuration,
     snapshot: Option<Value>,
     labels: Vec<Value>,
+    #[serde(default)]
+    tags: Vec<TagRecord>,
 }
 
 impl Comparison {
@@ -169,6 +243,7 @@ impl Comparison {
             configuration: case.configuration.as_ref().unwrap_or(default).clone(),
             snapshot: case.snapshot.clone(),
             labels: case.labels.clone(),
+            tags: case.tags.clone(),
         }
     }
 
@@ -222,6 +297,67 @@ struct Report {
     bundle_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gate: Option<release_gate::GateResult>,
+    signatures: SignatureEvidence,
+}
+
+#[derive(Default, Serialize)]
+struct SignatureEvidence {
+    strict: bool,
+    bundle: Option<crate::artifact::Verified>,
+    baseline: Option<crate::artifact::Verified>,
+}
+
+fn strict_signatures(args: &ReplayArgs) -> Result<bool> {
+    let strict = args.bundle_signature.is_some()
+        || args.baseline_signature.is_some()
+        || args.allowed_signers.is_some()
+        || args.signer.is_some();
+    if strict {
+        ensure!(
+            args.bundle.is_some() || args.baseline.is_some(),
+            "Signature options need a bundle or baseline input."
+        );
+        ensure!(
+            args.allowed_signers.is_some()
+                && args
+                    .signer
+                    .as_ref()
+                    .is_some_and(|identity| !identity.trim().is_empty()),
+            "Signature mode needs an explicit allowed-signers file and signer identity."
+        );
+        ensure!(
+            args.bundle.is_some() == args.bundle_signature.is_some()
+                && args.baseline.is_some() == args.baseline_signature.is_some(),
+            "Signature mode needs one signature for each selected bundle and baseline."
+        );
+    }
+    Ok(strict)
+}
+
+fn signature_trust(args: &ReplayArgs, signature: &Path) -> crate::artifact::Trust {
+    crate::artifact::Trust {
+        signature: signature.into(),
+        allowed_signers: args
+            .allowed_signers
+            .as_ref()
+            .expect("validated trust")
+            .clone(),
+        identity: args.signer.as_ref().expect("validated trust").clone(),
+    }
+}
+
+fn baseline_input(
+    path: &Path,
+    trust: Option<&crate::artifact::Trust>,
+) -> Result<(release_gate::Baseline, Option<crate::artifact::Verified>)> {
+    let bytes = release_gate::baseline_bytes(path)?;
+    let verified = trust
+        .map(|trust| {
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            crate::artifact::verify_digest(crate::artifact::Kind::Baseline, &digest, trust)
+        })
+        .transpose()?;
+    Ok((release_gate::read_baseline(&bytes)?, verified))
 }
 
 fn valid_hash(hash: &str) -> bool {
@@ -285,12 +421,24 @@ fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
         "PATCHGATE_POLICY must name a relative file outside .pijul."
     );
     let mut ids = BTreeSet::new();
+    let mut captures = BTreeMap::new();
     for case in &manifest.cases {
         validate_configuration(
             case.configuration
                 .as_ref()
                 .unwrap_or(&manifest.configuration),
         )?;
+        validate_tag_history(&case.tags)?;
+        if let Some(identity) = capture_identity(case) {
+            if let Some((tags, labels, expected)) =
+                captures.insert(identity, (&case.tags, &case.labels, case.expected))
+            {
+                ensure!(
+                    tags == &case.tags && labels == &case.labels && expected == case.expected,
+                    "Duplicate captures must use the same human tag and label histories."
+                );
+            }
+        }
         for label in &case.labels {
             ensure!(
                 label["user"]
@@ -1042,6 +1190,12 @@ fn trusted_runtime_path() -> Result<std::ffi::OsString> {
 }
 
 pub fn run(args: ReplayArgs) -> Result<()> {
+    let strict = strict_signatures(&args)?;
+    release_gate::validate_requirements(&args)?;
+    let mut signatures = SignatureEvidence {
+        strict,
+        ..SignatureEvidence::default()
+    };
     let input = args
         .manifest
         .as_deref()
@@ -1052,11 +1206,42 @@ pub fn run(args: ReplayArgs) -> Result<()> {
         "Replay needs exactly one manifest or bundle."
     );
     let manifest_path = fs::canonicalize(input).context("Read the replay input path.")?;
+    let authenticated = args
+        .bundle_signature
+        .as_ref()
+        .map(|signature| {
+            crate::artifact::snapshot(
+                input,
+                crate::artifact::Kind::Bundle,
+                &signature_trust(&args, signature),
+            )
+        })
+        .transpose()?;
     let mut loaded = args
         .bundle
         .as_ref()
-        .map(|_| crate::bundle::load(&manifest_path))
+        .map(|_| {
+            crate::bundle::load(authenticated.as_ref().map_or(
+                manifest_path.as_path(),
+                crate::artifact::VerifiedSnapshot::path,
+            ))
+        })
         .transpose()?;
+    signatures.bundle = authenticated.map(|snapshot| snapshot.verified);
+    let baseline = args.baseline.as_deref().map(|path| {
+        let trust = args
+            .baseline_signature
+            .as_ref()
+            .map(|signature| signature_trust(&args, signature));
+        let (baseline, verified) = baseline_input(path, trust.as_ref())?;
+        signatures.baseline = verified;
+        Ok(baseline)
+    });
+    if strict {
+        if let Some(Err(error)) = &baseline {
+            bail!("The signed baseline is not valid: {error:#}");
+        }
+    }
     let mut manifest: Manifest = match &mut loaded {
         Some(bundle) => serde_json::from_value(std::mem::take(&mut bundle.manifest)),
         None => serde_json::from_slice(&fs::read(&manifest_path)?),
@@ -1082,7 +1267,6 @@ pub fn run(args: ReplayArgs) -> Result<()> {
             (source.clone(), source)
         }
     };
-    let baseline = args.baseline.as_deref().map(release_gate::read_baseline);
     let report_path = args
         .report
         .as_deref()
@@ -1220,6 +1404,7 @@ pub fn run(args: ReplayArgs) -> Result<()> {
         authorizes_acceptance: false,
         bundle_sha256: loaded.as_ref().map(|bundle| bundle.sha256.clone()),
         gate,
+        signatures,
     };
     let mut text = serde_json::to_string_pretty(&report)?;
     text.push('\n');
@@ -1324,6 +1509,50 @@ mod tests {
         assert!(validate(&manifest, "POLICY.md").is_err());
         manifest.cases[0].expected = Label::Reject;
         manifest.cases[0].snapshot.as_mut().unwrap()["base"] = json!(["B".repeat(53)]);
+        assert!(validate(&manifest, "POLICY.md").is_err());
+    }
+
+    #[test]
+    fn duplicate_capture_tag_histories_must_match() {
+        let mut manifest = fixture();
+        manifest.cases[0].snapshot = Some(json!({
+            "base": [], "candidate": manifest.cases[0].candidate,
+            "main": "main", "inbox": "inbox",
+            "configuration": {"values": manifest.configuration},
+        }));
+        manifest.cases[0].labels = vec![json!({
+            "user": "reviewer", "time": "2026-10-21T00:00:00Z",
+            "expected": "reject", "reason": "The reviewer rejects the change.",
+        })];
+        manifest.cases[0].tags = vec![TagRecord {
+            user: "reviewer".into(),
+            time: "2026-10-21T00:00:00Z".into(),
+            reason: "The reviewer identifies the rule.".into(),
+            policy_rules: vec!["protected-path".into()],
+            conflict_kinds: Vec::new(),
+        }];
+        let duplicate: Case = serde_json::from_value(json!({
+            "id": "duplicate", "base": manifest.cases[0].base,
+            "candidate": manifest.cases[0].candidate, "expected": "reject",
+            "snapshot": manifest.cases[0].snapshot, "labels": manifest.cases[0].labels,
+            "tags": manifest.cases[0].tags,
+        }))
+        .unwrap();
+        manifest.cases.push(duplicate);
+        assert!(validate(&manifest, "POLICY.md").is_ok());
+        let comparison = Comparison::new(
+            &manifest.cases[0],
+            &manifest.variants[0],
+            &manifest.configuration,
+        );
+        assert_eq!(
+            serde_json::to_value(&comparison).unwrap()["tags"],
+            json!(manifest.cases[0].tags)
+        );
+        manifest.cases[1].tags[0].policy_rules.clear();
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[1].tags = manifest.cases[0].tags.clone();
+        manifest.cases[1].tags[0].reason = "Line\nbreak".into();
         assert!(validate(&manifest, "POLICY.md").is_err());
     }
 
@@ -1508,6 +1737,7 @@ mod tests {
             configuration: None,
             snapshot: None,
             labels: Vec::new(),
+            tags: Vec::new(),
         };
         let source_path = fs::canonicalize(&source.path)?;
         let states: Vec<Value> = serde_json::from_str(&source.pijul(&[
@@ -1854,6 +2084,166 @@ mod input_tests {
     }
 
     #[test]
+    fn strict_signature_options_require_each_selected_artifact() {
+        for arguments in [
+            vec!["replay", "manifest.json", "--signer", "reviewer"],
+            vec![
+                "replay",
+                "manifest.json",
+                "--baseline",
+                "baseline.json",
+                "--signer",
+                "reviewer",
+            ],
+            vec![
+                "replay",
+                "--bundle",
+                "cases.tar.gz",
+                "--allowed-signers",
+                "reviewers",
+                "--signer",
+                "reviewer",
+            ],
+            vec![
+                "replay",
+                "--bundle",
+                "cases.tar.gz",
+                "--bundle-signature",
+                "bundle.sig",
+            ],
+            vec![
+                "replay",
+                "manifest.json",
+                "--baseline-signature",
+                "baseline.sig",
+                "--allowed-signers",
+                "reviewers",
+                "--signer",
+                "reviewer",
+            ],
+            vec![
+                "replay",
+                "--bundle",
+                "cases.tar.gz",
+                "--baseline",
+                "baseline.json",
+                "--bundle-signature",
+                "bundle.sig",
+                "--allowed-signers",
+                "reviewers",
+                "--signer",
+                "reviewer",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(strict_signatures(&cli.replay).is_err());
+        }
+        for arguments in [
+            vec![
+                "replay",
+                "manifest.json",
+                "--baseline",
+                "baseline.json",
+                "--baseline-signature",
+                "baseline.sig",
+                "--allowed-signers",
+                "reviewers",
+                "--signer",
+                "reviewer",
+            ],
+            vec![
+                "replay",
+                "--bundle",
+                "cases.tar.gz",
+                "--bundle-signature",
+                "bundle.sig",
+                "--allowed-signers",
+                "reviewers",
+                "--signer",
+                "reviewer",
+            ],
+            vec![
+                "replay",
+                "--bundle",
+                "cases.tar.gz",
+                "--baseline",
+                "baseline.json",
+                "--bundle-signature",
+                "bundle.sig",
+                "--baseline-signature",
+                "baseline.sig",
+                "--allowed-signers",
+                "reviewers",
+                "--signer",
+                "reviewer",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            assert!(strict_signatures(&cli.replay).unwrap());
+        }
+        let cli = Cli::try_parse_from(["replay", "manifest.json"]).unwrap();
+        assert!(!strict_signatures(&cli.replay).unwrap());
+    }
+
+    #[test]
+    fn signature_failure_precedes_manifest_and_native_replay() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let manifest = directory.path().join("manifest.json");
+        let baseline = directory.path().join("baseline.json");
+        let signature = directory.path().join("baseline.sig");
+        let allowed = directory.path().join("reviewers");
+        let report = directory.path().join("report.json");
+        fs::write(&manifest, b"{}")?;
+        fs::write(&baseline, b"{}")?;
+        fs::write(&signature, b"invalid signature")?;
+        fs::write(&allowed, b"invalid trust")?;
+        let cli = Cli::try_parse_from([
+            std::ffi::OsStr::new("replay"),
+            manifest.as_os_str(),
+            std::ffi::OsStr::new("--baseline"),
+            baseline.as_os_str(),
+            std::ffi::OsStr::new("--baseline-signature"),
+            signature.as_os_str(),
+            std::ffi::OsStr::new("--allowed-signers"),
+            allowed.as_os_str(),
+            std::ffi::OsStr::new("--signer"),
+            std::ffi::OsStr::new("reviewer"),
+            std::ffi::OsStr::new("--report"),
+            report.as_os_str(),
+        ])?;
+        let error = run(cli.replay).unwrap_err();
+        assert!(format!("{error:#}").starts_with("The signed baseline is not valid:"));
+        assert!(!report.exists());
+        assert_eq!(fs::read(&manifest)?, b"{}");
+        assert_eq!(fs::read(&baseline)?, b"{}");
+        Ok(())
+    }
+
+    #[test]
+    fn coverage_cli_repeats_and_rejects_malformed_requirements() {
+        let cli = Cli::try_parse_from([
+            "replay",
+            "manifest.json",
+            "--min-policy-rule",
+            "protected-path=2",
+            "--min-policy-rule",
+            "review=0",
+            "--min-conflict-kind",
+            "content=1",
+        ])
+        .unwrap();
+        assert_eq!(cli.replay.min_policy_rule.len(), 2);
+        assert_eq!(cli.replay.min_conflict_kind.len(), 1);
+        assert!(
+            Cli::try_parse_from(["replay", "manifest.json", "--min-policy-rule", "bad"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["replay", "manifest.json", "--min-conflict-kind", "Bad=1"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn portable_native_replay_preserves_origin_after_source_deletion() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let root = fs::canonicalize(directory.path())?;
@@ -1928,6 +2318,65 @@ mod input_tests {
             .is_err()
         );
         assert!(!origin.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn signed_baseline_uses_one_snapshot_and_retains_trust_evidence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let key = root.join("reviewer");
+        checked_output(
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&key)
+                .output()?,
+            "Create the review key",
+        )?;
+        let allowed = root.join("allowed-signers");
+        fs::write(
+            &allowed,
+            format!(
+                "reviewer {}",
+                fs::read_to_string(key.with_extension("pub"))?
+            ),
+        )?;
+        let path = root.join("baseline.json");
+        let bytes = serde_json::to_vec(&json!({
+            "schema_version": 1, "repository": "/captured/source",
+            "main": "main", "inbox": "inbox", "variants": [], "comparisons": [],
+            "authorizes_acceptance": false,
+        }))?;
+        fs::write(&path, &bytes)?;
+        let signature = root.join("baseline.sig");
+        crate::artifact::sign(
+            &root,
+            &path,
+            crate::artifact::Kind::Baseline,
+            &key,
+            &signature,
+        )?;
+        let trust = crate::artifact::Trust {
+            signature,
+            allowed_signers: allowed,
+            identity: "reviewer".into(),
+        };
+        let (_baseline, verified) = baseline_input(&path, Some(&trust))?;
+        fs::write(&path, b"replacement report")?;
+        let verified = verified.unwrap();
+        assert_eq!(verified.sha256, format!("{:x}", Sha256::digest(&bytes)));
+        assert_eq!(verified.identity, "reviewer");
+        assert!(!verified.authorizes_acceptance);
+        assert!(baseline_input(&path, Some(&trust)).is_err());
+        let evidence = SignatureEvidence {
+            strict: true,
+            bundle: None,
+            baseline: Some(verified),
+        };
+        let json = serde_json::to_value(evidence)?;
+        assert_eq!(json["baseline"]["identity"], "reviewer");
+        assert_eq!(json["baseline"]["authorizes_acceptance"], false);
+        assert_eq!(json["baseline"]["namespace"], "patchgate-baseline-v1");
         Ok(())
     }
 }
