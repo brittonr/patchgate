@@ -17,6 +17,8 @@ const REVIEW_REPLY: &str = "Reply with a JSON object:\n\
 - \"summary\": one sentence that tells what the change does.\n\
 - \"reason\": the policy rule that decides, and the evidence in the change.\n\
 Use \"escalate\" when you are not sure, or when the policy does not cover the change.\n";
+const SYSTEMONE_REVIEW_REPLY: &str =
+    "Use escalate when you are not sure, or when the policy does not cover the change.\n";
 
 const MERGE_RULES: &str = "You are patchgate. You decide how to merge one conflict between Pijul changes.\n\
 Two or more changes edited the same place in a file, and no change knew about the others. You get the file, the kind of conflict, what each change did in the file, the lines around the conflict, and each side of the conflict.\n\
@@ -60,6 +62,25 @@ impl std::str::FromStr for Api {
     }
 }
 
+fn review_instruction_parts(api: Api) -> [&'static str; 3] {
+    match api {
+        Api::OpenAi => [REVIEW_RULES, REVIEW_REPLY, "\nPolicy:\n\n"],
+        Api::SystemOne => [REVIEW_RULES, SYSTEMONE_REVIEW_REPLY, "Policy:\n\n"],
+    }
+}
+
+fn review_instructions(api: Api, policy: &str) -> String {
+    let [rules, reply, header] = review_instruction_parts(api);
+    [rules, reply, header, policy].concat()
+}
+
+pub fn review_instruction_chars(api: Api) -> usize {
+    review_instruction_parts(api)
+        .iter()
+        .map(|part| part.chars().count())
+        .sum()
+}
+
 pub struct Model {
     url: String,
     name: String,
@@ -93,9 +114,7 @@ impl Model {
                 "reject": "The change violates a reject rule in the policy.",
                 "escalate": "A human must decide. The policy requires review, does not cover the change, or the answer is uncertain."
             });
-            let instructions = format!(
-                "{REVIEW_RULES}Use escalate when you are not sure, or when the policy does not cover the change.\nPolicy:\n\n{policy}"
-            );
+            let instructions = review_instructions(self.api, policy);
             return Ok(self
                 .systemone("review", &instructions, state, criteria)?
                 .map(|choice| Verdict {
@@ -115,7 +134,7 @@ impl Model {
             "additionalProperties": false
         });
         let content = self.chat(
-            &format!("{REVIEW_RULES}{REVIEW_REPLY}\nPolicy:\n\n{policy}"),
+            &review_instructions(self.api, policy),
             state.get(),
             "verdict",
             schema,
@@ -344,6 +363,31 @@ fn parse_merge(content: &Value, labels: &[&str]) -> Option<MergeChoice> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_instruction_count_uses_exact_api_text() {
+        let policy = "保護 café 🛡\n";
+        for api in [Api::OpenAi, Api::SystemOne] {
+            assert_eq!(
+                review_instruction_chars(api),
+                review_instructions(api, "").chars().count()
+            );
+            assert_eq!(
+                review_instructions(api, policy).chars().count(),
+                review_instruction_chars(api) + policy.chars().count()
+            );
+        }
+        assert_eq!(
+            review_instructions(Api::OpenAi, policy),
+            format!("{REVIEW_RULES}{REVIEW_REPLY}\nPolicy:\n\n{policy}")
+        );
+        assert_eq!(
+            review_instructions(Api::SystemOne, policy),
+            format!(
+                "{REVIEW_RULES}Use escalate when you are not sure, or when the policy does not cover the change.\nPolicy:\n\n{policy}"
+            )
+        );
+    }
 
     #[test]
     fn verdict_accepts_wrapped_json_and_trims_fields() {

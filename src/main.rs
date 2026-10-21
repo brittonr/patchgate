@@ -1,10 +1,14 @@
+mod budget;
+mod cases;
 mod change;
+mod configuration;
 mod doctor;
 mod gate;
 mod isolation;
 mod model;
 mod pijul;
 mod protected;
+mod resolution;
 mod review;
 mod secrets;
 mod verify;
@@ -58,6 +62,35 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Report complete review context costs without a model request.
+    Budget {
+        change: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prepare an isolated workspace for a human resolution.
+    Resolve {
+        change: String,
+        #[arg(long)]
+        workspace: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Review an earlier gate or model decision without loss of its evidence.
+    Reconsider {
+        change: String,
+        #[arg(short = 'm', long)]
+        reason: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Capture, label, and export historical replay cases.
+    Cases {
+        #[command(subcommand)]
+        command: CaseCommand,
+    },
     /// Review and merge the pending changes one time.
     Review {
         /// Review in isolation without source acceptance.
@@ -80,7 +113,11 @@ enum Command {
     /// Accept a change and the conflicting changes that it resolves.
     Accept {
         /// The change hash, or the start of the hash.
-        change: String,
+        #[arg(required_unless_present = "resolution", conflicts_with = "resolution")]
+        change: Option<String>,
+        /// Accept the edited workspace against its original main state.
+        #[arg(long, required_unless_present = "change", conflicts_with = "change")]
+        resolution: Option<PathBuf>,
         /// The reason for the decision.
         #[arg(short = 'm', long)]
         reason: Option<String>,
@@ -98,6 +135,42 @@ enum Command {
         /// The number of records to show.
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CaseCommand {
+    /// Capture the current main snapshot for one pending change.
+    Capture {
+        change: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show captured snapshots and human label state.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append an explicit human label.
+    Label {
+        case: String,
+        #[arg(value_enum)]
+        expected: cases::Label,
+        #[arg(short = 'm', long)]
+        reason: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export labeled cases and explicit model variants for replay.
+    Export {
+        #[arg(long)]
+        variants: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long = "case")]
+        cases: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -214,6 +287,90 @@ fn show_review(report: &gate::ReviewReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn label_name(label: cases::Label) -> &'static str {
+    match label {
+        cases::Label::Accept => "accept",
+        cases::Label::Reject => "reject",
+        cases::Label::Escalate => "escalate",
+    }
+}
+
+fn show_case(record: &cases::CaseRecord, json: bool) -> Result<()> {
+    if json {
+        return print_json(record);
+    }
+    let label = record
+        .labels
+        .last()
+        .map(|label| label_name(label.expected))
+        .unwrap_or("unlabeled");
+    println!(
+        "{}  {}  {label}",
+        record.id,
+        short(&record.snapshot.candidate)
+    );
+    Ok(())
+}
+
+fn run_cases(settings: Settings, command: CaseCommand) -> Result<()> {
+    match command {
+        CaseCommand::Capture { change, json } => {
+            show_case(&Gate::capture_case(settings, &change)?, json)?;
+        }
+        CaseCommand::List { json } => {
+            let records = cases::Store::new(&settings.repo).list()?;
+            if json {
+                #[derive(serde::Serialize)]
+                struct CasesReport<'a> {
+                    schema_version: u8,
+                    cases: &'a [cases::CaseRecord],
+                }
+                print_json(&CasesReport {
+                    schema_version: 1,
+                    cases: &records,
+                })?;
+            } else {
+                for record in &records {
+                    show_case(record, false)?;
+                }
+                if records.is_empty() {
+                    println!("No replay cases exist.");
+                }
+            }
+        }
+        CaseCommand::Label {
+            case,
+            expected,
+            reason,
+            json,
+        } => {
+            let record = cases::Store::new(&settings.repo).label(&case, expected, &reason)?;
+            show_case(&record, json)?;
+        }
+        CaseCommand::Export {
+            variants,
+            output,
+            cases,
+            json,
+        } => {
+            let report = cases::Store::new(&settings.repo).export(&cases, &variants, &output)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "Exported labeled replay cases to {}.",
+                    report.output.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn quote_path(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
 fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result<()> {
     match command {
         Command::Init => {
@@ -273,6 +430,63 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 show_explanation(&explanation)?;
             }
         }
+        Command::Budget { change, json } => {
+            let report = Gate::budget(settings, &change)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                budget::show(&report);
+            }
+        }
+        Command::Resolve {
+            change,
+            workspace,
+            json,
+        } => {
+            let repository = settings.repo.clone();
+            let prepared = Gate::prepare_resolution(settings, &change, &workspace)?;
+            if json {
+                #[derive(serde::Serialize)]
+                struct ResolutionReport<'a> {
+                    schema_version: u8,
+                    authorizes_acceptance: bool,
+                    prepared: &'a resolution::Prepared,
+                }
+                print_json(&ResolutionReport {
+                    schema_version: 1,
+                    authorizes_acceptance: false,
+                    prepared: &prepared,
+                })?;
+            } else {
+                println!("Resolution: {}", prepared.id);
+                println!("Workspace: {}", prepared.workspace.display());
+                println!("Conflicts: {}", prepared.conflicts.len());
+                if let Some(policy) = &prepared.policy_file {
+                    println!("Trusted policy: {}", policy.display());
+                }
+                println!("Native review: {}", prepared.review_file.display());
+                println!("Edit tracked files. Use pijul add for new files.");
+                println!(
+                    "Accept explicitly: patchgate --repo {} accept --resolution {}",
+                    quote_path(&repository),
+                    quote_path(&prepared.workspace),
+                );
+            }
+        }
+        Command::Reconsider {
+            change,
+            reason,
+            dry_run,
+            json,
+        } => {
+            let report = if dry_run {
+                Gate::reconsider_dry_run(settings, &change, &reason)?
+            } else {
+                Gate::new(settings)?.reconsider(&change, &reason)?
+            };
+            show_review(&report, json)?;
+        }
+        Command::Cases { command } => run_cases(settings, command)?,
         Command::Doctor { json } => {
             let report = doctor::inspect(&settings)?;
             if json {
@@ -335,9 +549,22 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 }
             }
         }
-        Command::Accept { change, reason } => {
+        Command::Accept {
+            change,
+            resolution,
+            reason,
+        } => {
             let mut gate = Gate::new(settings)?;
-            show(&gate.decide_by_hand(&change, "accept", reason.as_deref())?)
+            let item = if let Some(workspace) = resolution {
+                gate.accept_resolution(&workspace, reason.as_deref())?
+            } else {
+                gate.decide_by_hand(
+                    &change.context("Give a change or a resolution workspace")?,
+                    "accept",
+                    reason.as_deref(),
+                )?
+            };
+            show(&item);
         }
         Command::Reject { change, reason } => {
             let mut gate = Gate::new(settings)?;

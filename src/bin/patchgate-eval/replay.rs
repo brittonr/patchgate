@@ -1,8 +1,9 @@
 use super::support::*;
 use clap::Args;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Component;
 use std::sync::Arc;
@@ -29,14 +30,14 @@ struct Manifest {
     configuration: Configuration,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct Configuration {
     policy_path: String,
     protected: Vec<String>,
     max_change_chars: usize,
-    timeout_seconds: u64,
-    check_timeout_seconds: u64,
+    timeout_seconds: f64,
+    check_timeout_seconds: f64,
 }
 
 impl Default for Configuration {
@@ -45,8 +46,8 @@ impl Default for Configuration {
             policy_path: "POLICY.md".into(),
             protected: Vec::new(),
             max_change_chars: 8000,
-            timeout_seconds: 300,
-            check_timeout_seconds: 900,
+            timeout_seconds: 300.0,
+            check_timeout_seconds: 900.0,
         }
     }
 }
@@ -66,6 +67,12 @@ struct Case {
     base: Vec<String>,
     candidate: String,
     expected: Label,
+    #[serde(default)]
+    configuration: Option<Configuration>,
+    #[serde(default)]
+    snapshot: Option<Value>,
+    #[serde(default)]
+    labels: Vec<Value>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,10 +117,13 @@ struct Comparison {
     exit_code: Option<i32>,
     stderr: String,
     evidence: Option<Value>,
+    configuration: Configuration,
+    snapshot: Option<Value>,
+    labels: Vec<Value>,
 }
 
 impl Comparison {
-    fn new(case: &Case, variant: &Variant) -> Self {
+    fn new(case: &Case, variant: &Variant, default: &Configuration) -> Self {
         Self {
             case_id: case.id.clone(),
             variant_id: variant.id.clone(),
@@ -136,6 +146,9 @@ impl Comparison {
             exit_code: None,
             stderr: String::new(),
             evidence: None,
+            configuration: case.configuration.as_ref().unwrap_or(default).clone(),
+            snapshot: case.snapshot.clone(),
+            labels: case.labels.clone(),
         }
     }
 
@@ -194,23 +207,33 @@ fn valid_hash(hash: &str) -> bool {
             .all(|byte| byte.is_ascii_uppercase() || (b'2'..=b'7').contains(&byte))
 }
 
-fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
+fn validate_configuration(configuration: &Configuration) -> Result<()> {
     ensure!(
-        manifest.schema_version == 1,
-        "The manifest schema_version must be 1."
+        std::time::Duration::try_from_secs_f64(configuration.timeout_seconds).is_ok()
+            && std::time::Duration::try_from_secs_f64(configuration.check_timeout_seconds).is_ok(),
+        "Replay time limits must be finite and nonnegative."
+    );
+    let policy = normalize_policy_path(Path::new(&configuration.policy_path))?;
+    ensure!(
+        !policy.as_os_str().is_empty() && !policy.starts_with(".pijul"),
+        "The replay policy must name a relative file outside .pijul."
     );
     ensure!(
-        manifest.configuration.timeout_seconds > 0
-            && manifest.configuration.check_timeout_seconds > 0,
-        "Replay time limits must be positive."
-    );
-    ensure!(
-        manifest.configuration.protected.iter().all(|pattern| {
+        configuration.protected.iter().all(|pattern| {
             !pattern.trim().is_empty()
                 && !pattern.contains(',')
                 && !pattern.chars().any(char::is_control)
         }),
         "Protected path patterns must be nonempty and cannot contain commas or control characters."
+    );
+    Ok(())
+}
+
+fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
+    validate_configuration(&manifest.configuration)?;
+    ensure!(
+        manifest.schema_version == 1,
+        "The manifest schema_version must be 1."
     );
     ensure!(
         !manifest.cases.is_empty(),
@@ -232,17 +255,57 @@ fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
         manifest.main != manifest.inbox,
         "Main and inbox must use different channels."
     );
-    let policy = Path::new(policy_path);
+    let policy = normalize_policy_path(Path::new(policy_path))?;
     ensure!(
-        !policy_path.is_empty()
-            && policy
-                .components()
-                .all(|part| matches!(part, Component::Normal(_)))
-            && !policy.starts_with(".pijul"),
+        !policy.as_os_str().is_empty() && !policy.starts_with(".pijul"),
         "PATCHGATE_POLICY must name a relative file outside .pijul."
     );
     let mut ids = BTreeSet::new();
     for case in &manifest.cases {
+        validate_configuration(
+            case.configuration
+                .as_ref()
+                .unwrap_or(&manifest.configuration),
+        )?;
+        for label in &case.labels {
+            ensure!(
+                label["user"]
+                    .as_str()
+                    .is_some_and(|user| !user.trim().is_empty())
+                    && label["reason"]
+                        .as_str()
+                        .is_some_and(|reason| !reason.trim().is_empty())
+                    && label["time"]
+                        .as_str()
+                        .is_some_and(|time| chrono::DateTime::parse_from_rfc3339(time).is_ok())
+                    && matches!(
+                        label["expected"].as_str(),
+                        Some("accept" | "reject" | "escalate")
+                    ),
+                "Each case label needs a user, time, expected value, and explicit reason."
+            );
+        }
+        if let Some(snapshot) = &case.snapshot {
+            ensure!(
+                snapshot["base"] == json!(case.base)
+                    && snapshot["candidate"] == case.candidate
+                    && snapshot["main"] == manifest.main
+                    && snapshot["inbox"] == manifest.inbox
+                    && snapshot["configuration"]["values"]
+                        == serde_json::to_value(
+                            case.configuration
+                                .as_ref()
+                                .unwrap_or(&manifest.configuration)
+                        )?,
+                "The case snapshot differs from its replay bindings."
+            );
+            ensure!(
+                case.labels
+                    .last()
+                    .is_some_and(|label| label["expected"] == json!(case.expected)),
+                "The captured case needs its explicit human label."
+            );
+        }
         ensure!(
             !case.id.trim().is_empty() && ids.insert(&case.id),
             "Case IDs must be nonempty and unique."
@@ -455,6 +518,113 @@ fn candidate_inbox(repo: &Repo, case: &Case, main: &str, inbox: &str) -> Result<
     Ok(())
 }
 
+fn normalize_policy_path(path: &Path) -> Result<PathBuf> {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ensure!(result.pop(), "The policy archive path escapes the channel.");
+            }
+            Component::Normal(name) => result.push(name),
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("The policy archive path is absolute.");
+            }
+        }
+    }
+    Ok(result)
+}
+
+enum PolicyMember {
+    File(Vec<u8>),
+    Link(PathBuf),
+    Other,
+}
+
+fn policy_archive_member(archive: &Path, target: &Path) -> Result<Option<PolicyMember>> {
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(fs::File::open(archive)?));
+    let mut member = None;
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        if normalize_policy_path(&entry.path()?)? != target {
+            continue;
+        }
+        let kind = entry.header().entry_type();
+        member = Some(if kind.is_file() || kind.is_gnu_sparse() {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes)?;
+            PolicyMember::File(bytes)
+        } else if kind.is_symlink() || kind.is_hard_link() {
+            let link = entry
+                .link_name()?
+                .context("The policy archive link has no target.")?;
+            let link = if kind.is_symlink() {
+                normalize_policy_path(
+                    &target.parent().unwrap_or(Path::new("")).join(link.as_ref()),
+                )?
+            } else {
+                normalize_policy_path(&link)?
+            };
+            PolicyMember::Link(link)
+        } else {
+            PolicyMember::Other
+        });
+    }
+    Ok(member)
+}
+
+fn policy_archive_bytes(archive: &Path, path: &str) -> Result<Option<Vec<u8>>> {
+    let mut target = normalize_policy_path(Path::new(path))?;
+    let mut visited = BTreeSet::new();
+    // Use the production archive rules for file links and directory links.
+    for _ in 0..128 {
+        ensure!(
+            visited.insert(target.clone()),
+            "The policy archive contains a link cycle."
+        );
+        match policy_archive_member(archive, &target)? {
+            Some(PolicyMember::File(bytes)) => return Ok(Some(bytes)),
+            Some(PolicyMember::Link(link)) => target = link,
+            Some(PolicyMember::Other) | None => {
+                let mut resolved = None;
+                for parent in target
+                    .ancestors()
+                    .skip(1)
+                    .filter(|path| !path.as_os_str().is_empty())
+                {
+                    if let Some(PolicyMember::Link(link)) = policy_archive_member(archive, parent)?
+                    {
+                        resolved = Some(normalize_policy_path(
+                            &link.join(target.strip_prefix(parent)?),
+                        )?);
+                        break;
+                    }
+                }
+                match resolved {
+                    Some(path) => target = path,
+                    None => return Ok(None),
+                }
+            }
+        }
+    }
+    bail!("The policy archive link depth exceeds the channel limit.")
+}
+
+fn recorded_policy_digest(repo: &Repo, channel: &str, path: &str) -> Result<Option<String>> {
+    let directory = tempfile::tempdir()?;
+    let archive = directory.path().join("channel.tar.gz");
+    repo.pijul(&[
+        "archive",
+        "--channel",
+        channel,
+        "-o",
+        archive
+            .to_str()
+            .context("The policy archive path is not UTF-8.")?,
+    ])?;
+    Ok(policy_archive_bytes(&archive, path)?.map(|bytes| format!("{:x}", Sha256::digest(bytes))))
+}
+
 fn preflight(
     source: &Path,
     root: &Path,
@@ -470,6 +640,42 @@ fn preflight(
     }
     validate_order(case, &prerequisites)?;
     reconstruct(&repo, case, &manifest.main)?;
+    if let Some(snapshot) = &case.snapshot {
+        ensure!(
+            snapshot["repository"] == json!(source),
+            "The captured case belongs to a different source repository."
+        );
+        let states: Vec<Value> = serde_json::from_str(&repo.pijul(&[
+            "log",
+            "--channel",
+            &manifest.main,
+            "--state",
+            "--output-format",
+            "json",
+        ])?)?;
+        let state = states
+            .first()
+            .map(|entry| entry["state"].clone())
+            .unwrap_or(Value::Null);
+        ensure!(
+            state == snapshot["main_state"],
+            "The reconstructed native state differs from its capture."
+        );
+        let configuration = case
+            .configuration
+            .as_ref()
+            .unwrap_or(&manifest.configuration);
+        ensure!(
+            snapshot["policy_path"] == configuration.policy_path,
+            "The captured policy path differs from its replay settings."
+        );
+        let policy_digest =
+            recorded_policy_digest(&repo, &manifest.main, &configuration.policy_path)?;
+        ensure!(
+            json!(policy_digest) == snapshot["policy_sha256"],
+            "The reconstructed policy differs from its capture."
+        );
+    }
     candidate_inbox(&repo, case, &manifest.main, &manifest.inbox)?;
     Ok(())
 }
@@ -582,19 +788,19 @@ fn execute(
         .env("PATCHGATE_POLICY", policy_path)
         .env(
             "PATCHGATE_PROTECTED",
-            manifest.configuration.protected.join(","),
+            comparison.configuration.protected.join(","),
         )
         .env(
             "PATCHGATE_MAX_CHANGE_CHARS",
-            manifest.configuration.max_change_chars.to_string(),
+            comparison.configuration.max_change_chars.to_string(),
         )
         .env(
             "PATCHGATE_TIMEOUT",
-            manifest.configuration.timeout_seconds.to_string(),
+            comparison.configuration.timeout_seconds.to_string(),
         )
         .env(
             "PATCHGATE_CHECK_TIMEOUT",
-            manifest.configuration.check_timeout_seconds.to_string(),
+            comparison.configuration.check_timeout_seconds.to_string(),
         )
         .env("PATCHGATE_MODEL_URL", &variant.model_url)
         .env("PATCHGATE_MODEL", &variant.model)
@@ -873,7 +1079,8 @@ pub fn run(args: ReplayArgs) -> Result<()> {
             Ok(&env)
         };
         for (case_index, case) in manifest.cases.iter().enumerate() {
-            let mut comparison = Comparison::new(case, variant);
+            let mut comparison = Comparison::new(case, variant, &manifest.configuration);
+            let case_policy_path = comparison.configuration.policy_path.clone();
             let start = Instant::now();
             let result = match (&variant_env, &binary) {
                 (_, Err(error)) => Err(anyhow!("Read the gate binary: {error:#}")),
@@ -893,7 +1100,7 @@ pub fn run(args: ReplayArgs) -> Result<()> {
                     case,
                     variant,
                     policies.get(&variant.id).map(String::as_str),
-                    &policy_path,
+                    &case_policy_path,
                     &manifest,
                     env,
                     binary,
@@ -955,6 +1162,82 @@ mod tests {
     }
 
     #[test]
+    fn per_case_settings_override_root_and_preserve_fractional_limits() {
+        let mut manifest = fixture();
+        manifest.configuration.max_change_chars = 100;
+        manifest.configuration.timeout_seconds = 1.25;
+        let mut configuration = Configuration::default();
+        configuration.max_change_chars = 200;
+        configuration.timeout_seconds = 0.125;
+        configuration.check_timeout_seconds = 2.75;
+        manifest.cases[0].configuration = Some(configuration.clone());
+        assert!(validate(&manifest, "POLICY.md").is_ok());
+        let comparison = Comparison::new(
+            &manifest.cases[0],
+            &manifest.variants[0],
+            &manifest.configuration,
+        );
+        assert_eq!(comparison.configuration, configuration);
+        manifest.cases[0]
+            .configuration
+            .as_mut()
+            .unwrap()
+            .timeout_seconds = f64::INFINITY;
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[0]
+            .configuration
+            .as_mut()
+            .unwrap()
+            .timeout_seconds = -0.1;
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[0].configuration = None;
+        assert_eq!(
+            Comparison::new(
+                &manifest.cases[0],
+                &manifest.variants[0],
+                &manifest.configuration
+            )
+            .configuration
+            .timeout_seconds,
+            1.25
+        );
+    }
+
+    #[test]
+    fn captured_bindings_and_human_labels_remain_explicit() {
+        let mut manifest = fixture();
+        manifest.cases[0].snapshot = Some(json!({
+            "base": [],
+            "candidate": manifest.cases[0].candidate,
+            "main": "main",
+            "inbox": "inbox",
+            "configuration": {"values": manifest.configuration},
+        }));
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[0].labels = vec![json!({
+            "user": "reviewer", "time": "2026-10-21T00:00:00Z",
+            "expected": "reject", "reason": "The reviewer rejects the change.",
+        })];
+        assert!(validate(&manifest, "POLICY.md").is_ok());
+        let comparison = Comparison::new(
+            &manifest.cases[0],
+            &manifest.variants[0],
+            &manifest.configuration,
+        );
+        let encoded = serde_json::to_value(comparison).unwrap();
+        assert_eq!(
+            encoded["snapshot"],
+            manifest.cases[0].snapshot.clone().unwrap()
+        );
+        assert_eq!(encoded["labels"], json!(manifest.cases[0].labels));
+        manifest.cases[0].expected = Label::Accept;
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[0].expected = Label::Reject;
+        manifest.cases[0].snapshot.as_mut().unwrap()["base"] = json!(["B".repeat(53)]);
+        assert!(validate(&manifest, "POLICY.md").is_err());
+    }
+
+    #[test]
     fn manifest_requires_explicit_revisions_unique_ids_and_full_hashes() {
         let mut manifest = fixture();
         assert!(validate(&manifest, "POLICY.md").is_ok());
@@ -970,8 +1253,20 @@ mod tests {
         .unwrap();
         manifest.cases.push(duplicate);
         assert!(validate(&manifest, "POLICY.md").is_err());
-        assert!(validate(&fixture(), "../POLICY.md").is_err());
-        assert!(validate(&fixture(), ".pijul/policy").is_err());
+        for path in [
+            "",
+            ".",
+            "docs/..",
+            "../POLICY.md",
+            "/POLICY.md",
+            ".pijul/policy",
+            "docs/../.pijul/policy",
+        ] {
+            assert!(validate(&fixture(), path).is_err(), "{path}");
+            let mut manifest = fixture();
+            manifest.configuration.policy_path = path.into();
+            assert!(validate(&manifest, "POLICY.md").is_err(), "{path}");
+        }
     }
 
     #[test]
@@ -1067,22 +1362,22 @@ mod tests {
         let manifest = fixture();
         let case = &manifest.cases[0];
         let variant = &manifest.variants[0];
-        let mut unsafe_row = Comparison::new(case, variant);
+        let mut unsafe_row = Comparison::new(case, variant, &manifest.configuration);
         unsafe_row.expected = Label::Escalate;
         unsafe_row.decision(Some(Label::Accept), "verdict".into());
         unsafe_row.exit_code = Some(0);
         unsafe_row.cli_executed = true;
         unsafe_row.elapsed_seconds = 1.0;
-        let mut escalation = Comparison::new(case, variant);
+        let mut escalation = Comparison::new(case, variant, &manifest.configuration);
         escalation.decision(Some(Label::Escalate), "verdict".into());
         escalation.exit_code = Some(0);
         escalation.cli_executed = true;
         escalation.elapsed_seconds = 3.0;
-        let mut error = Comparison::new(case, variant);
+        let mut error = Comparison::new(case, variant, &manifest.configuration);
         error.execution_error = Some("The model API is unavailable.".into());
         let blocked = Comparison {
             outcome: "blocked".into(),
-            ..Comparison::new(case, variant)
+            ..Comparison::new(case, variant, &manifest.configuration)
         };
         let summary = summarize(&variant.id, &[unsafe_row, escalation, error, blocked]);
         assert_eq!(summary.verdicts, 2);
@@ -1115,12 +1410,49 @@ mod tests {
             "Add later source",
         )?;
         let source_hashes = source.hashes("inbox")?;
-        let case = Case {
+        let mut case = Case {
             id: "historical".into(),
             base,
             candidate,
             expected: Label::Accept,
+            configuration: None,
+            snapshot: None,
+            labels: Vec::new(),
         };
+        let source_path = fs::canonicalize(&source.path)?;
+        let states: Vec<Value> = serde_json::from_str(&source.pijul(&[
+            "log",
+            "--channel",
+            "main",
+            "--state",
+            "--output-format",
+            "json",
+        ])?)?;
+        case.snapshot = Some(json!({
+            "repository": source_path,
+            "main": "main",
+            "inbox": "inbox",
+            "main_state": states[0]["state"],
+            "base": case.base,
+            "candidate": case.candidate,
+            "policy_path": "POLICY.md",
+            "policy_sha256": null,
+            "configuration": {
+                "source": "environment", "path": null, "sha256": null,
+                "values": Configuration::default(),
+            },
+        }));
+        case.labels = vec![json!({
+            "user": "reviewer", "time": "2026-10-21T00:00:00Z",
+            "expected": "accept", "reason": "The reviewer approves the change.",
+        })];
+        preflight(
+            &source_path,
+            &directory.path().join("preflight"),
+            &case,
+            &fixture(),
+            &signer.env,
+        )?;
         let replay = init_repo(directory.path().join("replay"), "main", &signer.env)?;
         copy_changes(&source.path, &replay, &case)?;
         reconstruct(&replay, &case, "main")?;
@@ -1132,6 +1464,212 @@ mod tests {
         assert!(!main.files.contains_key("later.txt"));
         assert!(!inbox.files.contains_key("later.txt"));
         assert_eq!(source.hashes("inbox")?, source_hashes);
+        Ok(())
+    }
+
+    #[test]
+    fn captured_policy_paths_replay_with_exact_recorded_bytes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let signer = Signer::new()?;
+        let source = init_repo(directory.path().join("source"), "main", &signer.env)?;
+        let policy = "# Policy\r\nReject a change that adds a secret.\r\n";
+        source.change(
+            &[("docs/POLICY.md", policy), ("value.txt", "base\n")],
+            "Define the policy and base value",
+        )?;
+        let base = source
+            .pijul(&["log", "--channel", "main", "--hash-only"])?
+            .split_whitespace()
+            .rev()
+            .map(str::to_owned)
+            .collect();
+        let states: Vec<Value> = serde_json::from_str(&source.pijul(&[
+            "log",
+            "--channel",
+            "main",
+            "--state",
+            "--output-format",
+            "json",
+        ])?)?;
+        source.pijul(&["fork", "--channel", "main", "inbox"])?;
+        source.pijul(&["channel", "switch", "inbox"])?;
+        let candidate = source.change(&[("value.txt", "candidate\n")], "Change the value")?;
+        let source_path = fs::canonicalize(&source.path)?;
+        let mut manifest = fixture();
+        manifest.cases[0].base = base;
+        manifest.cases[0].candidate = candidate;
+        manifest.cases[0].labels = vec![json!({
+            "user": "reviewer", "time": "2026-10-21T00:00:00Z",
+            "expected": "reject", "reason": "The reviewer rejects the change.",
+        })];
+        let main_hashes = source.hashes("main")?;
+        let inbox_hashes = source.hashes("inbox")?;
+        for (index, path) in [
+            "docs/./POLICY.md",
+            "./docs/POLICY.md",
+            "docs/unused/../POLICY.md",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let configuration = Configuration {
+                policy_path: path.into(),
+                ..Configuration::default()
+            };
+            manifest.cases[0].configuration = Some(configuration.clone());
+            manifest.cases[0].snapshot = Some(json!({
+                "repository": source_path,
+                "main": "main",
+                "inbox": "inbox",
+                "main_state": states[0]["state"],
+                "base": manifest.cases[0].base,
+                "candidate": manifest.cases[0].candidate,
+                "policy_path": path,
+                "policy_sha256": format!("{:x}", Sha256::digest(policy.as_bytes())),
+                "configuration": {
+                    "source": "environment", "path": null, "sha256": null,
+                    "values": configuration,
+                },
+            }));
+            validate(&manifest, path)?;
+            preflight(
+                &source_path,
+                &directory.path().join(format!("match-{index}")),
+                &manifest.cases[0],
+                &manifest,
+                &signer.env,
+            )?;
+            let comparison = Comparison::new(
+                &manifest.cases[0],
+                &manifest.variants[0],
+                &manifest.configuration,
+            );
+            assert_eq!(comparison.configuration.policy_path, path);
+            assert_eq!(comparison.snapshot.unwrap()["policy_path"], path);
+        }
+        assert_eq!(source.hashes("main")?, main_hashes);
+        assert_eq!(source.hashes("inbox")?, inbox_hashes);
+        assert_eq!(
+            fs::read(source.path.join("docs/POLICY.md"))?,
+            policy.as_bytes()
+        );
+        assert!(!source.path.join(".pijul/patchgate").exists());
+
+        source.pijul(&["channel", "switch", "main"])?;
+        let changed = source.change(
+            &[(
+                "docs/POLICY.md",
+                "# Policy\nReject a change that adds a secret.\n",
+            )],
+            "Change the exact policy bytes",
+        )?;
+        manifest.cases[0].base.push(changed);
+        let states: Vec<Value> = serde_json::from_str(&source.pijul(&[
+            "log",
+            "--channel",
+            "main",
+            "--state",
+            "--output-format",
+            "json",
+        ])?)?;
+        let base = json!(manifest.cases[0].base);
+        let snapshot = manifest.cases[0].snapshot.as_mut().unwrap();
+        snapshot["base"] = base;
+        snapshot["main_state"] = states[0]["state"].clone();
+        validate(&manifest, "docs/./POLICY.md")?;
+        let main_hashes = source.hashes("main")?;
+        let error = preflight(
+            &source_path,
+            &directory.path().join("changed-policy"),
+            &manifest.cases[0],
+            &manifest,
+            &signer.env,
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains(policy));
+        assert_eq!(source.hashes("main")?, main_hashes);
+        assert_eq!(source.hashes("inbox")?, inbox_hashes);
+        assert!(!source.path.join(".pijul/patchgate").exists());
+        manifest.cases[0].snapshot.as_mut().unwrap()["policy_sha256"] = json!(format!(
+            "{:x}",
+            Sha256::digest(b"# Policy\nReject a change that adds a secret.\n")
+        ));
+        preflight(
+            &source_path,
+            &directory.path().join("new-policy-binding"),
+            &manifest.cases[0],
+            &manifest,
+            &signer.env,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn policy_archive_reads_internal_aliases_and_refuses_unsafe_links() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let archive = directory.path().join("channel.tar.gz");
+        let encoder = flate2::write::GzEncoder::new(
+            fs::File::create(&archive)?,
+            flate2::Compression::default(),
+        );
+        let mut tar = tar::Builder::new(encoder);
+        let bytes = b"# Policy\r\nExact bytes.\r\n";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "docs/POLICY.md", &bytes[..])?;
+        for (name, target, kind) in [
+            ("alias", "docs/POLICY.md", tar::EntryType::Symlink),
+            (
+                "docs/relative",
+                "../docs/./POLICY.md",
+                tar::EntryType::Symlink,
+            ),
+            ("directory", "docs", tar::EntryType::Symlink),
+            ("hard", "docs/POLICY.md", tar::EntryType::Link),
+            ("escape", "../marker", tar::EntryType::Symlink),
+            ("absolute", "/marker", tar::EntryType::Symlink),
+            ("cycle-a", "cycle-b", tar::EntryType::Symlink),
+            ("cycle-b", "cycle-a", tar::EntryType::Symlink),
+            (
+                "nested-cycle",
+                "nested-cycle/child",
+                tar::EntryType::Symlink,
+            ),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(0);
+            header.set_mode(0o777);
+            tar.append_link(&mut header, name, target)?;
+        }
+        tar.into_inner()?.finish()?;
+        for path in [
+            "docs/./POLICY.md",
+            "alias",
+            "docs/relative",
+            "directory/POLICY.md",
+            "hard",
+        ] {
+            assert_eq!(
+                policy_archive_bytes(&archive, path)?.as_deref(),
+                Some(&bytes[..]),
+                "{path}"
+            );
+        }
+        assert_eq!(policy_archive_bytes(&archive, "missing")?, None);
+        for path in [
+            "escape",
+            "absolute",
+            "cycle-a",
+            "directory/../escape",
+            "../marker",
+            "/marker",
+            "nested-cycle/POLICY.md",
+        ] {
+            assert!(policy_archive_bytes(&archive, path).is_err(), "{path}");
+        }
         Ok(())
     }
 

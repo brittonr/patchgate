@@ -88,14 +88,14 @@ struct SnapshotEntry {
 }
 
 #[derive(Deserialize)]
-struct ReviewEntry {
-    hash: String,
+pub struct ReviewEntry {
+    pub hash: String,
     #[serde(default, deserialize_with = "null_default")]
-    message: String,
-    authors: Vec<String>,
-    timestamp: String,
+    pub message: String,
+    pub authors: Vec<String>,
+    pub timestamp: String,
     #[serde(default, deserialize_with = "null_default")]
-    paths: Vec<String>,
+    pub paths: Vec<String>,
 }
 
 fn null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
@@ -265,6 +265,18 @@ impl Pijul {
         })
     }
 
+    pub fn review_metadata(&self, channel: &str) -> Result<Vec<ReviewEntry>> {
+        let output = self.run([
+            "log",
+            "--channel",
+            channel,
+            "--output-format",
+            "json",
+            "--files",
+        ])?;
+        serde_json::from_str(&output).context("Native change metadata is not complete JSON")
+    }
+
     pub fn review_change(
         &self,
         channel: &str,
@@ -309,10 +321,8 @@ impl Pijul {
         if actual_text != text {
             bail!("The isolated candidate differs from the supplied change");
         }
-        let output = isolated.run(["log", "--output-format", "json", "--files"])?;
-        let entries: Vec<ReviewEntry> =
-            serde_json::from_str(&output).context("Candidate metadata is not complete JSON")?;
-        let entry = entries
+        let entry = isolated
+            .review_metadata(channel)?
             .into_iter()
             .find(|entry| entry.hash == hash)
             .context("The isolated channel does not contain the exact candidate hash")?;
@@ -556,6 +566,23 @@ impl Pijul {
     }
 
     pub fn read_file(&self, channel: &str, path: &str) -> Result<Option<String>> {
+        self.read_channel_file(channel, path, read_archive_file)
+    }
+
+    pub fn read_file_bytes(&self, channel: &str, path: &str) -> Result<Option<Vec<u8>>> {
+        self.read_channel_file(channel, path, read_archive_bytes)
+    }
+
+    pub fn read_regular_file(&self, channel: &str, path: &str) -> Result<Option<String>> {
+        self.read_channel_file(channel, path, read_regular_archive_file)
+    }
+
+    fn read_channel_file<T>(
+        &self,
+        channel: &str,
+        path: &str,
+        reader: impl FnOnce(&Path, &str) -> Result<T>,
+    ) -> Result<T> {
         let directory = tempfile::tempdir()?;
         let archive = directory.path().join("channel.tar.gz");
         self.run([
@@ -565,7 +592,7 @@ impl Pijul {
             OsStr::new("-o"),
             archive.as_os_str(),
         ])?;
-        read_archive_file(&archive, path)
+        reader(&archive, path)
     }
 
     pub fn conflicts(&self) -> Result<Vec<crate::change::Conflict>> {
@@ -914,6 +941,13 @@ enum ArchiveMember {
 }
 
 fn read_archive_file(archive: &Path, path: &str) -> Result<Option<String>> {
+    read_archive_bytes(archive, path)?
+        .map(String::from_utf8)
+        .transpose()
+        .context("Archive file is not UTF-8")
+}
+
+fn read_archive_bytes(archive: &Path, path: &str) -> Result<Option<Vec<u8>>> {
     let mut target = normalize_path(Path::new(path))?;
     let mut visited = HashSet::new();
     for _ in 0..128 {
@@ -921,11 +955,7 @@ fn read_archive_file(archive: &Path, path: &str) -> Result<Option<String>> {
             bail!("Archive link cycle at {}", target.display());
         }
         match archive_member(archive, &target)? {
-            Some(ArchiveMember::File(bytes)) => {
-                return Ok(Some(
-                    String::from_utf8(bytes).context("Archive file is not UTF-8")?,
-                ));
-            }
+            Some(ArchiveMember::File(bytes)) => return Ok(Some(bytes)),
             Some(ArchiveMember::Link(link)) => target = link,
             Some(ArchiveMember::Other) | None => {
                 let mut resolved = None;
@@ -947,6 +977,31 @@ fn read_archive_file(archive: &Path, path: &str) -> Result<Option<String>> {
         }
     }
     bail!("Archive link depth exceeds the channel limit")
+}
+
+fn read_regular_archive_file(archive: &Path, path: &str) -> Result<Option<String>> {
+    let target = normalize_path(Path::new(path))?;
+    let mut tar = tar::Archive::new(GzDecoder::new(File::open(archive)?));
+    let mut bytes = None;
+    for entry in tar.entries()? {
+        let mut entry = entry?;
+        let member = normalize_path(&entry.path()?)?;
+        let kind = entry.header().entry_type();
+        if member == target {
+            if !kind.is_file() || bytes.is_some() {
+                bail!("The requested path is not one recorded regular file");
+            }
+            let mut data = Vec::new();
+            entry.read_to_end(&mut data)?;
+            bytes = Some(data);
+        } else if member.starts_with(&target) || (target.starts_with(&member) && !kind.is_dir()) {
+            bail!("The requested regular file path uses a directory, link, or special file");
+        }
+    }
+    bytes
+        .map(String::from_utf8)
+        .transpose()
+        .context("Archive file is not UTF-8")
 }
 
 fn archive_member(archive: &Path, target: &Path) -> Result<Option<ArchiveMember>> {
@@ -978,7 +1033,7 @@ fn archive_member(archive: &Path, target: &Path) -> Result<Option<ArchiveMember>
     Ok(member)
 }
 
-fn normalize_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn normalize_path(path: &Path) -> Result<PathBuf> {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1184,6 +1239,49 @@ mod safety_tests {
         }
         header.set_cksum();
         tar.append(&header, bytes)?;
+        Ok(())
+    }
+
+    #[test]
+    fn trusted_regular_file_reads_reject_aliases_and_directory_forms() -> Result<()> {
+        use tar::EntryType::{Directory, Link, Regular, Symlink};
+        let directory = tempfile::tempdir()?;
+        let cases = [
+            vec![
+                ("patchgate.json", Symlink, "settings.json"),
+                ("settings.json", Regular, ""),
+            ],
+            vec![
+                ("patchgate.json", Link, "settings.json"),
+                ("settings.json", Regular, ""),
+            ],
+            vec![("patchgate.json", Directory, "")],
+            vec![("patchgate.json/child", Regular, "")],
+            vec![
+                ("patchgate.json", Regular, ""),
+                ("patchgate.json", Regular, ""),
+            ],
+        ];
+        for (index, entries) in cases.iter().enumerate() {
+            let archive = directory
+                .path()
+                .join(format!("configuration-{index}.tar.gz"));
+            let encoder = GzEncoder::new(File::create(&archive)?, Compression::default());
+            let mut tar = tar::Builder::new(encoder);
+            for &(name, kind, target) in entries {
+                let data: &[u8] = if kind == Regular {
+                    br#"{"schema_version":1}"#
+                } else {
+                    b""
+                };
+                source_fixture(&mut tar, name, kind, target, data, 0o600)?;
+            }
+            tar.into_inner()?.finish()?;
+            assert!(
+                read_regular_archive_file(&archive, "patchgate.json").is_err(),
+                "{index}"
+            );
+        }
         Ok(())
     }
 

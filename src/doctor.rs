@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::configuration::{self, Evidence};
 use crate::gate::Settings;
 use crate::model::{Api, Model};
 use crate::pijul::{Pijul, safe_path};
@@ -25,6 +26,7 @@ pub struct Report {
     pub schema_version: u32,
     pub ok: bool,
     pub checks: Vec<Check>,
+    pub configuration: Option<Evidence>,
 }
 
 #[derive(Serialize)]
@@ -81,6 +83,7 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
         schema_version: 1,
         ok: true,
         checks: Vec::new(),
+        configuration: None,
     };
     let command = format!(
         "patchgate --repo {} --main {} --inbox {}",
@@ -96,18 +99,6 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
             Some(format!("Restore unsafe metadata from a trusted backup. Inspect it with: stat {}",
                 quote(&settings.repo.join(".pijul").to_string_lossy())))),
     }
-    if metadata.is_ok() {
-        inspect_journal(&mut report, settings, &command);
-    } else {
-        report.add(
-            "acceptance.recovery",
-            Status::Unavailable,
-            "Unsafe repository metadata prevents acceptance journal inspection.",
-            None,
-        );
-    }
-
-    let timeout = settings.timeout.min(PROBE_LIMIT);
     let help_directory = tempfile::Builder::new()
         .prefix("patchgate-doctor-help-")
         .tempdir()?;
@@ -126,10 +117,13 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
         match crate::isolation::copy_repository(&settings.repo) {
             Ok(isolated) => {
                 let pijul = Pijul::with_timeout(isolated.pijul.repo.clone(), PROBE_LIMIT);
+                inspect_isolated_journal(&mut report, &settings.repo, &pijul.repo, &command);
                 inspect_channels(&mut report, &pijul, settings, &command);
             }
             Err(error) => {
                 for id in [
+                    "acceptance.recovery",
+                    "configuration.trusted",
                     "channel.main",
                     "channel.inbox",
                     "policy.trusted",
@@ -148,6 +142,8 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
         }
     } else {
         for id in [
+            "acceptance.recovery",
+            "configuration.trusted",
             "channel.main",
             "channel.inbox",
             "policy.trusted",
@@ -161,8 +157,17 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
             );
         }
     }
+    let values = report.configuration.as_ref().map(|value| &value.values);
+    let timeout = values
+        .and_then(|value| Duration::try_from_secs_f64(value.timeout_seconds).ok())
+        .unwrap_or(settings.timeout)
+        .min(PROBE_LIMIT);
+    let check_timeout = values
+        .and_then(|value| Duration::try_from_secs_f64(value.check_timeout_seconds).ok())
+        .unwrap_or(settings.check_timeout)
+        .min(PROBE_LIMIT);
     inspect_model(&mut report, settings, timeout);
-    inspect_nix(&mut report, settings.check_timeout.min(PROBE_LIMIT));
+    inspect_nix(&mut report, check_timeout);
     Ok(report)
 }
 
@@ -173,6 +178,7 @@ fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, com
             for id in [
                 "channel.main",
                 "channel.inbox",
+                "configuration.trusted",
                 "policy.trusted",
                 "nix.manifest",
             ] {
@@ -220,7 +226,7 @@ fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, com
         );
     }
     if !main {
-        for id in ["policy.trusted", "nix.manifest"] {
+        for id in ["configuration.trusted", "policy.trusted", "nix.manifest"] {
             report.add(
                 id,
                 Status::Unavailable,
@@ -230,17 +236,57 @@ fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, com
         }
         return;
     }
-    let policy_repair = format!(
-        "Record {} in the inbox, then accept its change with: {command} accept <hash>",
-        quote(&settings.policy)
-    );
-    match pijul.read_file(&settings.main, &settings.policy) {
-        Ok(Some(text)) if !text.trim().is_empty() => report.add("policy.trusted", Status::Pass,
-            "The trusted main channel contains nonempty UTF-8 policy text. This check does not assess policy quality.", None),
-        Ok(_) => report.add("policy.trusted", Status::Error,
-            "The trusted main policy is absent or empty. Work files are not trusted policy.", Some(policy_repair)),
-        Err(error) => report.add("policy.trusted", Status::Error, format!("Cannot read trusted policy: {error:#}"),
-            Some(policy_repair)),
+    match configuration::load(pijul, &settings.main, &settings.baseline_values()) {
+        Ok(evidence) => {
+            report.add(
+                "configuration.trusted",
+                Status::Pass,
+                configuration_detail(&evidence),
+                None,
+            );
+            let policy_path = &evidence.values.policy_path;
+            let policy_repair = format!(
+                "Record {} in the inbox, then accept its change with: {command} accept <hash>",
+                quote(policy_path)
+            );
+            match pijul.read_file(&settings.main, policy_path) {
+                Ok(Some(text)) if !text.trim().is_empty() => report.add(
+                    "policy.trusted",
+                    Status::Pass,
+                    "The effective main policy contains nonempty UTF-8 text. This check does not assess policy quality.",
+                    None,
+                ),
+                Ok(_) => report.add(
+                    "policy.trusted",
+                    Status::Error,
+                    "The effective main policy is absent or empty. Work files are not trusted policy.",
+                    Some(policy_repair),
+                ),
+                Err(_) => report.add(
+                    "policy.trusted",
+                    Status::Error,
+                    "Cannot read the effective trusted policy.",
+                    Some(policy_repair),
+                ),
+            }
+            report.configuration = Some(evidence);
+        }
+        Err(error) => {
+            report.add(
+                "configuration.trusted",
+                Status::Error,
+                format!("{error:#}"),
+                Some(format!(
+                    "Correct recorded patchgate.json, then run: {command} accept <hash>"
+                )),
+            );
+            report.add(
+                "policy.trusted",
+                Status::Unavailable,
+                "Invalid trusted configuration prevents effective policy inspection.",
+                None,
+            );
+        }
     }
     match verify::Plan::load(pijul, &settings.main) {
         Ok(Some(_)) => report.add("nix.manifest", Status::Pass,
@@ -250,6 +296,53 @@ fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, com
             Some(format!("Record nix/checks.json and its check definitions, then run: {command} accept <hash>"))),
         Err(error) => report.add("nix.manifest", Status::Error, format!("{error:#}"),
             Some(format!("Correct the recorded nix/checks.json and check paths, then run: {command} accept <hash>"))),
+    }
+}
+
+fn configuration_detail(evidence: &Evidence) -> String {
+    if evidence.source == "main" {
+        format!(
+            "Effective settings use recorded patchgate.json. Exact text SHA-256: {}.",
+            evidence.sha256.as_deref().unwrap_or("absent")
+        )
+    } else {
+        "Main has no patchgate.json. Effective settings use the caller environment.".into()
+    }
+}
+
+fn inspect_isolated_journal(report: &mut Report, source: &Path, isolated: &Path, command: &str) {
+    match copy_journal(source, isolated) {
+        Ok(()) => inspect_journal(report, isolated, command),
+        Err(error) => report.add(
+            "acceptance.recovery",
+            Status::Unavailable,
+            format!("Cannot isolate the acceptance journal: {error:#}"),
+            Some(format!(
+                "Restore journal access, then run: {command} status"
+            )),
+        ),
+    }
+}
+
+fn copy_journal(source: &Path, isolated: &Path) -> Result<()> {
+    let path = safe_path(source, Path::new(".pijul/patchgate/acceptance.json"))?;
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file(),
+                "The acceptance journal is not a regular file"
+            );
+            let target = isolated.join(".pijul/patchgate/acceptance.json");
+            fs::create_dir_all(
+                target
+                    .parent()
+                    .context("The journal has no parent directory")?,
+            )?;
+            fs::copy(path, target)?;
+            Ok(())
+        }
     }
 }
 
@@ -277,8 +370,8 @@ fn metadata_safety(repo: &Path) -> Result<()> {
     Ok(())
 }
 
-fn inspect_journal(report: &mut Report, settings: &Settings, command: &str) {
-    let path = settings.repo.join(".pijul/patchgate/acceptance.json");
+fn inspect_journal(report: &mut Report, repository: &Path, command: &str) {
+    let path = repository.join(".pijul/patchgate/acceptance.json");
     match File::open(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => report.add(
             "acceptance.recovery",
@@ -601,6 +694,154 @@ mod tests {
         symlink(outside.path(), repository.path().join(".pijul/patchgate"))?;
         assert!(metadata_safety(repository.path()).is_err());
         assert_eq!(fs::read(outside.path().join("ledger"))?, b"unchanged");
+        Ok(())
+    }
+
+    #[test]
+    fn journal_inspection_reads_the_private_copy() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let isolated = tempfile::tempdir()?;
+        fs::create_dir_all(source.path().join(".pijul/patchgate"))?;
+        fs::create_dir(isolated.path().join(".pijul"))?;
+        let journal = source.path().join(".pijul/patchgate/acceptance.json");
+        fs::write(&journal, b"original invalid journal")?;
+        copy_journal(source.path(), isolated.path())?;
+        fs::write(&journal, b"different source bytes")?;
+        let mut report = Report {
+            schema_version: 1,
+            ok: true,
+            checks: Vec::new(),
+            configuration: None,
+        };
+        inspect_journal(&mut report, isolated.path(), "patchgate");
+        assert!(
+            report.checks.iter().any(|check| {
+                check.id == "acceptance.recovery" && check.status == Status::Error
+            })
+        );
+        assert_eq!(fs::read(&journal)?, b"different source bytes");
+        assert_eq!(
+            fs::read(isolated.path().join(".pijul/patchgate/acceptance.json"))?,
+            b"original invalid journal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn journal_isolation_refuses_links() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let isolated = tempfile::tempdir()?;
+        let outside = tempfile::NamedTempFile::new()?;
+        fs::create_dir_all(source.path().join(".pijul/patchgate"))?;
+        fs::create_dir(isolated.path().join(".pijul"))?;
+        symlink(
+            outside.path(),
+            source.path().join(".pijul/patchgate/acceptance.json"),
+        )?;
+        assert!(copy_journal(source.path(), isolated.path()).is_err());
+        assert!(!isolated.path().join(".pijul/patchgate").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_channel_checks_use_effective_policy_and_report_configuration() -> Result<()> {
+        use crate::pijul::Signer;
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("repo");
+        fs::create_dir(&root)?;
+        let pijul = Pijul::new(root.clone());
+        pijul.run(["init"])?;
+        fs::write(
+            root.join(configuration::PATH),
+            r#"{"schema_version":1,"settings":{"policy_path":"TRUSTED.md"}}"#,
+        )?;
+        fs::write(root.join("TRUSTED.md"), "Accept safe changes.\n")?;
+        pijul.run(["add", configuration::PATH, "TRUSTED.md"])?;
+        let signer = Signer::new(root.join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Record trusted policy",
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        pijul.run(["fork", "--channel", "main", "inbox"])?;
+        fs::write(root.join(configuration::PATH), "dirty configuration")?;
+        fs::write(root.join("TRUSTED.md"), "")?;
+        let settings = Settings::from_env(
+            root.clone(),
+            "inbox".into(),
+            "main".into(),
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        let isolated = crate::isolation::copy_repository(&root)?;
+        let mut report = Report {
+            schema_version: 1,
+            ok: true,
+            checks: Vec::new(),
+            configuration: None,
+        };
+        inspect_channels(&mut report, &isolated.pijul, &settings, "patchgate");
+        assert!(
+            report.checks.iter().any(|check| {
+                check.id == "configuration.trusted" && check.status == Status::Pass
+            })
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| { check.id == "policy.trusted" && check.status == Status::Pass })
+        );
+        let evidence = report
+            .configuration
+            .context("Missing configuration evidence")?;
+        assert_eq!(evidence.source, "main");
+        assert_eq!(evidence.values.policy_path, "TRUSTED.md");
+        assert!(configuration_detail(&evidence).contains(evidence.sha256.as_deref().unwrap()));
+        assert_eq!(
+            fs::read_to_string(root.join(configuration::PATH))?,
+            "dirty configuration"
+        );
+        assert_eq!(fs::read_to_string(root.join("TRUSTED.md"))?, "");
+        pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Record invalid configuration",
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        let isolated = crate::isolation::copy_repository(&root)?;
+        let mut report = Report {
+            schema_version: 1,
+            ok: true,
+            checks: Vec::new(),
+            configuration: None,
+        };
+        inspect_channels(&mut report, &isolated.pijul, &settings, "patchgate");
+        assert!(report.configuration.is_none());
+        assert!(
+            report.checks.iter().any(|check| {
+                check.id == "configuration.trusted" && check.status == Status::Error
+            })
+        );
+        assert!(
+            report.checks.iter().any(|check| {
+                check.id == "policy.trusted" && check.status == Status::Unavailable
+            })
+        );
+        assert!(!serde_json::to_string(&report)?.contains("dirty configuration"));
         Ok(())
     }
 }

@@ -215,6 +215,43 @@ $ patchgate accept <hash of the change that you recorded>
 
 `patchgate accept` applies the escalated change and your resolution to main together.
 
+#### Separate human workspace
+
+Use a separate workspace to preserve the original inbox files during human review:
+
+```console
+$ patchgate resolve <hash> --workspace ../human-resolution
+$ $EDITOR ../human-resolution/server.conf
+$ patchgate accept --resolution ../human-resolution -m "Preserve both contributions"
+```
+
+The workspace must be a new directory outside the source repository.
+Preparation copies recorded main and the permitted candidate set.
+It does not call the model or accept a change.
+
+The command reports private files with the trusted policy and native change text.
+Use `pijul add` inside the workspace for new files.
+Acceptance retains existing human records and records tracked edits.
+Untracked files do not enter the result.
+
+Source control metadata retains the authoritative main, candidate, and configuration bindings.
+An editable workspace pointer cannot replace these bindings.
+Main or configuration changes invalidate the prepared workspace.
+A later prerequisite rejection also stops acceptance before a new workspace record.
+
+Acceptance checks native metadata for supported credentials and checks the final source tree.
+It runs the trusted Nix checks and uses native conditional acceptance.
+Supplemental native files enter the source atomically.
+Accepted human records also enter inbox without replacement of author edits.
+
+Resolution recording refuses `.pijul/config`, `.pijul/config.toml`, and root `pijul.toml`, including files without hooks.
+Preparation removes clone-generated metadata configuration.
+This boundary prevents editable native configuration from execution with the private signer.
+
+`resolve --json` reports `authorizes_acceptance: false`.
+Only the separate `accept --resolution` command can accept the prepared work.
+
+
 ## Models
 
 These measurements use the former Python implementation, not the Rust port. They cover six reviews and three conflicts on an Apple M4 with 24 GB:
@@ -413,6 +450,7 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 
 ## Commands
 
+<!-- ste-disable-next-line paragraph-length -->
 | Command | What it does |
 | --- | --- |
 | `patchgate init` | Makes the `inbox` channel from `main` and puts the working copy on it. |
@@ -426,6 +464,14 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate review --dry-run` | Runs the review, merge, and check flow in an isolated repository without source acceptance. |
 | `patchgate doctor` | Diagnoses setup and gives repair commands without repository changes. |
 | `patchgate-eval replay <manifest>` | Compares labeled historical changes across model and policy variants. |
+| `patchgate resolve <hash> --workspace <path>` | Prepares a separate human workspace without acceptance. |
+| `patchgate accept --resolution <path>` | Verifies and accepts the prepared human resolution against its original bindings. |
+| `patchgate reconsider <hash> -m <reason>` | Reviews an earlier gate or model rejection or escalation and retains its history. |
+| `patchgate budget <hash>` | Reports complete review input costs without a model request. |
+| `patchgate cases capture <hash>` | Captures exact recorded main and review settings for one unaccepted change. |
+| `patchgate cases list` | Lists captured snapshots and human label state. |
+| `patchgate cases label <id> <expected> -m <reason>` | Appends an explicit human label. |
+| `patchgate cases export --variants <file> --output <file>` | Exports labeled cases as a replay manifest. |
 
 A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
@@ -440,7 +486,7 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
 ### Decision evidence and JSON
 
-`status`, `explain`, `log`, and `review` accept `--json`.
+`status`, `explain`, `log`, `review`, `reconsider`, `resolve`, `budget`, and the `cases` subcommands accept `--json`.
 Every report declares `schema_version: 1`.
 JSON uses full change hashes and the existing lowercase state names.
 
@@ -503,6 +549,93 @@ Client sandbox configuration does not prove daemon enforcement.
 The daemon, build machines, caches, and sandbox policy remain trusted.
 Pijul and merge-signature tools resolve from absolute `PATH` directories, not relative entries.
 
+### Audited reconsideration
+
+```console
+$ patchgate reconsider <hash> -m "Apply the current policy and model" --json
+$ patchgate reconsider <hash> -m "Examine the new result first" --dry-run --json
+```
+
+The command selects one earlier gate or model rejection or escalation.
+It uses current main, trusted policy, protection rules, limits, and verification checks.
+All native prerequisites must already be in main.
+
+It refuses human decisions, changes already in main, and removed acceptances.
+Earlier records remain in the ledger.
+A new decision records the previous ledger index and canonical record SHA-256.
+It also records the human request reason and user.
+
+An invalid model reply or another execution failure leaves the earlier decision unchanged.
+A dry run uses isolated state and cannot authorize source acceptance.
+
+### Complete context budgets
+
+```console
+$ patchgate budget <hash>
+$ patchgate budget <hash> --json
+```
+
+Budget inspection uses an isolated recorded snapshot and makes no model request.
+It does not change source files, channels, cases, or acceptance records.
+It never truncates review data.
+
+<!-- ste-disable-next-line paragraph-length -->
+| Report field | Meaning |
+| --- | --- |
+| `limit`, `total` | Configured limit and complete encoded review size in Unicode characters. |
+| `remaining`, `excess`, `exceeds_limit` | Exact comparison with the structured input limit. |
+| `files` | Encoded context and metadata context cost for each file. |
+| `metadata_framing` | All remaining native metadata, path lists, bindings, and JSON framing. |
+| `policy` | Policy character count outside the structured input limit. |
+| `fixed_instructions` | API review instructions without policy, transport schemas, or typed-choice criteria. |
+| `findings` | Safe locations and rule IDs for supported credential formats. |
+
+File costs plus `metadata_framing` equal `total`.
+Equality with the limit does not cause escalation.
+These counts do not measure tokens or the server context capacity.
+
+Reports omit source text, messages, authors, and policy bytes.
+Credential findings cause redaction of all reported file names without changes to cost counts.
+Context errors omit native details that could disclose file names.
+
+### Replay case capture and human labels
+
+```console
+$ patchgate cases capture <hash> --json
+$ patchgate cases list --json
+$ patchgate cases label <case-id> accept -m "The source satisfies the policy"
+$ patchgate cases export --case <case-id> --variants ../variants.json --output ../replay.json
+$ patchgate-eval replay ../replay.json --report ../replay-report.json
+```
+
+Normal decisions capture their exact recorded main snapshot before review.
+Dry runs do not persist cases in the source repository.
+Manual capture selects one unaccepted inbox change.
+
+Each snapshot retains ordered native base hashes, candidate hash, main state, policy digest, channel names, and effective review settings.
+The private `.pijul/patchgate/cases` store contains snapshot metadata and human label history, not source text.
+Native `.pijul/changes` files remain the replay data source.
+Retain the native files that exported cases need.
+
+Case IDs derive from complete snapshot contents.
+Repeated capture retains existing labels.
+Labels never come from model decisions.
+Each explicit label retains its user, time, expected result, and reason.
+The last human label supplies the expected replay result.
+
+The variants file contains a JSON array with the historical replay variant schema below.
+Every variant needs an explicit checkpoint revision.
+Use repeated `--case` options to select several cases.
+Without `--case`, export selects all labeled cases.
+
+Export refuses missing labels, unknown IDs, duplicate selections, and mixed channel pairs.
+The output must be a new file outside the source repository.
+Export refuses file aliases and existing destinations.
+
+Each exported case retains its capture, label history, and review settings.
+Replay checks captured native state and exact policy bytes before comparison.
+Per-case settings replace root replay defaults.
+
 ### Historical replay
 
 ```console
@@ -544,7 +677,7 @@ An optional `policy` file replaces trusted policy only inside the isolated repla
 | `check_timeout_seconds` | `900` |
 
 Replay does not inherit these review settings from `PATCHGATE_*` variables.
-The gate always protects the configured policy path and `nix/`.
+The gate retains its fixed protected paths, including `patchgate.json`.
 Set `configuration.protected` to reproduce other protection rules.
 Replay excludes relative `PATH` entries before it executes historical source operations.
 
@@ -567,6 +700,51 @@ Report writes reject symbolic-link destinations and replace existing files atomi
 No replay report authorizes acceptance.
 
 ## Configuration
+
+### Trusted repository settings
+
+Record `patchgate.json` on main to define repository review rules:
+
+```json
+{
+  "schema_version": 1,
+  "settings": {
+    "policy_path": "POLICY.md",
+    "protected": ["src/**"],
+    "max_change_chars": 8000,
+    "timeout_seconds": 300,
+    "check_timeout_seconds": 900
+  }
+}
+```
+
+Only the recorded main file controls these settings.
+Inbox candidates and unrecorded edits cannot change their own review rules.
+A human must accept changes to `patchgate.json`.
+The gate always protects that file, the effective policy path, and `nix/`.
+The policy path is a literal file name, not a glob pattern.
+
+The file replaces the corresponding environment settings.
+Omitted fields use fixed defaults from the replay configuration table, not environment values.
+An omitted `settings` object also uses those fixed defaults.
+Model connection, model name, API, and channel selection remain outside this file.
+
+Unknown fields, invalid schema versions, unsafe paths, and credential data cause an error.
+Recorded links and directories also cause an error.
+A malformed file never activates environment defaults.
+Paths must be safe and relative.
+Time limits must be finite positive seconds, and fractional seconds are valid.
+
+The gate refreshes these settings before each review pass and human decision.
+New decision records retain their effective values, source, and exact configuration text SHA-256.
+Status, explanation, and review JSON also expose effective configuration.
+Older records remain unchanged.
+
+Without the file, the original environment settings apply.
+Removal of the file restores those original values, including within an active watch process.
+
+### Environment settings
+
 
 `devenv.nix` sets these variables. To use a different model one time, set the variable on the command line, for example `PATCHGATE_MODEL=ternary-bonsai-27b-mlx patchgate review`.
 

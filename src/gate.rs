@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
@@ -15,6 +16,7 @@ use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
 use regex::RegexSet;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::change::{self, Choices, Conflict, ConflictFile, Hunks, Piece, Region, Unmerged, short};
 use crate::model::{Api, Model};
@@ -72,6 +74,16 @@ impl Settings {
                 .context("PATCHGATE_CHECK_TIMEOUT must be a finite, positive number")?,
             interrupted,
         })
+    }
+
+    pub(crate) fn baseline_values(&self) -> crate::configuration::Values {
+        crate::configuration::Values {
+            policy_path: self.policy.clone(),
+            protected: self.protected.clone(),
+            max_change_chars: self.max_change_chars,
+            timeout_seconds: self.timeout.as_secs_f64(),
+            check_timeout_seconds: self.check_timeout.as_secs_f64(),
+        }
     }
 }
 
@@ -162,6 +174,21 @@ impl From<LogEntry> for Item {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
+pub struct Reconsideration {
+    pub previous_record_index: usize,
+    pub previous_record_sha256: String,
+    pub requested_by: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct ResolutionAcceptance {
+    pub id: String,
+    pub main_state: Option<String>,
+    pub candidates: Vec<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Record {
     pub hash: String,
     pub decision: String,
@@ -187,6 +214,14 @@ pub struct Record {
     pub verification: Option<Rc<Verification>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<Rc<crate::configuration::Evidence>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconsideration: Option<Reconsideration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<ResolutionAcceptance>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     conflict: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,6 +248,10 @@ impl Record {
             findings: Vec::new(),
             verification: None,
             user: None,
+            configuration: None,
+            case_id: None,
+            reconsideration: None,
+            resolution: None,
             conflict: false,
             merge: None,
             for_hashes: Vec::new(),
@@ -240,6 +279,90 @@ impl Record {
     }
 }
 
+fn record_sha256(record: &Record) -> Result<String> {
+    struct HashWriter(Sha256);
+    impl Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = HashWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, record)?;
+    Ok(format!("{:x}", writer.0.finalize()))
+}
+
+fn same_native_change(source: &mut File, target: &Path) -> Result<bool> {
+    let mut existing = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(target)?;
+    if !existing.metadata()?.is_file() {
+        bail!("A native change is not a regular file.");
+    }
+    if source.metadata()?.len() != existing.metadata()?.len() {
+        return Ok(false);
+    }
+    source.rewind()?;
+    let mut expected = [0; 8192];
+    let mut actual = [0; 8192];
+    loop {
+        let count = source.read(&mut expected)?;
+        if count == 0 {
+            return Ok(true);
+        }
+        existing.read_exact(&mut actual[..count])?;
+        if expected[..count] != actual[..count] {
+            return Ok(false);
+        }
+    }
+}
+
+fn import_native_change(source: &Path, target: &Path) -> Result<()> {
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(source)?;
+    if !input.metadata()?.is_file() {
+        bail!("A supplemental change is not a regular file.");
+    }
+    match fs::symlink_metadata(target) {
+        Ok(_) => {
+            if !same_native_change(&mut input, target)? {
+                bail!("A native change differs from the human workspace.");
+            }
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let parent = target
+        .parent()
+        .context("The native change path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::copy(&mut input, &mut temporary)?;
+    temporary.as_file().sync_all()?;
+    match temporary.persist_noclobber(target) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !same_native_change(&mut input, target)? {
+                bail!("A native change differs from the human workspace.");
+            }
+        }
+        Err(error) => return Err(error.error.into()),
+    }
+    sync_directory(parent)
+}
+
+struct ResolutionInput<'a> {
+    pijul: &'a Pijul,
+    imported: &'a HashSet<String>,
+}
+
 #[derive(Serialize)]
 pub struct DependencyInfo {
     pub hash: String,
@@ -258,6 +381,7 @@ pub struct Explanation {
     pub protected_paths: Vec<String>,
     pub dependencies: Vec<DependencyInfo>,
     pub current: ReviewBinding,
+    pub configuration: Rc<crate::configuration::Evidence>,
     pub checks: Option<serde_json::Value>,
     pub records: Vec<Record>,
     pub next_actions: Vec<String>,
@@ -268,6 +392,7 @@ pub struct StatusReport {
     pub schema_version: u8,
     pub main: review::MainBinding,
     pub inbox: review::MainBinding,
+    pub configuration: Rc<crate::configuration::Evidence>,
     pub items: Vec<Item>,
     pub behind: Vec<LogEntry>,
     pub records: Vec<Record>,
@@ -280,6 +405,7 @@ pub struct ReviewReport {
     pub authorizes_acceptance: bool,
     pub main: review::MainBinding,
     pub inbox: review::MainBinding,
+    pub configuration: Rc<crate::configuration::Evidence>,
     pub items: Vec<Item>,
     pub records: Vec<Record>,
 }
@@ -583,18 +709,31 @@ pub struct Gate {
     signer: Signer,
     model: Model,
     protected: RegexSet,
+    policy_path: PathBuf,
     changes: HashMap<String, Rc<str>>,
+    baseline: crate::configuration::Values,
+    configuration: Rc<crate::configuration::Evidence>,
+    capture_enabled: bool,
 }
 
 impl Gate {
     pub fn new(settings: Settings) -> Result<Self> {
+        let baseline = settings.baseline_values();
+        let configuration = Rc::new(crate::configuration::Evidence {
+            source: "environment".into(),
+            path: None,
+            sha256: None,
+            values: baseline.clone(),
+        });
         let ledger = Ledger::new(&settings.repo);
         let protected = RegexSet::new(
-            std::iter::once(&settings.policy)
-                .chain(&settings.protected)
+            settings
+                .protected
+                .iter()
                 .map(|pattern| crate::protected::pattern_regex(pattern)),
         )?;
-        let gate = Self {
+        let policy_path = crate::pijul::normalize_path(Path::new(&settings.policy))?;
+        let mut gate = Self {
             pijul: Pijul::new(settings.repo.clone()),
             signer: Signer::new(ledger.directory.clone()),
             model: Model::new(
@@ -604,13 +743,56 @@ impl Gate {
                 settings.model_api,
             )?,
             protected,
+            policy_path,
             settings,
             ledger,
             changes: HashMap::new(),
+            baseline,
+            configuration,
+            capture_enabled: true,
         };
         let _lock = gate.ledger.lock()?;
         gate.recover()?;
+        let main = gate.pijul.snapshot(&gate.settings.main)?;
+        gate.refresh_configuration(&main)?;
         Ok(gate)
+    }
+
+    fn refresh_configuration(&mut self, main: &ChannelSnapshot) -> Result<()> {
+        let evidence =
+            crate::configuration::load(&self.pijul, &self.settings.main, &self.baseline)?;
+        self.require_current_main(main)?;
+        if *self.configuration == evidence {
+            return Ok(());
+        }
+        let values = &evidence.values;
+        if self.settings.protected != values.protected {
+            self.protected = RegexSet::new(
+                values
+                    .protected
+                    .iter()
+                    .map(|pattern| crate::protected::pattern_regex(pattern)),
+            )?;
+        }
+        if self.settings.policy != values.policy_path {
+            self.policy_path = crate::pijul::normalize_path(Path::new(&values.policy_path))?;
+        }
+        let timeout = Duration::try_from_secs_f64(values.timeout_seconds)?;
+        if timeout != self.settings.timeout {
+            self.model = Model::new(
+                &self.settings.model_url,
+                &self.settings.model,
+                timeout,
+                self.settings.model_api,
+            )?;
+        }
+        self.settings.policy.clone_from(&values.policy_path);
+        self.settings.protected.clone_from(&values.protected);
+        self.settings.max_change_chars = values.max_change_chars;
+        self.settings.timeout = timeout;
+        self.settings.check_timeout = Duration::try_from_secs_f64(values.check_timeout_seconds)?;
+        self.configuration = Rc::new(evidence);
+        Ok(())
     }
 
     fn recover(&self) -> Result<()> {
@@ -622,7 +804,7 @@ impl Gate {
         self.ledger.reconcile(&intent, applied)?;
         if applied {
             for record in &intent.records {
-                if record.decision == "merge" {
+                if record.decision == "merge" || record.resolution.is_some() {
                     let note = self.mirror_merge(record, &intent.inbox);
                     if !note.is_empty() {
                         eprintln!("{note}");
@@ -658,6 +840,281 @@ impl Gate {
         Ok(text)
     }
 
+    fn find_entry(&self, prefix: &str, include_main: bool) -> Result<LogEntry> {
+        if prefix.is_empty() {
+            bail!("Give a nonempty change hash prefix.");
+        }
+        let prefix = prefix.to_uppercase();
+        let mut found: Option<LogEntry> = None;
+        let main = if include_main {
+            self.pijul.log(&self.settings.main)?
+        } else {
+            Vec::new()
+        };
+        for entry in self
+            .pijul
+            .log(&self.settings.inbox)?
+            .into_iter()
+            .chain(main)
+        {
+            if !entry.hash.starts_with(&prefix) {
+                continue;
+            }
+            if let Some(previous) = &found {
+                if previous.hash != entry.hash {
+                    bail!("The hash prefix matches more than one change. Give more of the hash.");
+                }
+            } else {
+                found = Some(entry);
+            }
+        }
+        found.context("No change matches this hash prefix")
+    }
+
+    fn isolated(
+        mut settings: Settings,
+        materialize: bool,
+    ) -> Result<(crate::isolation::Isolated, Self)> {
+        let original = Ledger::new(&settings.repo);
+        if original.pending()?.is_some() {
+            bail!(
+                "An acceptance journal needs recovery. Run patchgate status before an isolated operation."
+            );
+        }
+        original.history()?;
+        let isolated = crate::isolation::copy_repository(&settings.repo)?;
+        if materialize {
+            isolated.materialize()?;
+        }
+        settings.repo = isolated.pijul.repo.clone();
+        let mut gate = Self::new(settings)?;
+        gate.capture_enabled = false;
+        match fs::copy(&original.path, &gate.ledger.path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok((isolated, gate))
+    }
+
+    fn case_snapshot(
+        &mut self,
+        hash: &str,
+        main: &ChannelSnapshot,
+        repository: &Path,
+    ) -> Result<crate::cases::Snapshot> {
+        if main.hashes.contains(hash) {
+            bail!(
+                "The change is already in main. Use cases list for its earlier captured snapshot."
+            );
+        }
+        let text = self.change_text(hash)?;
+        if change::dependencies(&text)
+            .iter()
+            .any(|hash| !main.hashes.contains(hash))
+        {
+            bail!("The candidate has unmet prerequisites. Resolve them before case capture.");
+        }
+        let base: Vec<_> = self
+            .pijul
+            .log(&self.settings.main)?
+            .into_iter()
+            .map(|entry| entry.hash)
+            .collect();
+        if base.len() != main.hashes.len() || base.iter().any(|hash| !main.hashes.contains(hash)) {
+            bail!("Main changed during case capture.");
+        }
+        let policy = self
+            .pijul
+            .read_file_bytes(&self.settings.main, &self.settings.policy)?;
+        self.require_current_main(main)?;
+        Ok(crate::cases::Snapshot {
+            repository: repository.to_owned(),
+            main: self.settings.main.clone(),
+            inbox: self.settings.inbox.clone(),
+            main_state: main.state.clone(),
+            base,
+            candidate: hash.into(),
+            policy_path: self.settings.policy.clone(),
+            policy_sha256: policy.map(|bytes| format!("{:x}", Sha256::digest(bytes))),
+            configuration: serde_json::to_value(self.configuration.as_ref())?,
+        })
+    }
+
+    fn capture_record_case(
+        &mut self,
+        hash: &str,
+        main: &ChannelSnapshot,
+    ) -> Result<Option<String>> {
+        if !self.capture_enabled {
+            return Ok(None);
+        }
+        let repository = self.settings.repo.clone();
+        let snapshot = self.case_snapshot(hash, main, &repository)?;
+        Ok(Some(
+            crate::cases::Store::new(&repository).capture(snapshot)?.id,
+        ))
+    }
+
+    pub fn capture_case(settings: Settings, prefix: &str) -> Result<crate::cases::CaseRecord> {
+        let repository = settings.repo.clone();
+        let (_isolated, mut gate) = Self::isolated(settings, false)?;
+        let entry = gate.find_entry(prefix, false)?;
+        let main = gate.pijul.snapshot(&gate.settings.main)?;
+        gate.refresh_configuration(&main)?;
+        let snapshot = gate.case_snapshot(&entry.hash, &main, &repository)?;
+        crate::cases::Store::new(&repository).capture(snapshot)
+    }
+
+    pub fn budget(settings: Settings, prefix: &str) -> Result<crate::budget::Report> {
+        let (_isolated, mut gate) = Self::isolated(settings, false)?;
+        let entry = gate.find_entry(prefix, true)?;
+        let main = gate.pijul.snapshot(&gate.settings.main)?;
+        gate.refresh_configuration(&main)?;
+        let (candidate, policy) = (|| -> Result<_> {
+            let text = gate.change_text(&entry.hash)?;
+            let paths = gate.pijul.touched_paths(&gate.settings.inbox, &entry.paths, &text)?;
+            let candidate = gate.pijul.review_change(&gate.settings.inbox, &entry.hash, &text, &paths)?;
+            let policy = gate.pijul.read_file(&gate.settings.main, &gate.settings.policy)?
+                .context("Main has no trusted review policy")?;
+            Ok((candidate, policy))
+        })().map_err(|_| anyhow!(
+            "Cannot read complete native text context or trusted policy. No budget report is available."
+        ))?;
+        let binding = ReviewBinding::new(
+            std::slice::from_ref(&entry.hash),
+            &gate.settings.policy,
+            Some(&policy),
+            &gate.settings.main,
+            &main,
+        );
+        gate.require_current_main(&main)?;
+        crate::budget::report(
+            &candidate,
+            &binding,
+            &policy,
+            &gate.configuration,
+            gate.settings.model_api,
+        )
+    }
+
+    pub fn prepare_resolution(
+        settings: Settings,
+        prefix: &str,
+        workspace: &Path,
+    ) -> Result<crate::resolution::Prepared> {
+        let repository = settings.repo.clone();
+        let (_isolated, mut gate) = Self::isolated(settings, false)?;
+        let entry = gate.find_entry(prefix, false)?;
+        let main = gate.pijul.snapshot(&gate.settings.main)?;
+        if main.hashes.contains(&entry.hash) {
+            bail!("The change is already in main.");
+        }
+        gate.refresh_configuration(&main)?;
+        let inbox = gate.pijul.log(&gate.settings.inbox)?;
+        let candidates = gate.with_conflicting_dependencies(&entry.hash, &main.hashes, &inbox)?;
+        let policy = gate
+            .pijul
+            .read_file(&gate.settings.main, &gate.settings.policy)?;
+        let binding = ReviewBinding::new(
+            &candidates,
+            &gate.settings.policy,
+            policy.as_deref(),
+            &gate.settings.main,
+            &main,
+        );
+        gate.require_current_main(&main)?;
+        crate::resolution::prepare(
+            &repository,
+            &gate.pijul,
+            &gate.settings.main,
+            &gate.settings.inbox,
+            &candidates,
+            workspace,
+            binding,
+            gate.configuration.as_ref().clone(),
+        )
+    }
+
+    pub fn reconsider(&mut self, prefix: &str, reason: &str) -> Result<ReviewReport> {
+        if reason.trim().is_empty() {
+            bail!("Give an explicit reason for reconsideration.");
+        }
+        let _lock = self.ledger.lock()?;
+        self.recover()?;
+        let main = self.pijul.snapshot(&self.settings.main)?;
+        self.refresh_configuration(&main)?;
+        let inbox = self.pijul.snapshot(&self.settings.inbox)?;
+        let entry = self.find_entry(prefix, false)?;
+        if main.hashes.contains(&entry.hash) {
+            bail!("The change is already in main.");
+        }
+        let history = self.ledger.history()?;
+        if history.iter().any(|record| {
+            record.hash == entry.hash
+                && (record.by == "human" || matches!(record.decision.as_str(), "accept" | "merge"))
+        }) {
+            bail!(
+                "Reconsideration cannot reverse a human decision or a removed acceptance. Use an explicit human decision."
+            );
+        }
+        let (index, previous) = history
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, record)| record.hash == entry.hash)
+            .context("The change has no earlier decision. Use patchgate review.")?;
+        if !matches!(previous.by.as_str(), "gate" | "model")
+            || !matches!(previous.decision.as_str(), "reject" | "escalate")
+        {
+            bail!("Only a gate or model rejection or escalation can receive reconsideration.");
+        }
+        let text = self.change_text(&entry.hash)?;
+        if change::dependencies(&text)
+            .iter()
+            .any(|hash| !main.hashes.contains(hash))
+        {
+            bail!("The candidate has unmet prerequisites. Decide them before reconsideration.");
+        }
+        let reconsideration = Reconsideration {
+            previous_record_index: index,
+            previous_record_sha256: record_sha256(previous)?,
+            requested_by: env::var("USER").unwrap_or_else(|_| "a human".into()),
+            reason: reason.into(),
+        };
+        let configuration = Rc::clone(&self.configuration);
+        let boundary = history.len();
+        let mut item = Item::from(entry);
+        let mut hashes = main.hashes;
+        self.decide_and_land(&mut item, &text, &mut hashes, Some(reconsideration))?;
+        let records = self.ledger.history()?.into_iter().skip(boundary).collect();
+        Ok(ReviewReport {
+            schema_version: 1,
+            dry_run: !self.capture_enabled,
+            authorizes_acceptance: false,
+            main: review::MainBinding {
+                channel: self.settings.main.clone(),
+                state: main.state,
+            },
+            inbox: review::MainBinding {
+                channel: self.settings.inbox.clone(),
+                state: inbox.state,
+            },
+            configuration,
+            items: vec![item],
+            records,
+        })
+    }
+
+    pub fn reconsider_dry_run(
+        settings: Settings,
+        prefix: &str,
+        reason: &str,
+    ) -> Result<ReviewReport> {
+        let (_isolated, mut gate) = Self::isolated(settings, true)?;
+        gate.reconsider(prefix, reason)
+    }
+
     pub fn init(&self) -> Result<Vec<String>> {
         let s = &self.settings;
         let (current, names) = self.pijul.channels()?;
@@ -687,6 +1144,7 @@ impl Gate {
 
     pub fn status_report(&mut self) -> Result<StatusReport> {
         let main = self.pijul.snapshot(&self.settings.main)?;
+        self.refresh_configuration(&main)?;
         let inbox = self.pijul.snapshot(&self.settings.inbox)?;
         let items = self.status()?;
         let relevant: HashSet<_> = items.iter().map(|item| item.hash.as_str()).collect();
@@ -704,6 +1162,7 @@ impl Gate {
             .collect();
         Ok(StatusReport {
             schema_version: 1,
+            configuration: Rc::clone(&self.configuration),
             main: review::MainBinding {
                 channel: self.settings.main.clone(),
                 state: main.state,
@@ -723,6 +1182,7 @@ impl Gate {
             bail!("Give a change hash or a nonempty hash prefix.");
         }
         let main = self.pijul.snapshot(&self.settings.main)?;
+        self.refresh_configuration(&main)?;
         let entries: BTreeMap<_, _> = self
             .pijul
             .log(&self.settings.main)?
@@ -849,6 +1309,7 @@ impl Gate {
             protected_paths,
             dependencies,
             current,
+            configuration: Rc::clone(&self.configuration),
             checks,
             records,
             next_actions,
@@ -856,13 +1317,18 @@ impl Gate {
     }
 
     fn is_protected(&self, path: &str) -> bool {
-        Path::new(path).starts_with(verify::DIRECTORY) || self.protected.is_match(path)
+        let file = Path::new(path);
+        file == self.policy_path
+            || file == Path::new(crate::configuration::PATH)
+            || file.starts_with(verify::DIRECTORY)
+            || self.protected.is_match(path)
     }
 
     pub fn review_report(&mut self, dry_run: bool) -> Result<ReviewReport> {
         let _lock = self.ledger.lock()?;
         self.recover()?;
         let main = self.pijul.snapshot(&self.settings.main)?;
+        self.refresh_configuration(&main)?;
         let inbox = self.pijul.snapshot(&self.settings.inbox)?;
         let boundary = self.ledger.history()?.len();
         let items = self.walk(true, |_| {})?;
@@ -871,6 +1337,7 @@ impl Gate {
             schema_version: 1,
             dry_run,
             authorizes_acceptance: false,
+            configuration: Rc::clone(&self.configuration),
             main: review::MainBinding {
                 channel: self.settings.main.clone(),
                 state: main.state,
@@ -884,21 +1351,8 @@ impl Gate {
         })
     }
 
-    pub fn dry_run(mut settings: Settings) -> Result<ReviewReport> {
-        let original = Ledger::new(&settings.repo);
-        if original.pending()?.is_some() {
-            bail!("An acceptance journal needs recovery. Run patchgate status before a dry-run.");
-        }
-        original.history()?;
-        let isolated = crate::isolation::copy_repository(&settings.repo)?;
-        isolated.materialize()?;
-        settings.repo = isolated.pijul.repo.clone();
-        let mut gate = Self::new(settings)?;
-        match fs::copy(&original.path, &gate.ledger.path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+    pub fn dry_run(settings: Settings) -> Result<ReviewReport> {
+        let (_isolated, mut gate) = Self::isolated(settings, true)?;
         gate.review_report(true)
     }
 
@@ -927,6 +1381,7 @@ impl Gate {
         let _lock = self.ledger.lock()?;
         self.recover()?;
         let main = self.pijul.snapshot(&self.settings.main)?;
+        self.refresh_configuration(&main)?;
         let inbox = self.pijul.log(&self.settings.inbox)?;
         let prefix_upper = prefix.to_uppercase();
         let mut matches = inbox
@@ -970,6 +1425,16 @@ impl Gate {
         });
         item.reason = reason.clone();
         item.decided = true;
+        let text = self.change_text(&item.hash)?;
+        let case_id = if change::dependencies(&text)
+            .iter()
+            .all(|hash| main.hashes.contains(hash))
+        {
+            self.capture_record_case(&item.hash, &main)?
+        } else {
+            None
+        };
+        let configuration = Rc::clone(&self.configuration);
         let record = |hash: &str| {
             let message = inbox
                 .iter()
@@ -983,6 +1448,10 @@ impl Gate {
             };
             let mut record = Record::new(hash.into(), message, decision, "human", explanation);
             record.user = Some(user.clone());
+            record.configuration = Some(Rc::clone(&configuration));
+            if hash == item.hash {
+                record.case_id.clone_from(&case_id);
+            }
             record
         };
         if decision != "accept" {
@@ -993,7 +1462,7 @@ impl Gate {
         }
         let hashes = self.with_conflicting_dependencies(&item.hash, &main.hashes, &inbox)?;
         let records: Vec<_> = hashes.iter().map(|hash| record(hash)).collect();
-        match self.land(&hashes, &main, &records) {
+        match self.land(&hashes, &main, &records, None) {
             Err(error) if error.is::<SecretViolation>() => {
                 let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
                 let mut refusal = record(&item.hash);
@@ -1020,6 +1489,149 @@ impl Gate {
                 Ok(item)
             }
         }
+    }
+
+    pub fn accept_resolution(&mut self, workspace: &Path, reason: Option<&str>) -> Result<Item> {
+        let _lock = self.ledger.lock()?;
+        self.recover()?;
+        let main = self.pijul.snapshot(&self.settings.main)?;
+        self.refresh_configuration(&main)?;
+        let prepared = crate::resolution::load(&self.settings.repo, workspace)?;
+        if prepared.main != self.settings.main
+            || prepared.inbox != self.settings.inbox
+            || prepared.binding.main.state != main.state
+            || prepared.base.len() != main.hashes.len()
+            || prepared.base.iter().any(|hash| !main.hashes.contains(hash))
+        {
+            bail!(
+                "Main changed after resolution preparation. Prepare a new workspace before acceptance."
+            );
+        }
+        if prepared.configuration != *self.configuration {
+            bail!("Effective review settings changed after preparation. Prepare a new workspace.");
+        }
+        let primary = prepared
+            .candidates
+            .last()
+            .context("The resolution has no candidate")?;
+        let mut item = Item::from(self.find_entry(primary, false)?);
+        let inbox = self.pijul.log(&self.settings.inbox)?;
+        if self.with_conflicting_dependencies(primary, &main.hashes, &inbox)? != prepared.candidates
+        {
+            bail!(
+                "The permitted candidate set changed after preparation. Prepare a new workspace."
+            );
+        }
+        let user = env::var("USER").unwrap_or_else(|_| "a human".into());
+        let reason = reason
+            .filter(|reason| !reason.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{user} accepted the prepared human resolution."));
+        self.require_current_main(&main)?;
+        let completed = crate::resolution::record(&prepared, &self.signer, &reason)?;
+        self.require_current_main(&main)?;
+        let entries: HashMap<_, _> = completed
+            .pijul
+            .review_metadata(&self.settings.main)?
+            .into_iter()
+            .map(|entry| (entry.hash.clone(), entry))
+            .collect();
+        let mut findings = Vec::new();
+        let records = completed
+            .hashes
+            .iter()
+            .map(|hash| -> Result<Record> {
+                let entry = entries
+                    .get(hash)
+                    .context("The resolution lacks native change metadata")?;
+                for (path, text) in [
+                    ("[change.message]", entry.message.as_str()),
+                    ("[change.timestamp]", entry.timestamp.as_str()),
+                ] {
+                    findings.extend(crate::secrets::scan_text(path, text.as_bytes()));
+                }
+                for author in &entry.authors {
+                    findings.extend(crate::secrets::scan_text(
+                        "[change.author]",
+                        author.as_bytes(),
+                    ));
+                }
+                for path in &entry.paths {
+                    findings.extend(crate::secrets::scan_text("[change.path]", path.as_bytes()));
+                }
+                let mut record = Record::new(
+                    hash.clone(),
+                    entry.message.clone(),
+                    "accept",
+                    "human",
+                    reason.clone(),
+                );
+                record.user = Some(user.clone());
+                record.configuration = Some(Rc::clone(&self.configuration));
+                record.resolution = Some(ResolutionAcceptance {
+                    id: prepared.id.clone(),
+                    main_state: main.state.clone(),
+                    candidates: prepared.candidates.clone(),
+                });
+                Ok(record)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !findings.is_empty() {
+            let mut refusal = records
+                .iter()
+                .find(|record| record.hash == *primary)
+                .cloned()
+                .context("The resolution audit lacks its candidate")?;
+            refusal.reject_secrets(findings);
+            self.ledger.append(&refusal)?;
+            bail!("{}", refusal.reason);
+        }
+        for hash in &completed.hashes {
+            if !completed.imported.contains(hash) {
+                continue;
+            }
+            let source = completed.pijul.change_file(hash);
+            let source = crate::pijul::safe_path(
+                &completed.pijul.repo,
+                source.strip_prefix(&completed.pijul.repo)?,
+            )?;
+            let target = self.pijul.change_file(hash);
+            let target = crate::pijul::safe_path(
+                &self.settings.repo,
+                target.strip_prefix(&self.settings.repo)?,
+            )?;
+            import_native_change(&source, &target)?;
+        }
+        sync_directory(&self.settings.repo.join(".pijul/changes"))?;
+        let landed = match self.land(
+            &completed.hashes,
+            &main,
+            &records,
+            Some(ResolutionInput {
+                pijul: &completed.pijul,
+                imported: &completed.imported,
+            }),
+        ) {
+            Err(error) if error.is::<SecretViolation>() => {
+                let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
+                let mut refusal = records
+                    .iter()
+                    .find(|record| record.hash == *primary)
+                    .cloned()
+                    .context("The resolution audit lacks its candidate")?;
+                refusal.reject_secrets(findings);
+                self.ledger.append(&refusal)?;
+                bail!("{}", refusal.reason);
+            }
+            result => result?,
+        };
+        self.check_extra(&landed.extra)?;
+        item.state = State::Accepted;
+        item.decided = true;
+        item.reason = reason;
+        item.note = landed.note;
+        item.merge = landed.merge;
+        Ok(item)
     }
 
     fn with_conflicting_dependencies(
@@ -1104,7 +1716,7 @@ impl Gate {
                         State::Waiting
                     };
                 } else if decide {
-                    self.decide_and_land(&mut item, &text, &mut main)?;
+                    self.decide_and_land(&mut item, &text, &mut main, None)?;
                     report(&item);
                 }
             }
@@ -1119,6 +1731,7 @@ impl Gate {
         item: &mut Item,
         text: &str,
         main: &mut HashSet<String>,
+        reconsideration: Option<Reconsideration>,
     ) -> Result<()> {
         let reviewed = self.pijul.snapshot(&self.settings.main)?;
         if reviewed.hashes != *main {
@@ -1127,7 +1740,14 @@ impl Gate {
                 self.settings.main
             );
         }
+        self.refresh_configuration(&reviewed)?;
+        let case_id = self.capture_record_case(&item.hash, &reviewed)?;
         let mut record = self.decide(item, text, &reviewed)?;
+        if reconsideration.is_some() && record.execution_error.is_some() {
+            return Err(InvalidModelReply.into());
+        }
+        record.case_id = case_id;
+        record.reconsideration = reconsideration;
         self.require_current_main(&reviewed)?;
         let mut extra = BTreeSet::new();
         if record.decision == "accept" {
@@ -1135,6 +1755,7 @@ impl Gate {
                 std::slice::from_ref(&item.hash),
                 &reviewed,
                 std::slice::from_ref(&record),
+                None,
             ) {
                 Err(error) if error.is::<SecretViolation>() => {
                     let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
@@ -1170,6 +1791,9 @@ impl Gate {
                 }
             }
         }
+        if record.reconsideration.is_some() && record.execution_error.is_some() {
+            return Err(InvalidModelReply.into());
+        }
         if record.decision != "accept" {
             self.ledger.append(&record)?;
         }
@@ -1195,6 +1819,7 @@ impl Gate {
             "gate",
             String::new(),
         );
+        record.configuration = Some(Rc::clone(&self.configuration));
         let paths = match self
             .pijul
             .touched_paths(&self.settings.inbox, &item.paths, text)
@@ -1296,25 +1921,34 @@ impl Gate {
         hashes: &[String],
         main: &ChannelSnapshot,
         records: &[Record],
+        resolution: Option<ResolutionInput<'_>>,
     ) -> Result<Landing> {
-        let log_paths: HashMap<_, _> = self
-            .pijul
-            .log(&self.settings.inbox)?
+        let entries = if let Some(input) = &resolution {
+            input.pijul.log(&self.settings.main)?
+        } else {
+            self.pijul.log(&self.settings.inbox)?
+        };
+        let log_paths: HashMap<_, _> = entries
             .into_iter()
             .map(|entry| (entry.hash, entry.paths))
             .collect();
         let mut paths = BTreeSet::new();
         for hash in hashes {
             let text = self.change_text(hash)?;
-            paths.extend(
-                self.pijul
-                    .touched_paths(
-                        &self.settings.inbox,
-                        log_paths.get(hash).map(Vec::as_slice).unwrap_or_default(),
-                        &text,
-                    )
-                    .map_err(|error| Unmerged(error.to_string()))?,
-            );
+            let candidate_paths = if let Some(input) = &resolution {
+                input.pijul.touched_paths(
+                    &self.settings.main,
+                    log_paths.get(hash).map(Vec::as_slice).unwrap_or_default(),
+                    &text,
+                )
+            } else {
+                self.pijul.touched_paths(
+                    &self.settings.inbox,
+                    log_paths.get(hash).map(Vec::as_slice).unwrap_or_default(),
+                    &text,
+                )
+            };
+            paths.extend(candidate_paths.map_err(|error| Unmerged(error.to_string()))?);
         }
         self.pijul
             .check_paths(&paths)
@@ -1340,6 +1974,16 @@ impl Gate {
             let (_, stderr) = scratch.call([Path::new("apply"), &self.pijul.change_file(hash)])?;
             reported.extend(change::conflict_report(&stderr));
         }
+        let staged = scratch.hashes(&self.settings.main)?;
+        let planned: HashSet<_> = hashes.iter().map(String::as_str).collect();
+        if main.hashes.iter().any(|hash| !staged.contains(hash))
+            || hashes.iter().any(|hash| !staged.contains(hash))
+            || staged
+                .iter()
+                .any(|hash| !main.hashes.contains(hash) && !planned.contains(hash.as_str()))
+        {
+            bail!("The staged source differs from the exact acceptance plan.");
+        }
         let mut remaining = scratch.conflicts()?;
         paths.extend(
             reported
@@ -1355,11 +1999,29 @@ impl Gate {
         let merge = if remaining.is_empty() && files.is_empty() {
             None
         } else {
+            if resolution.is_some() {
+                return Err(Unmerged(
+                    "Complete the human resolution before acceptance. Conflicts remain.".into(),
+                )
+                .into());
+            }
             remaining.extend(reported.into_iter().filter(|r| files.contains_key(&r.path)));
             Some(self.merge(&scratch, hashes, main, &remaining, &files)?)
         };
         // The native transaction checks main before it applies this candidate.
-        let mut args: Vec<_> = hashes.iter().map(std::ffi::OsString::from).collect();
+        let mut args: Vec<_> = hashes
+            .iter()
+            .map(|hash| {
+                if resolution
+                    .as_ref()
+                    .is_some_and(|input| input.imported.contains(hash))
+                {
+                    self.pijul.change_file(hash).into_os_string()
+                } else {
+                    std::ffi::OsString::from(hash)
+                }
+            })
+            .collect();
         let mut expected: HashSet<&str> = hashes.iter().map(String::as_str).collect();
         if let Some(merge) = &merge {
             args.push(scratch.change_file(&merge.hash).into_os_string());
@@ -1371,6 +2033,9 @@ impl Gate {
                 record.merge = Some(merge.hash.clone());
             }
             audit.push(merge.clone());
+        }
+        for record in &mut audit {
+            record.configuration = Some(Rc::clone(&self.configuration));
         }
         let source = directory.path().join("candidate-source");
         scratch.export_source(&self.settings.main, &source)?;
@@ -1439,10 +2104,14 @@ impl Gate {
             .cloned()
             .collect();
         self.ledger.reconcile(&intent, true)?;
-        let note = merge
-            .as_ref()
+        let note = intent
+            .records
+            .iter()
+            .filter(|record| record.decision == "merge" || record.resolution.is_some())
             .map(|record| self.mirror_merge(record, &self.settings.inbox))
-            .unwrap_or_default();
+            .filter(|note| !note.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         self.ledger.finish()?;
         Ok(Landing {
             main: after,
@@ -2064,6 +2733,302 @@ mod feature_tests {
         Ok(files)
     }
 
+    fn pending_fixture(files: &[(&str, &[u8])]) -> Result<(tempfile::TempDir, Settings, String)> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?.join("repo");
+        fs::create_dir(&root)?;
+        let pijul = Pijul::new(root.clone());
+        pijul.run(["init"])?;
+        fs::write(root.join("POLICY.md"), "Accept safe source changes.\n")?;
+        fs::write(root.join("value.txt"), "base\n")?;
+        pijul.run(["add", "POLICY.md", "value.txt"])?;
+        let signer = Signer::new(root.join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Define source",
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        pijul.run(["fork", "--channel", "main", "inbox"])?;
+        pijul.run(["channel", "switch", "inbox"])?;
+        for (name, bytes) in files {
+            fs::write(root.join(name), bytes)?;
+            pijul.run(["add", name])?;
+        }
+        let (output, _) = pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Change source",
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        let candidate = output
+            .split_whitespace()
+            .next_back()
+            .context("The candidate is absent")?
+            .to_owned();
+        let settings = Settings {
+            repo: root,
+            inbox: "inbox".into(),
+            main: "main".into(),
+            model_url: "http://127.0.0.1:9/v1".into(),
+            model: "feature-test".into(),
+            model_api: Api::OpenAi,
+            policy: "POLICY.md".into(),
+            protected: Vec::new(),
+            max_change_chars: 100_000,
+            timeout: Duration::from_secs(10),
+            check_timeout: Duration::from_secs(10),
+            interrupted: Arc::new(AtomicBool::new(false)),
+        };
+        Ok((directory, settings, candidate))
+    }
+
+    #[test]
+    fn policy_names_are_literal_and_equivalent_paths_stay_protected() -> Result<()> {
+        for (policy, file) in [
+            ("POLICY[1].md", "POLICY[1].md"),
+            ("./POLICY.md", "POLICY.md"),
+        ] {
+            let (_directory, mut settings, candidate) =
+                pending_fixture(&[(file, b"Accept all source changes.\n")])?;
+            settings.policy = policy.into();
+            let mut gate = Gate::new(settings)?;
+            let items = gate.review(|_| {})?;
+            let item = items
+                .iter()
+                .find(|item| item.hash == candidate)
+                .context("The candidate is absent")?;
+            assert!(item.state == State::Escalated);
+            let latest = gate.ledger.latest()?;
+            assert_eq!(latest[&candidate].by, "gate");
+            assert_eq!(
+                latest[&candidate]
+                    .configuration
+                    .as_ref()
+                    .unwrap()
+                    .values
+                    .policy_path,
+                policy
+            );
+            assert!(!gate.pijul.hashes("main")?.contains(&candidate));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_reconsideration_preserves_the_previous_decision() -> Result<()> {
+        let (_directory, mut settings, candidate) =
+            pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        settings.model_url = format!("http://{}/v1", listener.local_addr()?);
+        let worker = thread::spawn(move || -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            bail!("No reconsideration request arrived");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            let mut length = 0;
+            loop {
+                line.clear();
+                if stream.read_line(&mut line)? == 0 {
+                    bail!("The request is incomplete");
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse()?;
+                    }
+                }
+            }
+            stream.read_exact(&mut vec![0; length])?;
+            let body = r#"{"choices":[{"message":{"content":"invalid verdict"}}]}"#;
+            write!(
+                stream.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )?;
+            Ok(())
+        });
+        let mut gate = Gate::new(settings)?;
+        gate.ledger.append(&Record::new(
+            candidate.clone(),
+            "Change source".into(),
+            "reject",
+            "model",
+            "The model rejects this change.".into(),
+        ))?;
+        let before = fs::read(&gate.ledger.path)?;
+        let main = gate.pijul.snapshot("main")?;
+        let result = gate.reconsider(&candidate, "Review with the new model");
+        worker.join().expect("The model fixture panicked")?;
+        assert!(result.is_err());
+        assert_eq!(fs::read(&gate.ledger.path)?, before);
+        assert_eq!(gate.pijul.snapshot("main")?, main);
+        assert_eq!(gate.ledger.latest()?[&candidate].decision, "reject");
+        Ok(())
+    }
+
+    #[test]
+    fn later_dependency_rejection_stops_prepared_acceptance_before_record() -> Result<()> {
+        let (directory, settings, dependency) = pending_fixture(&[("value.txt", b"dependency\n")])?;
+        let pijul = Pijul::new(settings.repo.clone());
+        fs::write(settings.repo.join("value.txt"), "dependent candidate\n")?;
+        let signer = Signer::new(settings.repo.join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        let (output, _) = pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Add a dependent change",
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        let candidate = output
+            .split_whitespace()
+            .next_back()
+            .context("The candidate is absent")?;
+        let mut gate = Gate::new(settings.clone())?;
+        let mut conflict = Record::new(
+            dependency.clone(),
+            "Change source".into(),
+            "escalate",
+            "gate",
+            "A human must resolve this conflict.".into(),
+        );
+        conflict.conflict = true;
+        gate.ledger.append(&conflict)?;
+        let prepared = Gate::prepare_resolution(
+            settings,
+            candidate,
+            &fs::canonicalize(directory.path())?.join("workspace"),
+        )?;
+        assert_eq!(
+            prepared.candidates,
+            vec![dependency.clone(), candidate.to_owned()]
+        );
+        gate.decide_by_hand(&dependency, "reject", Some("Retain the current rejection"))?;
+        fs::write(prepared.workspace.join("value.txt"), "pending human edit\n")?;
+        let workspace = Pijul::new(prepared.workspace.clone());
+        let workspace_before = workspace.snapshot("main")?;
+        let main = gate.pijul.snapshot("main")?;
+        let before = fs::read(&gate.ledger.path)?;
+        assert!(gate.accept_resolution(&prepared.workspace, None).is_err());
+        assert_eq!(fs::read(&gate.ledger.path)?, before);
+        assert_eq!(gate.pijul.snapshot("main")?, main);
+        assert_eq!(workspace.snapshot("main")?, workspace_before);
+        assert_eq!(
+            fs::read(prepared.workspace.join("value.txt"))?,
+            b"pending human edit\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn supplemental_credentials_never_enter_acceptance_audit() -> Result<()> {
+        let (directory, settings, candidate) = pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let prepared = Gate::prepare_resolution(
+            settings.clone(),
+            &candidate,
+            &fs::canonicalize(directory.path())?.join("workspace"),
+        )?;
+        let workspace = Pijul::new(prepared.workspace.clone());
+        fs::write(prepared.workspace.join("value.txt"), "human edit\n")?;
+        let credential = ["ghp_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+        let signer = Signer::new(settings.repo.join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        workspace.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                &format!("Review token {credential}"),
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        let mut gate = Gate::new(settings)?;
+        let main = gate.pijul.snapshot("main")?;
+        let error = gate
+            .accept_resolution(&prepared.workspace, None)
+            .err()
+            .context("The credential did not stop acceptance")?;
+        assert!(!format!("{error:#}").contains(&credential));
+        assert_eq!(gate.pijul.snapshot("main")?, main);
+        assert!(!String::from_utf8(fs::read(&gate.ledger.path)?)?.contains(&credential));
+        let latest = gate.ledger.latest()?;
+        assert_eq!(latest[&candidate].decision, "reject");
+        assert!(
+            latest[&candidate]
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == "github-token")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn budget_context_errors_do_not_disclose_credential_paths() -> Result<()> {
+        let credential = ["ghp_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+        let (_directory, settings, candidate) =
+            pending_fixture(&[(&credential, b"zero\0bytes\n")])?;
+        let before = source_bytes(&settings.repo)?;
+        let error = Gate::budget(settings.clone(), &candidate)
+            .err()
+            .context("The binary context did not stop the budget report")?;
+        assert!(!format!("{error:#}").contains(&credential));
+        assert_eq!(source_bytes(&settings.repo)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn native_import_never_publishes_failed_copies_or_replaces_different_bytes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source");
+        let target = directory.path().join("changes/target");
+        fs::create_dir(&source)?;
+        assert!(import_native_change(&source, &target).is_err());
+        assert!(!target.exists());
+        fs::remove_dir(&source)?;
+        fs::write(&source, b"complete native bytes")?;
+        import_native_change(&source, &target)?;
+        assert_eq!(fs::read(&target)?, b"complete native bytes");
+        fs::write(&target, b"partial")?;
+        assert!(import_native_change(&source, &target).is_err());
+        assert_eq!(fs::read(&target)?, b"partial");
+        assert_eq!(fs::read(&source)?, b"complete native bytes");
+        Ok(())
+    }
+
     #[test]
     fn accepted_dry_run_preserves_native_state_audit_keys_and_dirty_source() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -2139,6 +3104,7 @@ mod feature_tests {
                     Err(error) => return Err(error.into()),
                 }
             };
+            stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(Duration::from_secs(10)))?;
             let mut stream = BufReader::new(stream);
             let mut line = String::new();

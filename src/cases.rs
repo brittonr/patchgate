@@ -1,0 +1,873 @@
+use std::collections::BTreeSet;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context, Result, bail, ensure};
+use chrono::{SecondsFormat, Utc};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::configuration::{Evidence, Values};
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Snapshot {
+    pub repository: PathBuf,
+    pub main: String,
+    pub inbox: String,
+    pub main_state: Option<String>,
+    pub base: Vec<String>,
+    pub candidate: String,
+    pub policy_path: String,
+    pub policy_sha256: Option<String>,
+    pub configuration: Value,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Label {
+    Accept,
+    Reject,
+    Escalate,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LabelRecord {
+    pub user: String,
+    pub time: String,
+    pub expected: Label,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaseRecord {
+    pub schema_version: u32,
+    pub id: String,
+    pub snapshot: Snapshot,
+    pub captured_at: String,
+    pub labels: Vec<LabelRecord>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ExportReport {
+    pub schema_version: u32,
+    pub output: PathBuf,
+    pub cases: Vec<String>,
+    pub variants: usize,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Variant {
+    id: String,
+    model_url: String,
+    model: String,
+    api: String,
+    revision: String,
+    policy: Option<PathBuf>,
+}
+
+pub struct Store {
+    repo: PathBuf,
+}
+
+fn now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == 53
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || (b'2'..=b'7').contains(&byte))
+}
+
+fn digest(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn identity(snapshot: &Snapshot) -> Result<String> {
+    Ok(digest(&serde_json::to_vec(snapshot)?))
+}
+
+fn safe_text(value: &str) -> bool {
+    !value.trim().is_empty() && !value.chars().any(char::is_control)
+}
+
+fn validate_values(values: &Values) -> Result<()> {
+    let policy = crate::pijul::normalize_path(Path::new(&values.policy_path))
+        .map_err(|_| anyhow::anyhow!("The captured policy path is not safe."))?;
+    ensure!(
+        !values.policy_path.is_empty()
+            && !policy.as_os_str().is_empty()
+            && !policy.starts_with(".pijul"),
+        "The captured policy path is not safe."
+    );
+    ensure!(
+        std::time::Duration::try_from_secs_f64(values.timeout_seconds).is_ok()
+            && std::time::Duration::try_from_secs_f64(values.check_timeout_seconds).is_ok(),
+        "Captured time limits must be finite and nonnegative."
+    );
+    ensure!(
+        values
+            .protected
+            .iter()
+            .all(|pattern| safe_text(pattern) && !pattern.contains(',')),
+        "The captured protected patterns are not valid."
+    );
+    Ok(())
+}
+
+fn settings(snapshot: &Snapshot) -> Result<Values> {
+    let evidence: Evidence = serde_json::from_value(snapshot.configuration.clone())
+        .context("The captured configuration evidence is not valid.")?;
+    validate_values(&evidence.values)?;
+    ensure!(
+        snapshot.policy_path == evidence.values.policy_path,
+        "The captured policy path differs from its configuration."
+    );
+    Ok(evidence.values)
+}
+
+fn validate_snapshot(snapshot: &Snapshot, repository: &Path) -> Result<()> {
+    ensure!(
+        snapshot.repository == repository,
+        "The case belongs to a different repository."
+    );
+    for channel in [&snapshot.main, &snapshot.inbox] {
+        ensure!(
+            safe_text(channel) && !channel.starts_with('-'),
+            "The captured channel name is not valid."
+        );
+    }
+    ensure!(
+        snapshot.main != snapshot.inbox,
+        "Captured channels must differ."
+    );
+    ensure!(
+        valid_hash(&snapshot.candidate),
+        "The captured candidate hash is not valid."
+    );
+    let mut hashes = BTreeSet::new();
+    for hash in &snapshot.base {
+        ensure!(
+            valid_hash(hash) && hashes.insert(hash),
+            "The captured base hashes are not valid or unique."
+        );
+    }
+    ensure!(
+        !hashes.contains(&snapshot.candidate),
+        "The captured base contains its candidate."
+    );
+    if let Some(hash) = &snapshot.policy_sha256 {
+        ensure!(
+            hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "The captured policy digest is not valid."
+        );
+    }
+    settings(snapshot)?;
+    ensure!(
+        crate::secrets::scan_text("[case.snapshot]", &serde_json::to_vec(snapshot)?).is_empty(),
+        "The case snapshot contains credential data."
+    );
+    Ok(())
+}
+
+fn regular_private(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() && metadata.nlink() == 1,
+        "Case metadata must use a regular file without aliases."
+    );
+    Ok(())
+}
+
+impl Store {
+    pub fn new(repo: &Path) -> Self {
+        Self { repo: repo.into() }
+    }
+
+    fn repository(&self) -> Result<PathBuf> {
+        let repo = fs::canonicalize(&self.repo).context("Read the case repository path.")?;
+        let metadata = crate::pijul::safe_path(&repo, Path::new(".pijul"))?;
+        ensure!(
+            metadata.is_dir(),
+            "The case repository has no Pijul metadata."
+        );
+        Ok(repo)
+    }
+
+    fn directory(&self, repo: &Path) -> Result<PathBuf> {
+        crate::pijul::safe_path(repo, Path::new(".pijul/patchgate/cases"))
+    }
+
+    fn lock(&self, repo: &Path) -> Result<File> {
+        let directory = self.directory(repo)?;
+        fs::create_dir_all(&directory)?;
+        File::open(&directory)?.sync_all()?;
+        File::open(repo.join(".pijul/patchgate"))?.sync_all()?;
+        File::open(repo.join(".pijul"))?.sync_all()?;
+        let path = crate::pijul::safe_path(repo, Path::new(".pijul/patchgate/cases/lock"))?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&path)?;
+        regular_private(&path)?;
+        FileExt::lock_exclusive(&file)?;
+        Ok(file)
+    }
+
+    fn record(&self, repo: &Path, id: &str) -> Result<Option<CaseRecord>> {
+        let relative = Path::new(".pijul/patchgate/cases").join(format!("{id}.json"));
+        let path = crate::pijul::safe_path(repo, &relative)?;
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file() && metadata.nlink() == 1,
+            "Case metadata must use a regular file without aliases."
+        );
+        let record: CaseRecord =
+            serde_json::from_reader(file).context("Read a captured case record.")?;
+        ensure!(
+            record.schema_version == 1 && record.id == id && identity(&record.snapshot)? == id,
+            "The case record identity is not valid."
+        );
+        validate_snapshot(&record.snapshot, repo)?;
+        chrono::DateTime::parse_from_rfc3339(&record.captured_at)
+            .context("The capture time is not valid.")?;
+        for label in &record.labels {
+            ensure!(
+                safe_text(&label.user) && !label.reason.trim().is_empty(),
+                "The case label lacks an explicit user or reason."
+            );
+            chrono::DateTime::parse_from_rfc3339(&label.time)
+                .context("The label time is not valid.")?;
+        }
+        Ok(Some(record))
+    }
+
+    fn records(&self, repo: &Path) -> Result<Vec<CaseRecord>> {
+        let directory = self.directory(repo)?;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .context("A case metadata name is not valid UTF-8.")?;
+            if name == "lock" || name.starts_with(".tmp") {
+                continue;
+            }
+            let id = name
+                .strip_suffix(".json")
+                .context("A case metadata name is not valid.")?;
+            ensure!(
+                id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "A case metadata ID is not valid."
+            );
+            records.push(
+                self.record(repo, id)?
+                    .context("A listed case record is absent.")?,
+            );
+        }
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+
+    fn save(&self, repo: &Path, record: &CaseRecord) -> Result<()> {
+        let directory = self.directory(repo)?;
+        let path = crate::pijul::safe_path(
+            repo,
+            &Path::new(".pijul/patchgate/cases").join(format!("{}.json", record.id)),
+        )?;
+        if path.exists() {
+            regular_private(&path)?;
+        }
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".tmp")
+            .tempfile_in(&directory)?;
+        serde_json::to_writer_pretty(&mut temporary, record)?;
+        temporary.write_all(b"\n")?;
+        temporary.as_file().sync_all()?;
+        self.directory(repo)?;
+        temporary.persist(&path).map_err(|error| error.error)?;
+        File::open(directory)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn capture(&self, mut snapshot: Snapshot) -> Result<CaseRecord> {
+        let repo = self.repository()?;
+        snapshot.repository =
+            fs::canonicalize(&snapshot.repository).context("Read the captured repository path.")?;
+        validate_snapshot(&snapshot, &repo)?;
+        let _lock = self.lock(&repo)?;
+        let id = identity(&snapshot)?;
+        if let Some(record) = self.record(&repo, &id)? {
+            ensure!(
+                record.snapshot == snapshot,
+                "The case ID has a different snapshot."
+            );
+            return Ok(record);
+        }
+        let record = CaseRecord {
+            schema_version: 1,
+            id,
+            snapshot,
+            captured_at: now(),
+            labels: Vec::new(),
+        };
+        self.save(&repo, &record)?;
+        Ok(record)
+    }
+
+    pub fn list(&self) -> Result<Vec<CaseRecord>> {
+        let repo = self.repository()?;
+        self.records(&repo)
+    }
+
+    pub fn label(&self, prefix: &str, expected: Label, reason: &str) -> Result<CaseRecord> {
+        ensure!(
+            !reason.trim().is_empty(),
+            "A human label needs an explicit reason."
+        );
+        let repo = self.repository()?;
+        let _lock = self.lock(&repo)?;
+        let records = self.records(&repo)?;
+        let mut record = select(&records, prefix)?.clone();
+        let user = std::env::var("USER").unwrap_or_else(|_| "a human".into());
+        ensure!(safe_text(&user), "The human user name is not valid.");
+        record.labels.push(LabelRecord {
+            user,
+            time: now(),
+            expected,
+            reason: reason.into(),
+        });
+        self.save(&repo, &record)?;
+        Ok(record)
+    }
+
+    pub fn export(&self, ids: &[String], variants: &Path, output: &Path) -> Result<ExportReport> {
+        let repo = self.repository()?;
+        let records = self.records(&repo)?;
+        let selected = if ids.is_empty() {
+            records
+                .iter()
+                .filter(|record| !record.labels.is_empty())
+                .collect::<Vec<_>>()
+        } else {
+            let mut selected = Vec::new();
+            let mut unique = BTreeSet::new();
+            for id in ids {
+                let record = select(&records, id)?;
+                ensure!(
+                    unique.insert(&record.id),
+                    "The export selects one case more than once."
+                );
+                selected.push(record);
+            }
+            selected
+        };
+        ensure!(!selected.is_empty(), "The export has no labeled cases.");
+        let first = selected[0];
+        for record in &selected {
+            ensure!(
+                !record.labels.is_empty(),
+                "A selected case has no explicit human label."
+            );
+            ensure!(
+                record.snapshot.main == first.snapshot.main
+                    && record.snapshot.inbox == first.snapshot.inbox,
+                "Selected cases use different channels. Use explicit case IDs."
+            );
+            for hash in record
+                .snapshot
+                .base
+                .iter()
+                .chain(std::iter::once(&record.snapshot.candidate))
+            {
+                let relative = Path::new(".pijul/changes")
+                    .join(&hash[..2])
+                    .join(format!("{}.change", &hash[2..]));
+                let path = crate::pijul::safe_path(&repo, &relative)?;
+                ensure!(
+                    fs::symlink_metadata(path)?.is_file(),
+                    "A native case change is not a regular file."
+                );
+            }
+        }
+        let variants_path = fs::canonicalize(variants).context("Read the replay variants path.")?;
+        let mut variants: Vec<Variant> = serde_json::from_slice(&fs::read(&variants_path)?)
+            .context("Read the replay variants array.")?;
+        validate_variants(
+            &mut variants,
+            variants_path
+                .parent()
+                .context("The variants parent is absent.")?,
+        )?;
+        let cases = selected
+            .iter()
+            .map(|record| -> Result<Value> {
+                Ok(json!({
+                    "id": record.id,
+                    "base": record.snapshot.base,
+                    "candidate": record.snapshot.candidate,
+                    "expected": record.labels.last().context("The case label is absent.")?.expected,
+                    "configuration": settings(&record.snapshot)?,
+                    "snapshot": record.snapshot,
+                    "labels": record.labels,
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let manifest = json!({
+            "schema_version": 1,
+            "repository": repo,
+            "main": first.snapshot.main,
+            "inbox": first.snapshot.inbox,
+            "configuration": settings(&first.snapshot)?,
+            "cases": cases,
+            "variants": variants,
+        });
+        let output = export_path(output, &repo)?;
+        ensure!(
+            output != variants_path,
+            "The export cannot replace the variants file."
+        );
+        let parent = output.parent().context("The export parent is absent.")?;
+        fs::create_dir_all(parent)?;
+        export_path(&output, &repo)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(&mut temporary, &manifest)?;
+        temporary.write_all(b"\n")?;
+        temporary.as_file().sync_all()?;
+        export_path(&output, &repo)?;
+        temporary
+            .persist_noclobber(&output)
+            .map_err(|error| error.error)?;
+        File::open(parent)?.sync_all()?;
+        Ok(ExportReport {
+            schema_version: 1,
+            output,
+            cases: selected.iter().map(|record| record.id.clone()).collect(),
+            variants: variants.len(),
+        })
+    }
+}
+
+fn select<'a>(records: &'a [CaseRecord], prefix: &str) -> Result<&'a CaseRecord> {
+    ensure!(
+        !prefix.is_empty()
+            && prefix.len() <= 64
+            && prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "The case ID prefix is not valid."
+    );
+    let mut matches = records
+        .iter()
+        .filter(|record| record.id.starts_with(prefix));
+    let record = matches.next().context("No case matches the ID prefix.")?;
+    ensure!(matches.next().is_none(), "The case ID prefix is ambiguous.");
+    Ok(record)
+}
+
+fn validate_variants(variants: &mut [Variant], directory: &Path) -> Result<()> {
+    ensure!(!variants.is_empty(), "The variants array is empty.");
+    let mut ids = BTreeSet::new();
+    for variant in variants {
+        ensure!(
+            safe_text(&variant.id) && ids.insert(variant.id.clone()),
+            "Variant IDs must be nonempty and unique."
+        );
+        ensure!(
+            safe_text(&variant.model) && safe_text(&variant.revision),
+            "A variant needs a model and an explicit revision."
+        );
+        ensure!(
+            matches!(variant.api.as_str(), "openai" | "systemone"),
+            "The variant API is not valid."
+        );
+        let address = variant
+            .model_url
+            .strip_prefix("http://")
+            .or_else(|| variant.model_url.strip_prefix("https://"));
+        ensure!(
+            address.is_some_and(|address| !address
+                .split('/')
+                .next()
+                .unwrap_or_default()
+                .is_empty())
+                && !variant.model_url.chars().any(char::is_whitespace),
+            "A variant needs an HTTP or HTTPS model URL."
+        );
+        if let Some(path) = &variant.policy {
+            let path =
+                fs::canonicalize(directory.join(path)).context("Read a variant policy path.")?;
+            ensure!(path.is_file(), "A variant policy must name a regular file.");
+            fs::read_to_string(&path).context("Read a variant policy file.")?;
+            variant.policy = Some(path);
+        }
+    }
+    Ok(())
+}
+
+fn export_path(path: &Path, repo: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.into()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    ensure!(
+        absolute
+            .components()
+            .all(|part| !matches!(part, Component::ParentDir | Component::CurDir)),
+        "The export path must not contain relative components."
+    );
+    let mut parent = absolute.parent().context("The export parent is absent.")?;
+    let mut suffix = vec![
+        absolute
+            .file_name()
+            .context("The export path must name a file.")?
+            .to_owned(),
+    ];
+    loop {
+        match fs::symlink_metadata(parent) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(
+                    parent
+                        .file_name()
+                        .context("The export parent is not valid.")?
+                        .to_owned(),
+                );
+                parent = parent.parent().context("The export parent is absent.")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut resolved = fs::canonicalize(parent)?;
+    for part in suffix.into_iter().rev() {
+        resolved.push(part);
+    }
+    ensure!(
+        !resolved.starts_with(repo),
+        "The export must be outside the source repository."
+    );
+    match fs::symlink_metadata(&resolved) {
+        Ok(_) => bail!("The export destination already exists."),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Snapshot) {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = directory.path().join("source");
+        fs::create_dir_all(repo.join(".pijul/changes/AA")).unwrap();
+        fs::write(
+            repo.join(".pijul/changes/AA")
+                .join(format!("{}.change", "A".repeat(51))),
+            b"native data",
+        )
+        .unwrap();
+        let snapshot = Snapshot {
+            repository: repo,
+            main: "main".into(),
+            inbox: "inbox".into(),
+            main_state: None,
+            base: Vec::new(),
+            candidate: "A".repeat(53),
+            policy_path: "POLICY.md".into(),
+            policy_sha256: None,
+            configuration: json!({"source": "environment", "path": null, "sha256": null,
+                "values": {"policy_path": "POLICY.md", "protected": [], "max_change_chars": 8000,
+                    "timeout_seconds": 0.125, "check_timeout_seconds": 2.75}}),
+        };
+        (directory, snapshot)
+    }
+
+    fn variants(directory: &Path) -> PathBuf {
+        let path = directory.join("variants.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(
+                &json!([{"id": "model", "model_url": "http://localhost:8080",
+            "model": "model", "api": "openai", "revision": "checkpoint-12"}]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn capture_deduplicates_and_retains_explicit_label_history() {
+        let (_directory, snapshot) = fixture();
+        let store = Store::new(&snapshot.repository);
+        let first = store.capture(snapshot.clone()).unwrap();
+        assert!(first.labels.is_empty());
+        assert!(store.label(&first.id[..12], Label::Reject, "").is_err());
+        store
+            .label(
+                &first.id[..12],
+                Label::Reject,
+                "The change violates policy.",
+            )
+            .unwrap();
+        let labeled = store
+            .label(
+                &first.id,
+                Label::Accept,
+                "The reviewer approves the change.",
+            )
+            .unwrap();
+        assert_eq!(labeled.labels.len(), 2);
+        assert_eq!(labeled.labels[0].expected, Label::Reject);
+        assert_eq!(store.capture(snapshot).unwrap(), labeled);
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_capture_and_labels_retain_every_human_record() {
+        let (_directory, snapshot) = fixture();
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let snapshot = snapshot.clone();
+                std::thread::spawn(move || {
+                    let store = Store::new(&snapshot.repository);
+                    let record = store.capture(snapshot).unwrap();
+                    store
+                        .label(
+                            &record.id,
+                            Label::Reject,
+                            "The reviewer rejects the change.",
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let records = Store::new(&snapshot.repository).list().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].labels.len(), 8);
+    }
+
+    #[test]
+    fn snapshot_identity_binds_order_state_policy_and_configuration() {
+        let (_directory, mut snapshot) = fixture();
+        snapshot.candidate = "C".repeat(53);
+        snapshot.base = vec!["A".repeat(53), "B".repeat(53)];
+        let original = identity(&snapshot).unwrap();
+        snapshot.base.reverse();
+        assert_ne!(identity(&snapshot).unwrap(), original);
+        snapshot.base.reverse();
+        snapshot.main_state = Some("state".into());
+        assert_ne!(identity(&snapshot).unwrap(), original);
+        snapshot.main_state = None;
+        snapshot.policy_sha256 = Some("a".repeat(64));
+        assert_ne!(identity(&snapshot).unwrap(), original);
+        snapshot.policy_sha256 = None;
+        snapshot.configuration["values"]["timeout_seconds"] = json!(0.5);
+        assert_ne!(identity(&snapshot).unwrap(), original);
+    }
+
+    #[test]
+    fn export_preserves_snapshots_labels_and_per_case_settings() {
+        let (directory, snapshot) = fixture();
+        let store = Store::new(&snapshot.repository);
+        let first = store.capture(snapshot.clone()).unwrap();
+        let variants = variants(directory.path());
+        let output = directory.path().join("manifest.json");
+        assert!(
+            store
+                .export(&[first.id.clone()], &variants, &output)
+                .is_err()
+        );
+        store
+            .label(&first.id, Label::Reject, "The reviewer rejects the change.")
+            .unwrap();
+        let mut second = snapshot.clone();
+        second.configuration["values"]["max_change_chars"] = json!(16000);
+        let second = store.capture(second).unwrap();
+        store
+            .label(
+                &second.id,
+                Label::Escalate,
+                "The change needs a human decision.",
+            )
+            .unwrap();
+        let report = store.export(&[], &variants, &output).unwrap();
+        assert_eq!(report.cases.len(), 2);
+        let manifest: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        for case in manifest["cases"].as_array().unwrap() {
+            assert_eq!(
+                case["configuration"],
+                case["snapshot"]["configuration"]["values"]
+            );
+            assert_eq!(case["base"], case["snapshot"]["base"]);
+            assert_eq!(case["expected"], case["labels"][0]["expected"]);
+        }
+        assert!(store.export(&[], &variants, &output).is_err());
+        assert!(
+            store
+                .export(&[], &variants, &snapshot.repository.join("manifest.json"))
+                .is_err()
+        );
+        let nested = directory.path().join("reports/nested/manifest.json");
+        assert!(store.export(&[], &variants, &nested).is_ok());
+    }
+
+    #[test]
+    fn export_refuses_mixed_channels_unknown_ids_and_file_aliases() {
+        let (directory, snapshot) = fixture();
+        let store = Store::new(&snapshot.repository);
+        let first = store.capture(snapshot.clone()).unwrap();
+        store
+            .label(
+                &first.id,
+                Label::Accept,
+                "The reviewer approves the change.",
+            )
+            .unwrap();
+        let mut other = snapshot.clone();
+        other.inbox = "other".into();
+        let other = store.capture(other).unwrap();
+        store
+            .label(&other.id, Label::Reject, "The reviewer rejects the change.")
+            .unwrap();
+        let variants = variants(directory.path());
+        let output = directory.path().join("manifest.json");
+        assert!(store.export(&[], &variants, &output).is_err());
+        assert!(store.export(&["f".repeat(64)], &variants, &output).is_err());
+        let source_file = snapshot.repository.join("data");
+        fs::write(&source_file, b"source bytes").unwrap();
+        fs::hard_link(&source_file, &output).unwrap();
+        assert!(
+            store
+                .export(&[first.id.clone()], &variants, &output)
+                .is_err()
+        );
+        assert_eq!(fs::read(&source_file).unwrap(), b"source bytes");
+        fs::remove_file(&output).unwrap();
+        std::os::unix::fs::symlink(&source_file, &output).unwrap();
+        assert!(
+            store
+                .export(&[first.id.clone()], &variants, &output)
+                .is_err()
+        );
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&snapshot.repository, &alias).unwrap();
+        assert!(
+            store
+                .export(&[first.id], &variants, &alias.join("export.json"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_selection_and_variant_validation_do_not_omit_cases() {
+        let (directory, snapshot) = fixture();
+        let store = Store::new(&snapshot.repository);
+        let first = store.capture(snapshot.clone()).unwrap();
+        store
+            .label(
+                &first.id,
+                Label::Accept,
+                "The reviewer approves the change.",
+            )
+            .unwrap();
+        let mut other = snapshot;
+        other.inbox = "other".into();
+        let other = store.capture(other).unwrap();
+        store
+            .label(&other.id, Label::Reject, "The reviewer rejects the change.")
+            .unwrap();
+        let variants_path = variants(directory.path());
+        let output = directory.path().join("selected.json");
+        let report = store
+            .export(&[first.id[..12].into()], &variants_path, &output)
+            .unwrap();
+        assert_eq!(report.cases, vec![first.id.clone()]);
+        let mut records = store.list().unwrap();
+        records[0].id = format!("abc{}", "a".repeat(61));
+        records[1].id = format!("abc{}", "b".repeat(61));
+        assert!(select(&records, "abc").is_err());
+        let mut invalid: Vec<Variant> =
+            serde_json::from_slice(&fs::read(&variants_path).unwrap()).unwrap();
+        invalid[0].revision.clear();
+        assert!(validate_variants(&mut invalid, directory.path()).is_err());
+        assert!(
+            store
+                .export(
+                    &[first.id.clone(), first.id],
+                    &variants_path,
+                    &directory.path().join("duplicate.json")
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_paths_refuse_links_and_record_aliases() {
+        let (directory, snapshot) = fixture();
+        fs::create_dir_all(snapshot.repository.join(".pijul/patchgate")).unwrap();
+        std::os::unix::fs::symlink(
+            directory.path(),
+            snapshot.repository.join(".pijul/patchgate/cases"),
+        )
+        .unwrap();
+        assert!(
+            Store::new(&snapshot.repository)
+                .capture(snapshot.clone())
+                .is_err()
+        );
+        fs::remove_file(snapshot.repository.join(".pijul/patchgate/cases")).unwrap();
+        let store = Store::new(&snapshot.repository);
+        let record = store.capture(snapshot.clone()).unwrap();
+        let path = snapshot
+            .repository
+            .join(".pijul/patchgate/cases")
+            .join(format!("{}.json", record.id));
+        fs::hard_link(&path, directory.path().join("record-alias")).unwrap();
+        assert!(
+            store
+                .label(
+                    &record.id,
+                    Label::Accept,
+                    "The reviewer approves the change."
+                )
+                .is_err()
+        );
+    }
+}
