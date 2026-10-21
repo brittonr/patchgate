@@ -22,6 +22,7 @@ use crate::pijul::{ChannelSnapshot, LogEntry, Pijul, Signer};
 use crate::review::{self, ReviewBinding};
 use crate::verify::{self, Verification};
 
+#[derive(Clone)]
 pub struct Settings {
     pub repo: PathBuf,
     pub inbox: String,
@@ -32,8 +33,8 @@ pub struct Settings {
     pub policy: String,
     protected: Vec<String>,
     max_change_chars: usize,
-    timeout: Duration,
-    check_timeout: Duration,
+    pub(crate) timeout: Duration,
+    pub(crate) check_timeout: Duration,
     interrupted: Arc<AtomicBool>,
 }
 
@@ -87,7 +88,8 @@ where
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum State {
     Pending,
     Waiting,
@@ -130,6 +132,7 @@ impl State {
     }
 }
 
+#[derive(Serialize)]
 pub struct Item {
     pub hash: String,
     pub message: String,
@@ -177,6 +180,10 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<crate::secrets::Finding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Rc<Verification>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
@@ -202,6 +209,8 @@ impl Record {
             at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false),
             model: None,
             review: None,
+            execution_error: None,
+            findings: Vec::new(),
             verification: None,
             user: None,
             conflict: false,
@@ -210,7 +219,92 @@ impl Record {
             files: Vec::new(),
         }
     }
+
+    fn reject_secrets(&mut self, findings: Vec<crate::secrets::Finding>) {
+        let rules: BTreeSet<_> = findings
+            .iter()
+            .map(|finding| finding.rule_id.as_str())
+            .collect();
+        self.reason = format!(
+            "Deterministic secret checks rejected the change ({}). Remove the credential data before another review.",
+            rules.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        self.message.clear();
+        self.message.push_str("[message omitted: credential data]");
+        self.decision = "reject".into();
+        self.by = "gate".into();
+        self.model = None;
+        self.review = None;
+        self.user = None;
+        self.findings = findings;
+    }
 }
+
+#[derive(Serialize)]
+pub struct DependencyInfo {
+    pub hash: String,
+    pub state: State,
+    pub in_main: bool,
+    pub needs: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct Explanation {
+    pub schema_version: u8,
+    pub hash: String,
+    pub message: String,
+    pub state: State,
+    pub paths: BTreeSet<String>,
+    pub protected_paths: Vec<String>,
+    pub dependencies: Vec<DependencyInfo>,
+    pub current: ReviewBinding,
+    pub checks: Option<serde_json::Value>,
+    pub records: Vec<Record>,
+    pub next_actions: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct StatusReport {
+    pub schema_version: u8,
+    pub main: review::MainBinding,
+    pub inbox: review::MainBinding,
+    pub items: Vec<Item>,
+    pub behind: Vec<LogEntry>,
+    pub records: Vec<Record>,
+}
+
+#[derive(Serialize)]
+pub struct ReviewReport {
+    pub schema_version: u8,
+    pub dry_run: bool,
+    pub authorizes_acceptance: bool,
+    pub main: review::MainBinding,
+    pub inbox: review::MainBinding,
+    pub items: Vec<Item>,
+    pub records: Vec<Record>,
+}
+
+#[derive(Debug)]
+struct InvalidModelReply;
+
+impl std::fmt::Display for InvalidModelReply {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("The model reply is invalid")
+    }
+}
+
+impl std::error::Error for InvalidModelReply {}
+
+#[derive(Debug)]
+struct SecretViolation(Vec<crate::secrets::Finding>);
+
+impl std::fmt::Display for SecretViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("A deterministic secret check refused credential data")
+    }
+}
+
+impl std::error::Error for SecretViolation {}
 
 #[derive(Deserialize, Serialize)]
 struct Acceptance {
@@ -591,6 +685,223 @@ impl Gate {
         self.walk(false, |_| {})
     }
 
+    pub fn status_report(&mut self) -> Result<StatusReport> {
+        let main = self.pijul.snapshot(&self.settings.main)?;
+        let inbox = self.pijul.snapshot(&self.settings.inbox)?;
+        let items = self.status()?;
+        let relevant: HashSet<_> = items.iter().map(|item| item.hash.as_str()).collect();
+        let records = self
+            .ledger
+            .history()?
+            .into_iter()
+            .filter(|record| {
+                relevant.contains(record.hash.as_str())
+                    || record
+                        .for_hashes
+                        .iter()
+                        .any(|hash| relevant.contains(hash.as_str()))
+            })
+            .collect();
+        Ok(StatusReport {
+            schema_version: 1,
+            main: review::MainBinding {
+                channel: self.settings.main.clone(),
+                state: main.state,
+            },
+            inbox: review::MainBinding {
+                channel: self.settings.inbox.clone(),
+                state: inbox.state,
+            },
+            items,
+            behind: self.behind()?,
+            records,
+        })
+    }
+
+    pub fn explain(&mut self, prefix: &str) -> Result<Explanation> {
+        if prefix.is_empty() {
+            bail!("Give a change hash or a nonempty hash prefix.");
+        }
+        let main = self.pijul.snapshot(&self.settings.main)?;
+        let entries: BTreeMap<_, _> = self
+            .pijul
+            .log(&self.settings.main)?
+            .into_iter()
+            .chain(self.pijul.log(&self.settings.inbox)?)
+            .map(|entry| (entry.hash.clone(), entry))
+            .collect();
+        let prefix = prefix.to_uppercase();
+        let mut matches = entries.keys().filter(|hash| hash.starts_with(&prefix));
+        let hash = matches
+            .next()
+            .context("No change matches this hash prefix")?
+            .clone();
+        if matches.next().is_some() {
+            bail!("The hash prefix matches more than one change. Give more of the hash.");
+        }
+        let entry = &entries[&hash];
+        let states: HashMap<_, _> = self
+            .status()?
+            .into_iter()
+            .map(|item| (item.hash, item.state))
+            .collect();
+        let state_for = |hash: &str| {
+            if main.hashes.contains(hash) {
+                State::Accepted
+            } else {
+                states.get(hash).copied().unwrap_or(State::Unknown)
+            }
+        };
+        let state = state_for(&hash);
+        let text = self.change_text(&hash)?;
+        let mut paths = self
+            .pijul
+            .touched_paths(&self.settings.inbox, &entry.paths, &text)?;
+        let mut protected_paths: Vec<_> = paths
+            .iter()
+            .filter(|path| self.is_protected(path))
+            .cloned()
+            .collect();
+        let mut pending = change::dependencies(&text);
+        let mut seen = HashSet::new();
+        let mut dependencies = Vec::new();
+        while let Some(dependency) = pending.pop() {
+            if !seen.insert(dependency.clone()) {
+                continue;
+            }
+            let in_main = main.hashes.contains(&dependency);
+            let needs = if in_main {
+                Vec::new()
+            } else {
+                change::dependencies(&self.change_text(&dependency)?)
+                    .into_iter()
+                    .filter(|hash| !main.hashes.contains(hash))
+                    .collect::<Vec<_>>()
+            };
+            pending.extend(needs.iter().cloned());
+            dependencies.push(DependencyInfo {
+                state: state_for(&dependency),
+                hash: dependency,
+                in_main,
+                needs,
+            });
+        }
+        dependencies.sort_by(|left, right| left.hash.cmp(&right.hash));
+        let policy = self
+            .pijul
+            .read_file(&self.settings.main, &self.settings.policy)?;
+        let current = ReviewBinding::new(
+            std::slice::from_ref(&hash),
+            &self.settings.policy,
+            policy.as_deref(),
+            &self.settings.main,
+            &main,
+        );
+        let checks = self
+            .pijul
+            .read_file(&self.settings.main, verify::MANIFEST)?
+            .map(|text| serde_json::from_str(&text))
+            .transpose()
+            .context("The trusted Nix manifest is not valid JSON")?;
+        let records: Vec<_> = self
+            .ledger
+            .history()?
+            .into_iter()
+            .filter(|record| {
+                record.hash == hash
+                    || seen.contains(&record.hash)
+                    || record.for_hashes.contains(&hash)
+            })
+            .collect();
+        let secret_rejection = records
+            .iter()
+            .any(|record| record.hash == hash && !record.findings.is_empty());
+        let message = if secret_rejection {
+            paths.clear();
+            protected_paths.clear();
+            "[message omitted: credential data]".into()
+        } else {
+            entry.message.clone()
+        };
+        let next_actions = match state {
+            State::Accepted => Vec::new(),
+            State::Pending => vec!["patchgate review --dry-run".into()],
+            State::Rejected => vec![
+                format!("pijul unrecord {}", short(&hash)),
+                "Record a corrected change in the inbox.".into(),
+            ],
+            State::Escalated => vec![
+                format!("patchgate accept {}", short(&hash)),
+                format!("patchgate reject {}", short(&hash)),
+            ],
+            State::Waiting | State::Blocked => {
+                vec!["Decide the unmet dependencies before this change.".into()]
+            }
+            State::Removed => vec!["Examine the removal from main before another decision.".into()],
+            State::Unknown => vec!["Examine the channel and dependency state.".into()],
+        };
+        Ok(Explanation {
+            schema_version: 1,
+            hash,
+            message,
+            state,
+            paths,
+            protected_paths,
+            dependencies,
+            current,
+            checks,
+            records,
+            next_actions,
+        })
+    }
+
+    fn is_protected(&self, path: &str) -> bool {
+        Path::new(path).starts_with(verify::DIRECTORY) || self.protected.is_match(path)
+    }
+
+    pub fn review_report(&mut self, dry_run: bool) -> Result<ReviewReport> {
+        let _lock = self.ledger.lock()?;
+        self.recover()?;
+        let main = self.pijul.snapshot(&self.settings.main)?;
+        let inbox = self.pijul.snapshot(&self.settings.inbox)?;
+        let boundary = self.ledger.history()?.len();
+        let items = self.walk(true, |_| {})?;
+        let records = self.ledger.history()?.into_iter().skip(boundary).collect();
+        Ok(ReviewReport {
+            schema_version: 1,
+            dry_run,
+            authorizes_acceptance: false,
+            main: review::MainBinding {
+                channel: self.settings.main.clone(),
+                state: main.state,
+            },
+            inbox: review::MainBinding {
+                channel: self.settings.inbox.clone(),
+                state: inbox.state,
+            },
+            items,
+            records,
+        })
+    }
+
+    pub fn dry_run(mut settings: Settings) -> Result<ReviewReport> {
+        let original = Ledger::new(&settings.repo);
+        if original.pending()?.is_some() {
+            bail!("An acceptance journal needs recovery. Run patchgate status before a dry-run.");
+        }
+        original.history()?;
+        let isolated = crate::isolation::copy_repository(&settings.repo)?;
+        isolated.materialize()?;
+        settings.repo = isolated.pijul.repo.clone();
+        let mut gate = Self::new(settings)?;
+        match fs::copy(&original.path, &gate.ledger.path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        gate.review_report(true)
+    }
+
     pub fn behind(&self) -> Result<Vec<LogEntry>> {
         let inbox = self.pijul.hashes(&self.settings.inbox)?;
         Ok(self
@@ -683,6 +994,13 @@ impl Gate {
         let hashes = self.with_conflicting_dependencies(&item.hash, &main.hashes, &inbox)?;
         let records: Vec<_> = hashes.iter().map(|hash| record(hash)).collect();
         match self.land(&hashes, &main, &records) {
+            Err(error) if error.is::<SecretViolation>() => {
+                let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
+                let mut refusal = record(&item.hash);
+                refusal.reject_secrets(findings);
+                self.ledger.append(&refusal)?;
+                bail!("{}", refusal.reason);
+            }
             Err(error) => {
                 let problem = error.downcast::<Unmerged>()?;
                 bail!(
@@ -763,6 +1081,12 @@ impl Gate {
             if let Some(record) = records.get(&item.hash) {
                 item.state = State::from_decision(&record.decision);
                 item.reason = record.reason.clone();
+                if record.message != item.message {
+                    item.message.clone_from(&record.message);
+                }
+                if !record.findings.is_empty() {
+                    item.paths.clear();
+                }
             } else {
                 let text = self.change_text(&item.hash)?;
                 item.needs = change::dependencies(&text)
@@ -812,12 +1136,20 @@ impl Gate {
                 &reviewed,
                 std::slice::from_ref(&record),
             ) {
+                Err(error) if error.is::<SecretViolation>() => {
+                    let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
+                    record.reject_secrets(findings);
+                }
                 Err(error) => {
+                    let invalid_reply = error.is::<InvalidModelReply>();
                     let problem = error.downcast::<Unmerged>()?;
                     record.decision = "escalate".into();
                     record.by = "gate".into();
                     record.model = None;
                     record.review = None;
+                    if invalid_reply {
+                        record.execution_error = Some("invalid-model-reply".into());
+                    }
                     record.conflict = true;
                     record.reason = format!(
                         "The change conflicts with {}, and patchgate did not merge it. {problem} To merge it by hand, edit the conflict in {}, record the result, and run: patchgate accept <hash of the result>",
@@ -846,6 +1178,10 @@ impl Gate {
         } else {
             State::from_decision(&record.decision)
         };
+        if !record.findings.is_empty() {
+            item.paths.clear();
+        }
+        item.message = record.message;
         item.reason = record.reason;
         item.decided = true;
         self.check_extra(&extra)
@@ -879,9 +1215,7 @@ impl Gate {
         }
         let touched: Vec<_> = paths
             .iter()
-            .filter(|path| {
-                Path::new(path).starts_with(verify::DIRECTORY) || self.protected.is_match(path)
-            })
+            .filter(|path| self.is_protected(path))
             .map(String::as_str)
             .collect();
         if !touched.is_empty() {
@@ -911,6 +1245,15 @@ impl Gate {
                 "{} has no {}, so the model has no policy. Accept the change that adds {}: patchgate accept <hash>",
                 self.settings.main, self.settings.policy, self.settings.policy
             ))?;
+        let mut findings = crate::secrets::scan_change(&candidate);
+        findings.extend(crate::secrets::scan_text(
+            "[trusted.policy]",
+            policy.as_bytes(),
+        ));
+        if !findings.is_empty() {
+            record.reject_secrets(findings);
+            return Ok(record);
+        }
         let binding = ReviewBinding::new(
             std::slice::from_ref(&item.hash),
             &self.settings.policy,
@@ -938,6 +1281,7 @@ impl Gate {
                 record.review = Some(binding);
             }
             None => {
+                record.execution_error = Some("invalid-model-reply".into());
                 record.reason = format!(
                     "The reply of {} is not a valid verdict.",
                     self.settings.model
@@ -1028,10 +1372,14 @@ impl Gate {
             }
             audit.push(merge.clone());
         }
+        let source = directory.path().join("candidate-source");
+        scratch.export_source(&self.settings.main, &source)?;
+        let findings = crate::secrets::scan_tree(&source)?;
+        if !findings.is_empty() {
+            return Err(SecretViolation(findings).into());
+        }
         if let Some(checks) = checks {
             self.require_current_main(main)?;
-            let source = directory.path().join("candidate-source");
-            scratch.export_source(&self.settings.main, &source)?;
             let verification = Rc::new(checks.run(
                 &source,
                 hashes,
@@ -1243,13 +1591,17 @@ impl Gate {
                     ))
                     .into());
                 }
+                let findings = crate::secrets::scan_text("[merge.context]", prompt.as_bytes());
+                if !findings.is_empty() {
+                    return Err(SecretViolation(findings).into());
+                }
                 let mut labels: Vec<_> = choices.iter().map(|(label, _)| label.as_str()).collect();
                 labels.push("escalate");
                 let result = self.model.merge(&prompt, &labels)?.ok_or_else(|| {
-                    Unmerged(format!(
+                    anyhow::Error::new(InvalidModelReply).context(Unmerged(format!(
                         "The reply of {} for {path} is not one of the choices.",
                         self.settings.model
-                    ))
+                    )))
                 })?;
                 if result.choice == "escalate" {
                     return Err(Unmerged(format!(
@@ -1681,6 +2033,168 @@ mod durability_tests {
         assert!(intent.applied(&main).is_err());
         main.insert("MERGE".into());
         assert!(intent.applied(&main)?);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use std::io::BufRead;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Instant;
+
+    fn source_bytes(root: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+        let mut pending = vec![root.to_owned()];
+        let mut files = BTreeMap::new();
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    files.insert(
+                        entry.path().strip_prefix(root)?.to_owned(),
+                        fs::read(entry.path())?,
+                    );
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    #[test]
+    fn accepted_dry_run_preserves_native_state_audit_keys_and_dirty_source() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("repo");
+        fs::create_dir(&root)?;
+        let pijul = Pijul::new(root.clone());
+        pijul.run(["init"])?;
+        fs::write(root.join("POLICY.md"), "Accept safe source changes.\n")?;
+        fs::write(root.join("value.txt"), "base\n")?;
+        pijul.run(["add", "POLICY.md", "value.txt"])?;
+        let signer = Signer::new(root.join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Define source",
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        pijul.run(["fork", "--channel", "main", "inbox"])?;
+        pijul.run(["channel", "switch", "inbox"])?;
+        fs::write(root.join("value.txt"), "candidate\n")?;
+        let (output, _) = pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Change the value",
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        let candidate = output
+            .split_whitespace()
+            .next_back()
+            .context("Missing candidate hash")?
+            .to_owned();
+        drop(environment);
+        let ledger = Ledger::new(&root);
+        let _lock = ledger.lock()?;
+        ledger.append(&Record::new(
+            "earlier".into(),
+            "Earlier decision".into(),
+            "reject",
+            "human",
+            "Keep it out.".into(),
+        ))?;
+        drop(_lock);
+        fs::write(root.join("value.txt"), "dirty author bytes\n")?;
+        fs::write(root.join("untracked"), "untracked author bytes\n")?;
+        let main = pijul.snapshot("main")?;
+        let inbox = pijul.snapshot("inbox")?;
+        let before = source_bytes(&root)?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let worker = thread::spawn(move || -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            bail!("The dry-run made no model request");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            let mut length = 0;
+            loop {
+                line.clear();
+                if stream.read_line(&mut line)? == 0 {
+                    bail!("The model request is incomplete");
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        length = value.trim().parse()?;
+                    }
+                }
+            }
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body)?;
+            let body = r#"{"choices":[{"message":{"content":"{\"decision\":\"accept\",\"summary\":\"Change the value.\",\"reason\":\"The policy allows the change.\"}"}}]}"#;
+            write!(
+                stream.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )?;
+            Ok(())
+        });
+        let report = Gate::dry_run(Settings {
+            repo: root.clone(),
+            inbox: "inbox".into(),
+            main: "main".into(),
+            model_url: format!("http://{address}/v1"),
+            model: "dry-run-test".into(),
+            model_api: Api::OpenAi,
+            policy: "POLICY.md".into(),
+            protected: Vec::new(),
+            max_change_chars: 100_000,
+            timeout: Duration::from_secs(10),
+            check_timeout: Duration::from_secs(10),
+            interrupted: Arc::new(AtomicBool::new(false)),
+        })?;
+        worker.join().expect("The model fixture panicked")?;
+        assert!(report.dry_run);
+        assert!(!report.authorizes_acceptance);
+        assert!(
+            report
+                .records
+                .iter()
+                .any(|record| record.hash == candidate && record.decision == "accept")
+        );
+        assert_eq!(report.main.state, main.state);
+        assert_eq!(report.inbox.state, inbox.state);
+        assert_eq!(source_bytes(&root)?, before);
+        assert_eq!(pijul.snapshot("main")?, main);
+        assert_eq!(pijul.snapshot("inbox")?, inbox);
         Ok(())
     }
 }

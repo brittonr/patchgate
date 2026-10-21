@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -17,7 +18,7 @@ const EXPECTED_STATE_MISMATCH: i32 = 42;
 
 pub type CommandEnv = BTreeMap<OsString, OsString>;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 pub struct LogEntry {
     pub hash: String,
     #[serde(default, deserialize_with = "null_default")]
@@ -107,11 +108,23 @@ where
 
 pub struct Pijul {
     pub repo: PathBuf,
+    timeout: Option<Duration>,
+    executable: Option<PathBuf>,
 }
 
 impl Pijul {
     pub fn new(repo: PathBuf) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            timeout: None,
+            executable: find_executable("pijul"),
+        }
+    }
+
+    pub fn with_timeout(repo: PathBuf, timeout: Duration) -> Self {
+        let mut pijul = Self::new(repo);
+        pijul.timeout = Some(timeout);
+        pijul
     }
 
     pub fn call<I, S>(&self, args: I) -> Result<(String, String)>
@@ -144,7 +157,12 @@ impl Pijul {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let mut command = Command::new("pijul");
+        let executable = self.executable.as_ref().ok_or_else(|| {
+            anyhow!(
+                "Pijul is not in an absolute PATH directory. Run patchgate in the devenv shell."
+            )
+        })?;
+        let mut command = Command::new(executable);
         command
             .args(args)
             .current_dir(&self.repo)
@@ -153,7 +171,11 @@ impl Pijul {
             command.env_clear().envs(env);
         }
         command.env("NO_COLOR", "1");
-        let output = command.output().map_err(|error| {
+        let output = match self.timeout {
+            Some(timeout) => timed_output(&mut command, timeout),
+            None => command.output(),
+        }
+        .map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 anyhow!("pijul is not on PATH. Run patchgate in the devenv shell.")
             } else {
@@ -510,6 +532,14 @@ impl Pijul {
     /// Export recorded source into a new directory without VCS metadata or build state.
     /// Keep file bytes, file modes, and safe relative links. Reject unsafe archive entries.
     pub fn export_source(&self, channel: &str, destination: &Path) -> Result<()> {
+        self.export_archive(channel, destination, false)
+    }
+
+    pub fn export_working_copy(&self, channel: &str, destination: &Path) -> Result<()> {
+        self.export_archive(channel, destination, true)
+    }
+
+    fn export_archive(&self, channel: &str, destination: &Path, conflicts: bool) -> Result<()> {
         let directory = tempfile::tempdir()?;
         let archive = directory.path().join("channel.tar.gz");
         let (_, stderr) = self.call([
@@ -519,7 +549,7 @@ impl Pijul {
             OsStr::new("-o"),
             archive.as_os_str(),
         ])?;
-        if !crate::change::conflict_report(&stderr).is_empty() {
+        if !conflicts && !crate::change::conflict_report(&stderr).is_empty() {
             bail!("The source archive contains conflicts");
         }
         extract_source_archive(&archive, destination)
@@ -545,6 +575,53 @@ impl Pijul {
             self.call([OsStr::new("archive"), OsStr::new("-o"), archive.as_os_str()])?;
         Ok(crate::change::conflict_report(&stderr))
     }
+}
+
+fn find_executable(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find(|path| {
+            fs::metadata(path).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .and_then(|path| fs::canonicalize(path).ok())
+}
+
+fn timed_output(command: &mut Command, timeout: Duration) -> std::io::Result<Output> {
+    let mut stdout = tempfile::tempfile()?;
+    let mut stderr = tempfile::tempfile()?;
+    let mut child = command
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?)
+        .process_group(0)
+        .spawn()?;
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "The Pijul diagnostic exceeded its time limit",
+            ));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    stdout.rewind()?;
+    stderr.rewind()?;
+    let mut output = Output {
+        status,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+    };
+    stdout.read_to_end(&mut output.stdout)?;
+    stderr.read_to_end(&mut output.stderr)?;
+    Ok(output)
 }
 
 enum SourceMember {
@@ -982,7 +1059,9 @@ impl Signer {
                 .context("Gate key has no parent directory")?,
         )?;
         if !self.key.exists() {
-            let mut keygen = Command::new("ssh-keygen");
+            let executable = find_executable("ssh-keygen")
+                .context("ssh-keygen is not in an absolute PATH directory")?;
+            let mut keygen = Command::new(executable);
             keygen
                 .args(["-q", "-t", "ed25519", "-N", "", "-C", "patchgate", "-f"])
                 .arg(&self.key);
@@ -990,7 +1069,9 @@ impl Signer {
         }
         let directory = tempfile::Builder::new().prefix("patchgate-").tempdir()?;
         let socket = directory.path().join("agent");
-        let agent = Command::new("ssh-agent")
+        let executable = find_executable("ssh-agent")
+            .context("ssh-agent is not in an absolute PATH directory")?;
+        let agent = Command::new(executable)
             .args(["-D", "-a"])
             .arg(&socket)
             .stdin(Stdio::null())
@@ -1023,7 +1104,9 @@ impl Signer {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        let mut add = Command::new("ssh-add");
+        let executable =
+            find_executable("ssh-add").context("ssh-add is not in an absolute PATH directory")?;
+        let mut add = Command::new(executable);
         add.arg("-q")
             .arg(&self.key)
             .env_clear()

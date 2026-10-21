@@ -22,14 +22,26 @@ patchgate examines the inbox changes that are not in main, in the order of the i
 
 1. If a dependency of the change is not in main, the change waits. If that dependency has the state `rejected`, `escalated`, or `blocked`, patchgate blocks the change. `pijul apply` also applies the dependencies of a change, so patchgate never applies a blocked change.
 2. If the change touches a protected path, patchgate escalates the change to a human. The model does not see the change.
-3. If the complete structured review data exceeds `PATCHGATE_MAX_CHANGE_CHARS`, patchgate escalates the change. It never truncates review data.
-4. Else, patchgate sends structured native context and the trusted policy from main to the model.
+
+3. patchgate checks the complete review context and trusted policy for supported credential formats.
+   A match rejects the change without a model request.
+
+4. If the structured review data exceeds `PATCHGATE_MAX_CHANGE_CHARS`, patchgate escalates the change.
+   It never truncates review data.
+
+5. Else, patchgate sends structured native context and the trusted policy from main to the model.
    The model accepts, rejects, or escalates the candidate.
-5. patchgate applies each accepted change to a scratch clone of main. If the change conflicts with main, the model merges the conflict.
-6. If main declares Nix checks, each check must pass against the final scratch source.
-7. patchgate checks main after each model reply and after Nix verification.
+
+6. patchgate applies each accepted change to a scratch clone of main.
+   If the change conflicts with main, the model selects an exact merge.
+
+7. patchgate scans the final scratch source before Nix import or acceptance.
+   Every declared Nix check must pass.
+
+8. patchgate checks main after each model reply and after Nix verification.
    If main changed, the command stops without that acceptance.
-8. Pijul compares the reviewed main state inside its write transaction.
+
+9. Pijul compares the reviewed main state inside its write transaction.
    It applies the candidate and merge only if that state matches.
 
 
@@ -59,6 +71,35 @@ Earlier ledger records remain readable without retroactive review claims.
 
 Both environments use `nix/pijul.nix` to correct empty-directory archive headers in the pinned Pijul package.
 The writer sets directory sizes to zero. Archive validation remains strict.
+
+### Deterministic secret checks
+
+These checks run before a model receives review or merge data.
+They also scan the final recorded source before Nix import and every acceptance, including `patchgate accept`.
+Binary source files receive the same byte-based checks.
+
+| Rule ID | Supported formats |
+| --- | --- |
+| `private-key` | PKCS#8, encrypted PKCS#8, RSA, EC, DSA, and OpenSSH private-key headers. |
+| `aws-access-key` | AKIA and ASIA access-key IDs. |
+| `github-token` | Classic GitHub tokens and fine-grained `github_pat` tokens. |
+| `slack-token` | Supported `xoxb`, `xoxa`, `xoxp`, `xoxr`, and `xoxs` tokens. |
+| `credential-assignment` | Substantial literal values assigned to password, secret, token, and key names. |
+
+Assignment values need at least 16 bytes, eight distinct bytes, letters, and digits or punctuation.
+Quoted alphabetic values can also qualify at 24 bytes.
+Known example values and environment references do not qualify for the assignment rule.
+These rules do not detect every secret. The model policy remains necessary.
+
+New rejection records contain `findings` with `rule_id`, `path`, and one-based `line` fields.
+The records omit candidate messages and can replace locations with `[redacted-path]` to prevent disclosure.
+Reports omit original candidate paths after a deterministic secret rejection.
+Earlier audit records remain unchanged.
+
+A human cannot override a credential that remains in the final source.
+A human can accept a change that removes the credential, if the final source passes all checks.
+The checks do not erase credentials from existing Pijul history.
+Rotate an exposed credential.
 
 ### Trusted Nix verification
 
@@ -381,6 +422,10 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate accept <hash>` | A human accepts the change. patchgate applies it to main, with the escalated conflicting changes that it resolves. |
 | `patchgate reject <hash>` | A human rejects the change. |
 | `patchgate log` | Shows the decisions and the merges, newest first. |
+| `patchgate explain <hash>` | Shows paths, unmet dependency chains, current policy/main bindings, and recorded decision and verification evidence. |
+| `patchgate review --dry-run` | Runs the review, merge, and check flow in an isolated repository without source acceptance. |
+| `patchgate doctor` | Diagnoses setup and gives repair commands without repository changes. |
+| `patchgate-eval replay <manifest>` | Compares labeled historical changes across model and policy variants. |
 
 A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
@@ -389,9 +434,137 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 | `pending` | The change is ready for review. |
 | `waiting` | A dependency of the change is pending. |
 | `blocked` | A dependency of the change is rejected, escalated, or blocked. A human must decide about that dependency. |
-| `rejected` | The model or a human rejected the change. |
+| `rejected` | The model, a human, or a deterministic secret check rejected the change. |
 | `escalated` | patchgate or the model asks a human to decide. A conflict that patchgate did not merge has this state too. |
 | `removed` | patchgate accepted the change, but a human removed it from main. patchgate does not apply it again. |
+
+### Decision evidence and JSON
+
+`status`, `explain`, `log`, and `review` accept `--json`.
+Every report declares `schema_version: 1`.
+JSON uses full change hashes and the existing lowercase state names.
+
+```console
+$ patchgate status --json
+$ patchgate explain FTH4472WYKIZ --json
+$ patchgate log --json -n 50
+$ patchgate review --json
+```
+
+Status reports include items, native main/inbox bindings, missing inbox changes, and related audit records.
+Each item's `needs` list contains `[hash, state]` pairs.
+Log reports retain complete records, newest first, subject to `-n`.
+Explanation reports separate the current binding from historical records.
+Their dependency graph contains direct prerequisites and complete unmet chains.
+
+Model records retain their original `review` binding.
+Successful verified acceptances retain `verification` evidence with source, input, derivation, and output identities.
+Gate and human records do not claim model review evidence.
+An invalid model reply uses `execution_error: \"invalid-model-reply\"`.
+
+### Isolated review
+
+```console
+$ patchgate review --dry-run
+$ patchgate review --dry-run --json
+```
+
+Dry-run copies native metadata into a private temporary repository.
+It restores recorded source, copies existing decisions, and executes the normal review flow there.
+It excludes original gate keys and unrecorded files.
+Original channels, work files, audit bytes, acceptance journals, and keys stay unchanged.
+The isolated flow can create its own merge key and Nix store results.
+
+Dry-run reports contain `dry_run: true` and `authorizes_acceptance: false`.
+Their main/inbox bindings identify the initial snapshot.
+Each model record identifies the state that it actually reviewed.
+Later simulated acceptances can therefore use different main states within the same report.
+
+A dry-run report never authorizes later acceptance.
+Run `patchgate review` for a new review against current main.
+A pending acceptance journal prevents dry-run.
+Run `patchgate status` to recover that journal first.
+An invalid model reply causes a nonzero dry-run exit.
+
+### Setup diagnostics
+
+`patchgate doctor --json` returns checks with stable IDs, statuses, details, and repair commands.
+Statuses are `pass`, `error`, `warning`, or `unavailable`.
+Errors and unavailable checks cause a nonzero exit.
+Warnings do not cause failure.
+
+Doctor checks metadata safety, channels, trusted policy, pending recovery, patched Pijul support, the model API, and Nix configuration.
+It uses isolated metadata and fixed harmless model data.
+Each external probe has a time limit of 15 seconds or less.
+Doctor never executes repair commands or reconciles a journal.
+
+The Pijul help probe does not prove transaction semantics.
+Client sandbox configuration does not prove daemon enforcement.
+The daemon, build machines, caches, and sandbox policy remain trusted.
+Pijul and merge-signature tools resolve from absolute `PATH` directories, not relative entries.
+
+### Historical replay
+
+```console
+$ patchgate-eval replay comparison.json --report ../comparison-report.json
+```
+
+The manifest uses schema version 1.
+`repository` and policy variant paths resolve from the manifest directory.
+`main` and `inbox` default to their normal names.
+Each case needs an explicit human label, not an earlier model verdict.
+
+| Manifest field | Meaning |
+| --- | --- |
+| `schema_version` | Use `1`. |
+| `repository` | Source repository path. Replay never changes this repository. |
+| `main`, `inbox` | Optional channel names. They must differ. |
+| `cases` | Nonempty list of `{ id, base, candidate, expected }` objects. |
+| `variants` | Nonempty list of `{ id, model_url, model, api, revision, policy }` objects. |
+| `configuration` | Optional explicit review settings, retained in the report. |
+
+`base` lists every historical main change in native prerequisite order.
+`candidate` contains one full native hash outside that base.
+`expected` is `accept`, `reject`, or `escalate`.
+Use complete hashes from Pijul, not prefixes.
+`pijul log --channel main --hash-only` lists current main in reverse order.
+Missing, repeated, or incorrectly ordered prerequisites cause an explicit comparison error.
+
+Each variant needs a unique `id`, model URL, model name, API, and checkpoint `revision`.
+The API is `openai` or `systemone`.
+The revision is caller-provided evidence, not a server identity check.
+An optional `policy` file replaces trusted policy only inside the isolated replay repository.
+
+| Configuration field | Default |
+| --- | --- |
+| `policy_path` | `POLICY.md` |
+| `protected` | `[]` |
+| `max_change_chars` | `8000` |
+| `timeout_seconds` | `300` |
+| `check_timeout_seconds` | `900` |
+
+Replay does not inherit these review settings from `PATCHGATE_*` variables.
+The gate always protects the configured policy path and `nix/`.
+Set `configuration.protected` to reproduce other protection rules.
+Replay excludes relative `PATH` entries before it executes historical source operations.
+
+Replay reconstructs each exact base and candidate in isolation.
+It then invokes the actual `review --dry-run --json` command.
+Reports retain per-case labels, actors, native bindings, verification evidence, execution errors, and checkpoint revisions.
+Unsafe acceptance means acceptance of a case labeled reject or escalate.
+
+Each variant summary includes unsafe acceptances, label mismatches, escalation rate, infrastructure errors, and latency.
+Escalation rate uses completed verdicts as its denominator.
+Blocked cases and missing decisions are not escalations.
+Infrastructure errors never count as safe verdicts.
+Latency includes per-comparison snapshot preparation and the review command.
+
+The command prints its JSON report even when individual comparisons fail.
+Infrastructure errors cause a nonzero exit after the report.
+Label mismatches remain comparison results, not infrastructure failures.
+An optional report file must remain outside the source repository.
+Report writes reject symbolic-link destinations and replace existing files atomically.
+No replay report authorizes acceptance.
 
 ## Configuration
 

@@ -8,6 +8,7 @@ mod graphs;
 mod hostile;
 mod real_model;
 mod recovery;
+mod replay;
 mod stale;
 mod storage;
 mod structured;
@@ -50,6 +51,7 @@ enum Action {
     },
     VerifyHarbor(controls::ControlArgs),
     ModelHarbor(real_model::LiveArgs),
+    Replay(replay::ReplayArgs),
     #[command(disable_help_flag = true)]
     InterceptPijul {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -237,6 +239,7 @@ fn run() -> Result<()> {
         Action::Smoke { cases } => smoke(&cases)?,
         Action::VerifyHarbor(args) => controls::verify_harbor(args)?,
         Action::ModelHarbor(args) => real_model::model_harbor(args)?,
+        Action::Replay(args) => replay::run(args)?,
         Action::InterceptPijul { args } => recovery::intercept_pijul(&args)?,
         Action::InterceptApplyRace { args } => apply_race::intercept_pijul(&args)?,
     }

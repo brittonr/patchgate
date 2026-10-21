@@ -48,6 +48,10 @@ pub struct Signer {
 
 impl Signer {
     pub fn new() -> Result<Self> {
+        Self::with_path(std::env::var_os("PATH").unwrap_or_default())
+    }
+
+    pub fn with_path(path: OsString) -> Result<Self> {
         let directory = tempfile::Builder::new().prefix("pge-").tempdir()?;
         let key = directory.path().join("key");
         let socket = directory.path().join("agent");
@@ -57,17 +61,20 @@ impl Signer {
             Command::new("ssh-keygen")
                 .args(["-q", "-t", "ed25519", "-N", "", "-f"])
                 .arg(&key)
+                .env("PATH", &path)
                 .output()?,
             "create fixture key",
         )?;
         let agent = Command::new("ssh-agent")
             .args(["-D", "-a"])
             .arg(&socket)
+            .env("PATH", &path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
         let mut env: Env = std::env::vars_os().collect();
+        env.insert("PATH".into(), path);
         env.insert("HOME".into(), home.into_os_string());
         env.insert("SSH_AUTH_SOCK".into(), socket.as_os_str().to_owned());
         env.remove(OsStr::new("XDG_CONFIG_HOME"));
