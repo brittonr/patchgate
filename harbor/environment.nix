@@ -68,6 +68,10 @@ in
   inherit tools runtimeCheck lifecycleTools;
   # <!-- ste-disable-next-line semicolon -->
   cargoArtifacts = patchgate.cargoArtifacts;
+  # <!-- ste-disable-next-line semicolon -->
+  compiledApplication = patchgate.compiledApplication;
+  # <!-- ste-disable-next-line semicolon -->
+  compiledEvaluator = patchgate.compiledEvaluator;
   # Export the existing tools and the package's pinned Nix command.
   # <!-- ste-disable-next-line semicolon sentence-length -->
   runtimeClosure = pkgs.closureInfo { rootPaths = [ tools (pkgs.lib.getBin pkgs.nix) ]; };

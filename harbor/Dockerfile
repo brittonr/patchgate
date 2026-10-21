@@ -21,12 +21,49 @@ LC_ALL=C sort -u /runtime-closure/store-paths > /runtime-base-export/paths
 nix-store --export $(cat /runtime-base-export/paths) > /runtime-base-export/closure.nar
 SH
 
-FROM tools-builder AS builder
+FROM tools-builder AS dependencies
 
 COPY Cargo.toml Cargo.lock /build/
 
 # Cache compiled dependencies before Rust source enters the image.
-RUN nix-build /build/harbor/environment.nix -A cargoArtifacts --option sandbox false --out-link /cargo-artifacts
+RUN <<'SH'
+set -eu
+
+nix-build /build/harbor/environment.nix -A cargoArtifacts --option sandbox false --out-link /cargo-artifacts
+
+nix --extra-experimental-features nix-command path-info --all > /dependency-store-paths
+LC_ALL=C sort -u /dependency-store-paths -o /dependency-store-paths
+SH
+
+FROM dependencies AS application-builder
+
+COPY --exclude=bin src /build/src
+
+RUN nix-build /build/harbor/environment.nix -A compiledApplication --option sandbox false --out-link /compiled-application
+
+FROM dependencies AS evaluator-builder
+
+COPY src/bin/patchgate-eval /build/src/bin/patchgate-eval
+
+RUN nix-build /build/harbor/environment.nix -A compiledEvaluator --option sandbox false --out-link /compiled-evaluator
+
+# Transfer only evaluator paths absent from the shared dependency stage.
+RUN <<'SH'
+set -eu
+export LC_ALL=C
+
+mkdir /evaluator-export
+nix-store --query --requisites /compiled-evaluator > /evaluator-export/paths
+sort -u /evaluator-export/paths -o /evaluator-export/paths
+
+comm -23 /evaluator-export/paths /dependency-store-paths > /evaluator-export/delta
+nix-store --export $(cat /evaluator-export/delta) > /evaluator-export/closure.nar
+SH
+
+FROM application-builder AS builder
+
+RUN --mount=type=bind,from=evaluator-builder,source=/evaluator-export,target=/tmp/evaluator-export \
+    nix-store --import < /tmp/evaluator-export/closure.nar
 
 COPY src /build/src
 

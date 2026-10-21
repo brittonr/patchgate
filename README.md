@@ -250,7 +250,9 @@ cargo test --locked
 ```
 
 `nix/package.nix` first builds shared Cargo dependency artifacts.
-One application build then creates the application and evaluator outputs.
+Separate Crane derivations compile and test the application and evaluator from independent Rust source sets.
+A final derivation copies both binaries and creates their wrappers.
+The evaluator wrapper always binds to that assembly's application output.
 
 Crane v0.23.3 provides `buildDepsOnly` and `buildPackage`.
 `nix/checks.json` pins its revision and NAR hash for standalone builds and trusted checks.
@@ -263,6 +265,9 @@ Dependency feature changes select new artifacts.
 Package tests remain enabled.
 Both outputs exclude build-only vendor directories and compiled artifact archives.
 Docker builds dependency artifacts before it copies Rust source.
+Separate Docker builder stages compile each binary from its own source tree.
+`COPY --exclude=bin` needs Dockerfile frontend 1.19 or later.
+The Dockerfile selects the stable frontend.
 
 devenv exposes these build results:
 
@@ -286,6 +291,32 @@ Crash tests select the private executable so their Pijul interceptor can stop th
 Both paths execute the same compiled application.
 The evaluator wrapper supplies defaults for `PATCHGATE_BIN` and `PATCHGATE_EVAL_UNWRAPPED_BIN`.
 Explicit evaluator settings can override these defaults.
+
+Native smoke builds changed each CLI description in an isolated source copy.
+An application edit preserved the evaluator derivation and output.
+An evaluator edit preserved the application derivation and output.
+All wrapper bindings targeted the current application.
+Neither final output retained compiled components or dependency artifacts.
+
+Native proof: `.devenv/split-package-proof-canonical/report.json`.
+
+Native source checks pass all 38 Rust tests, format checks, and Clippy with `-D warnings`.
+Eight control runs cover concurrent review and the model, human, and merge application races.
+Report: `.devenv/split-resumed-native-checks.json`.
+
+The complete `devenv --no-eval-cache test --no-tui` run passed with independent compilation.
+All 124 primary Harbor controls returned the expected rewards without trial errors.
+Docker and Linux bubblewrap lifecycle checks passed.
+Four verifier baselines and ten negative controls passed without trial or verifier exceptions.
+
+Linux report: `.devenv/split-independent-complete-check.result.json`.
+Lifecycle report: `.devenv/test-state/lifecycle-jobs/20261021-000425-b7446352/summary.json`.
+Verifier controls: `.devenv/test-state/harbor-jobs/rust-negative-controls-1792556425430305000-71860.json`.
+
+All four isolated Linux image builds passed, including image export and `--load`.
+Both source-change cases reused the opposite compilation and preserved the runtime-base layer prefix.
+Image proof: `.devenv/split-final-image-proof.json`.
+Timing evidence: `.devenv/split-build-times.json`.
 
 ## Start
 
@@ -578,24 +609,24 @@ Report: `.devenv/image-closure-comparison.json`.
 
 Each measurement set uses one fresh Linux ARM64 `docker-container` BuildKit builder.
 Upstream image and Nix binary caches remain enabled.
-All three durations include image export and `--load`.
+All durations include image export and `--load`.
 
-| Build | Before artifact reuse, seconds | Artifact reuse only, seconds | Stable runtime base, seconds |
-| --- | ---: | ---: | ---: |
-| Cold private BuildKit cache | 364.2 | 599.9 | 639.2 |
-| Unchanged source and reused cache | 21.9 | 14.9 | 15.5 |
-| One Rust comment change and reused cache | 147.5 | 238.4 | 77.1 |
+| Build | Before artifact reuse, seconds | Artifact reuse only, seconds | Stable runtime base, seconds | Independent compilation, seconds |
+| --- | ---: | ---: | ---: | ---: |
+| Cold private BuildKit cache | 364.2 | 599.9 | 639.2 | 602.3 |
+| Unchanged source and reused cache | 21.9 | 14.9 | 15.5 | 12.4 |
+| Application-only comment change and reused cache | 147.5 | 238.4 | 77.1 | 68.3 |
+| Evaluator-only comment change and reused cache | — | — | — | 42.3 |
 
-The latest source-change run reused all 70 runtime-base layers and imported four application and fixture store paths.
-It reused dependency artifacts and compiled only application code.
-Its runtime check took 42.2 seconds, and image export and transfer took 12.6 seconds.
+The application change reused evaluator compilation.
+The evaluator change reused application compilation.
+Both cases preserved the runtime-base layer prefix.
+The unchanged case retained the cold image identity.
 
-The measured source-change time fell by 67.7% against the artifact-only run.
-Cold and unchanged totals did not improve in this run.
 These separate runs do not isolate machine load or filesystem performance.
 
-The comment changed only a temporary source copy.
-The live source hash remained unchanged.
+The comments changed only temporary source copies.
+All live build inputs remained unchanged.
 The benchmark removed its temporary images, private builder, cache, and source copy.
 Logs, metadata, source hashes, and complete JSON evidence remain.
 
@@ -603,7 +634,10 @@ Before artifact reuse: `.devenv/nix-acceptance-build-times.json`.
 Artifact reuse only: `.devenv/cargo-artifact-build-times.json`.
 Earlier full evidence and logs: `../patchgate-cargo-artifact-build-evidence-closure/`.
 Stable runtime base: `.devenv/runtime-layer-build-times.json`.
-Latest full evidence and logs: `../patchgate-runtime-layer-evidence-20261020-01/`.
+Stable runtime-base evidence and logs: `../patchgate-runtime-layer-evidence-20261020-01/`.
+
+Independent compilation: `.devenv/split-build-times.json`.
+Latest full evidence and logs: `../patchgate-split-build-evidence-complete-0a33564e/`.
 
 An earlier run exposed a vendor-source reference in the evaluator binary.
 The package now removes that reference and rejects build-only references in both outputs.

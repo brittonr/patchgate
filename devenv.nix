@@ -29,7 +29,7 @@ in
   # <!-- ste-disable-next-line semicolon -->
   languages.python.enable = true;
 
-  # Both outputs share one Rust build with the Harbor environment.
+  # Both outputs reuse the same independently compiled binaries as Harbor.
   # <!-- ste-disable-next-line semicolon -->
   outputs.patchgate = package;
   # <!-- ste-disable-next-line semicolon -->

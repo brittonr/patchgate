@@ -55,60 +55,85 @@ let
     src = dependencySource;
     # <!-- ste-disable-next-line semicolon sentence-length -->
     cargoVendorDir = craneLib.vendorCargoDeps { src = dependencySource; };
-    # <!-- ste-disable-next-line semicolon sentence-length -->
-    nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
   # <!-- ste-disable-next-line semicolon -->
   };
 
   # <!-- ste-disable-next-line semicolon -->
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+
+  # Each target receives only its own Rust source files.
+  compileBinary = name: files: craneLib.buildPackage (commonArgs // {
+    # <!-- ste-disable-next-line semicolon -->
+    pname = "${name}-unwrapped";
+    # <!-- ste-disable-next-line semicolon -->
+    cargoExtraArgs = "--locked --bin ${name}";
+
+    src = toString (pkgs.lib.fileset.toSource {
+      # <!-- ste-disable-next-line semicolon -->
+      root = sourceRoot;
+      fileset = pkgs.lib.fileset.unions [
+        (sourceRoot + "/Cargo.toml")
+        (sourceRoot + "/Cargo.lock")
+        files
+      # <!-- ste-disable-next-line semicolon -->
+      ];
+    # <!-- ste-disable-next-line semicolon -->
+    });
+
+    # <!-- ste-disable-next-line semicolon -->
+    inherit cargoArtifacts;
+    # <!-- ste-disable-next-line semicolon sentence-length -->
+    nativeCheckInputs = [ pijul pkgs.openssh ];
+    # <!-- ste-disable-next-line semicolon sentence-length -->
+    disallowedReferences = [ commonArgs.cargoVendorDir cargoArtifacts ];
+    # <!-- ste-disable-next-line semicolon -->
+    meta.mainProgram = name;
+  # <!-- ste-disable-next-line semicolon -->
+  });
+
+  # <!-- ste-disable-next-line semicolon sentence-length -->
+  rustSources = pkgs.lib.fileset.fileFilter (file: file.hasExt "rs") (sourceRoot + "/src");
+
+  compiledApplication = compileBinary "patchgate" (
+    pkgs.lib.fileset.difference rustSources (pkgs.lib.fileset.maybeMissing (sourceRoot + "/src/bin"))
+  # <!-- ste-disable-next-line semicolon -->
+  );
+
+  compiledEvaluator = compileBinary "patchgate-eval" (
+    pkgs.lib.fileset.fileFilter (file: file.hasExt "rs") (sourceRoot + "/src/bin/patchgate-eval")
+  # <!-- ste-disable-next-line semicolon -->
+  );
 in
-craneLib.buildPackage (commonArgs // {
-  # The application output excludes evaluator and compiler dependencies.
+pkgs.runCommand "patchgate-0.1.0" {
+  # Wrappers bind the independently compiled binaries to the current gate.
   # <!-- ste-disable-next-line semicolon -->
   outputs = [ "out" "eval" ];
   # <!-- ste-disable-next-line semicolon sentence-length -->
-  nativeCheckInputs = [ pijul pkgs.openssh ];
+  nativeBuildInputs = [ pkgs.makeBinaryWrapper ];
 
-  # Only Cargo inputs and Rust source files enter the package.
-  src = pkgs.lib.fileset.toSource {
+  # Neither output may retain compiled component paths or build-only dependencies.
+  # <!-- ste-disable-next-line semicolon sentence-length -->
+  disallowedReferences = [ compiledApplication compiledEvaluator commonArgs.cargoVendorDir cargoArtifacts ];
+
+  passthru = {
     # <!-- ste-disable-next-line semicolon sentence-length -->
-    root = sourceRoot;
-    fileset = pkgs.lib.fileset.unions [
-      (sourceRoot + "/Cargo.toml")
-      (sourceRoot + "/Cargo.lock")
-      (pkgs.lib.fileset.fileFilter (file: file.hasExt "rs") (sourceRoot + "/src"))
-    # <!-- ste-disable-next-line semicolon -->
-    ];
+    inherit cargoArtifacts compiledApplication compiledEvaluator;
   # <!-- ste-disable-next-line semicolon -->
   };
-
-  # <!-- ste-disable-next-line semicolon -->
-  inherit cargoArtifacts;
-  # <!-- ste-disable-next-line semicolon -->
-  passthru.cargoArtifacts = cargoArtifacts;
-
-  # Neither output may retain build-only dependency files.
-  # <!-- ste-disable-next-line semicolon sentence-length -->
-  disallowedReferences = [ commonArgs.cargoVendorDir cargoArtifacts ];
-
-  postInstall = ''
-    mkdir -p "$out/libexec" "$eval/bin" "$eval/libexec"
-    mv "$out/bin/patchgate" "$out/libexec/patchgate"
-    mv "$out/bin/patchgate-eval" "$eval/libexec/patchgate-eval"
-    removeReferencesToVendoredSources "$eval/libexec"
-
-    makeBinaryWrapper "$out/libexec/patchgate" "$out/bin/patchgate" \
-      --prefix PATH : ${pkgs.lib.makeBinPath runtimeTools}
-    makeBinaryWrapper "$eval/libexec/patchgate-eval" "$eval/bin/patchgate-eval" \
-      --prefix PATH : ${pkgs.lib.makeBinPath evalTools} \
-      --set-default PATCHGATE_BIN "$out/bin/patchgate" \
-      --set-default PATCHGATE_EVAL_UNWRAPPED_BIN "$out/libexec/patchgate"
-  # <!-- ste-disable-next-line semicolon -->
-  '';
 
   # <!-- ste-disable-next-line semicolon -->
   meta.mainProgram = "patchgate";
   # <!-- ste-disable-next-line semicolon -->
   meta.outputsToInstall = [ "out" ];
-})
+} ''
+  mkdir -p "$out/bin" "$out/libexec" "$eval/bin" "$eval/libexec"
+  cp ${compiledApplication}/bin/patchgate "$out/libexec/patchgate"
+  cp ${compiledEvaluator}/bin/patchgate-eval "$eval/libexec/patchgate-eval"
+
+  makeBinaryWrapper "$out/libexec/patchgate" "$out/bin/patchgate" \
+    --prefix PATH : ${pkgs.lib.makeBinPath runtimeTools}
+  makeBinaryWrapper "$eval/libexec/patchgate-eval" "$eval/bin/patchgate-eval" \
+    --prefix PATH : ${pkgs.lib.makeBinPath evalTools} \
+    --set-default PATCHGATE_BIN "$out/bin/patchgate" \
+    --set-default PATCHGATE_EVAL_UNWRAPPED_BIN "$out/libexec/patchgate"
+''
