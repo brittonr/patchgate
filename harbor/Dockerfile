@@ -6,14 +6,13 @@ FROM nixos/nix:2.35.3@sha256:ff480dbb23511aa1c10710aa068ceea5b93fed9bfce5f5379f3
 # The tools come first, so a change to the project does not fetch them again.
 COPY devenv.lock /build/devenv.lock
 
-COPY harbor/environment.nix /build/harbor/environment.nix
-
-COPY nix /build/nix
+COPY nix/harbor-tools.nix nix/pijul.nix /build/nix/
+COPY nix/pijul-apply.patch nix/pijul-archive.patch /build/nix/
 
 RUN <<'SH'
 set -eu
 
-nix-build /build/harbor/environment.nix -A runtimeClosure --option sandbox false --out-link /runtime-closure
+nix-build /build/nix/harbor-tools.nix -A runtimeClosure --option sandbox false --out-link /runtime-closure
 
 mkdir /runtime-base-export
 LC_ALL=C sort -u /runtime-closure/store-paths > /runtime-base-export/paths
@@ -22,6 +21,10 @@ nix-store --export $(cat /runtime-base-export/paths) > /runtime-base-export/clos
 SH
 
 FROM tools-builder AS dependencies
+
+# Application packaging and checks enter after the stable tool build.
+COPY harbor/environment.nix /build/harbor/environment.nix
+COPY nix /build/nix
 
 COPY Cargo.toml Cargo.lock /build/
 

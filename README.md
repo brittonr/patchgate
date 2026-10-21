@@ -304,19 +304,21 @@ Native source checks pass all 38 Rust tests, format checks, and Clippy with `-D 
 Eight control runs cover concurrent review and the model, human, and merge application races.
 Report: `.devenv/split-resumed-native-checks.json`.
 
-The complete `devenv --no-eval-cache test --no-tui` run passed with independent compilation.
+The complete `devenv --no-eval-cache test --no-tui` run passed with narrow stable tool inputs.
+
 All 124 primary Harbor controls returned the expected rewards without trial errors.
 Docker and Linux bubblewrap lifecycle checks passed.
 Four verifier baselines and ten negative controls passed without trial or verifier exceptions.
 
-Linux report: `.devenv/split-independent-complete-check.result.json`.
-Lifecycle report: `.devenv/test-state/lifecycle-jobs/20261021-000425-b7446352/summary.json`.
-Verifier controls: `.devenv/test-state/harbor-jobs/rust-negative-controls-1792556425430305000-71860.json`.
+Linux report: `.devenv/tool-input-complete-check.result.json`.
+Lifecycle report: `.devenv/test-state/lifecycle-jobs/20261021-014442-99a02035/summary.json`.
+Verifier controls: `.devenv/test-state/harbor-jobs/rust-negative-controls-1792562375618268000-35865.json`.
 
-All four isolated Linux image builds passed, including image export and `--load`.
-Both source-change cases reused the opposite compilation and preserved the runtime-base layer prefix.
-Image proof: `.devenv/split-final-image-proof.json`.
-Timing evidence: `.devenv/split-build-times.json`.
+All five isolated Linux image builds passed, including image export and `--load`.
+The packaging edit reused the tool build and runtime-base layers.
+The Rust edits reused the opposite compilation and preserved the runtime-base layer prefix.
+Image proof: `.devenv/tool-input-proof-verified.json`.
+Timing evidence: `.devenv/tool-input-build-times.json`.
 
 ## Start
 
@@ -573,7 +575,11 @@ The Nix acceptance tasks need their Docker privilege declarations.
 ### Task image closure
 
 The `tools-builder` stage builds the pinned Pijul, Nix, OpenSSH, Rust, linker, and process tools.
-`harbor/environment.nix` exposes their source-independent closure as `runtimeClosure`.
+`nix/harbor-tools.nix` defines their source-independent closure as `runtimeClosure`.
+Only `devenv.lock`, this module, `nix/pijul.nix`, and its patches enter the tool stage as project files.
+
+Application packaging, checks, and `harbor/environment.nix` enter the `dependencies` stage.
+
 The `runtime-base` stage imports that closure without application source inputs.
 The builder runs the package runtime check.
 The final stage imports and registers only environment paths absent from that base.
@@ -586,13 +592,18 @@ The registered paths equal the base-image paths plus the complete `/env` closure
 
 The image build checks the complete requisite closure and exact store registration.
 An independent read-only probe also checks installed commands, source exclusion, and empty fixture directories.
-Proof: `.devenv/runtime-layer-closure-proof-final/summary.json`.
+Proof: `.devenv/tool-input-proof-verified.json`.
 
-The complete `devenv --no-eval-cache test --no-tui` run also passed after the runtime-base split.
+The complete `devenv --no-eval-cache test --no-tui` run also passed after the stable-input split.
 All 124 primary Harbor controls matched expected rewards, with no trial errors.
 Four verifier baselines and ten negative controls passed without exceptions.
 Docker and Linux bubblewrap lifecycle checks passed.
-Report: `.devenv/runtime-layer-complete-check.result.json`.
+Report: `.devenv/tool-input-complete-check.result.json`.
+
+The extraction preserved native tool, closure, lifecycle, and environment derivation and output identities.
+Application packaging and check-file edits preserved the stable input image and tool derivations.
+Both Pijul patches and a valid alternate Nixpkgs pin changed those identities.
+Cache proof: `.devenv/tool-input-proof-verified.json`.
 
 The earlier closure measurements use an ARM64 Linux image.
 GB means 1,000,000,000 bytes.
@@ -611,21 +622,28 @@ Each measurement set uses one fresh Linux ARM64 `docker-container` BuildKit buil
 Upstream image and Nix binary caches remain enabled.
 All durations include image export and `--load`.
 
-| Build | Before artifact reuse, seconds | Artifact reuse only, seconds | Stable runtime base, seconds | Independent compilation, seconds |
-| --- | ---: | ---: | ---: | ---: |
-| Cold private BuildKit cache | 364.2 | 599.9 | 639.2 | 602.3 |
-| Unchanged source and reused cache | 21.9 | 14.9 | 15.5 | 12.4 |
-| Application-only comment change and reused cache | 147.5 | 238.4 | 77.1 | 68.3 |
-| Evaluator-only comment change and reused cache | — | — | — | 42.3 |
+| Build | Before artifact reuse, seconds | Artifact reuse only, seconds | Stable runtime base, seconds | Independent compilation, seconds | Narrow tool inputs, seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cold private BuildKit cache | 364.2 | 599.9 | 639.2 | 602.3 | 505.7 |
+| Unchanged source and reused cache | 21.9 | 14.9 | 15.5 | 12.4 | 9.0 |
+| Application-only comment change and reused cache | 147.5 | 238.4 | 77.1 | 68.3 | 59.3 |
+| Evaluator-only comment change and reused cache | — | — | — | 42.3 | 68.4 |
+| Packaging-only change and reused cache | — | — | — | — | 122.7 |
 
 The application change reused evaluator compilation.
 The evaluator change reused application compilation.
 Both cases preserved the runtime-base layer prefix.
 The unchanged case retained the cold image identity.
 
+The packaging-only case added a marker file to the application output.
+It reused both the tool build and runtime-base layers.
+
+
+The evaluator-only time increased in the latest set.
+
 These separate runs do not isolate machine load or filesystem performance.
 
-The comments changed only temporary source copies.
+All mutations changed only temporary source copies.
 All live build inputs remained unchanged.
 The benchmark removed its temporary images, private builder, cache, and source copy.
 Logs, metadata, source hashes, and complete JSON evidence remain.
@@ -637,7 +655,10 @@ Stable runtime base: `.devenv/runtime-layer-build-times.json`.
 Stable runtime-base evidence and logs: `../patchgate-runtime-layer-evidence-20261020-01/`.
 
 Independent compilation: `.devenv/split-build-times.json`.
-Latest full evidence and logs: `../patchgate-split-build-evidence-complete-0a33564e/`.
+Independent-compilation evidence and logs: `../patchgate-split-build-evidence-complete-0a33564e/`.
+
+Narrow tool inputs: `.devenv/tool-input-build-times.json`.
+Latest full evidence and logs: `../patchgate-tool-input-build-evidence-20261021-01/`.
 
 An earlier run exposed a vendor-source reference in the evaluator binary.
 The package now removes that reference and rejects build-only references in both outputs.
