@@ -352,12 +352,7 @@ impl Pijul {
             .find(|entry| entry.hash == hash)
             .context("The isolated channel does not contain the exact candidate hash")?;
         let hashes = isolated.hashes(channel)?;
-        let mut context: NativeContext =
-            serde_json::from_str(&isolated.run(["change", "--context", hash])?)
-                .context("Native review context is not complete JSON")?;
-        if !context.full {
-            bail!("Native review context is incomplete");
-        }
+        let mut context = isolated.context(hash)?;
 
         let after_archive = directory.path().join("after.tar.gz");
         isolated.review_archive(&after_archive)?;
@@ -620,12 +615,62 @@ impl Pijul {
         reader(&archive, path)
     }
 
-    pub fn conflicts(&self) -> Result<Vec<crate::change::Conflict>> {
+    pub fn conflicts(&self, channel: &str) -> Result<Vec<crate::change::Conflict>> {
         let directory = private_source_directory()?;
         let archive = directory.path().join("channel.tar.gz");
-        let (_, stderr) =
-            self.call([OsStr::new("archive"), OsStr::new("-o"), archive.as_os_str()])?;
+        let (_, stderr) = self.call([
+            OsStr::new("archive"),
+            OsStr::new("--channel"),
+            OsStr::new(channel),
+            OsStr::new("-o"),
+            archive.as_os_str(),
+        ])?;
         Ok(crate::change::conflict_report(&stderr))
+    }
+
+    /// Read the full native palimpsest of one change without applying it.
+    pub fn context(&self, hash: &str) -> Result<NativeContext> {
+        let context: NativeContext = serde_json::from_str(&self.run(["change", "--context", hash])?)
+            .context("Native review context is not complete JSON")?;
+        if !context.full {
+            bail!("Native review context is incomplete");
+        }
+        Ok(context)
+    }
+
+    /// Read per-line attribution for one channel file.
+    pub fn credit(&self, channel: &str, path: &str) -> Result<Vec<serde_json::Value>> {
+        let output = self.run([
+            "credit",
+            "--channel",
+            channel,
+            "--output-format",
+            "json",
+            "--",
+            path,
+        ])?;
+        serde_json::from_str(&output).context("pijul credit gave output that is not JSON")
+    }
+
+    /// List the transitive reverse dependency closure of one change.
+    pub fn dependents(&self, hash: &str) -> Result<Vec<String>> {
+        Ok(self
+            .run(["dependents", hash])?
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Unrecord an exact set of changes from one channel.
+    pub fn unrecord(&self, channel: &str, hashes: &[String]) -> Result<()> {
+        let mut args = vec![
+            OsString::from("unrecord"),
+            OsString::from("--channel"),
+            OsString::from(channel),
+        ];
+        args.extend(hashes.iter().map(OsString::from));
+        self.run(args)?;
+        Ok(())
     }
 }
 

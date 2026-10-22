@@ -117,6 +117,72 @@ fn splitlines(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// A numbered policy rule that carries a stable identifier.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRule {
+    pub id: String,
+    pub text: String,
+}
+
+pub const MAX_POLICY_RULES: usize = 16;
+
+/// Read the identified rules of a policy text.
+///
+/// A rule line is a numbered or bulleted item with a `[R1]` style identifier.
+/// A policy without identifiers keeps the single-verdict behavior.
+pub fn policy_rules(text: &str) -> Result<Vec<PolicyRule>, String> {
+    let mut rules = Vec::new();
+    for line in splitlines(text) {
+        let line = line.trim();
+        let line = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line);
+        let line = match line.find('.') {
+            Some(index)
+                if !line[..index].is_empty()
+                    && line[..index].chars().all(|character| character.is_ascii_digit()) =>
+            {
+                line[index + 1..].trim_start()
+            }
+            _ => line,
+        };
+        let Some(rest) = line.strip_prefix('[') else {
+            continue;
+        };
+        let Some(close) = rest.find(']') else {
+            return Err(format!("A policy rule has no closing bracket: {line:?}"));
+        };
+        let id = &rest[..close];
+        let text = rest[close + 1..].trim();
+        if !id.strip_prefix('R').is_some_and(|digits| {
+            (1..=3).contains(&digits.len()) && digits.chars().all(|c| c.is_ascii_digit())
+        }) {
+            return Err(format!("A policy rule identifier is invalid: [{id}]"));
+        }
+        if text.is_empty() {
+            return Err(format!("Policy rule [{id}] has no text"));
+        }
+        if text.chars().count() > 240 {
+            return Err(format!("Policy rule [{id}] is too long"));
+        }
+        if rules.iter().any(|rule: &PolicyRule| rule.id == id) {
+            return Err(format!("Policy rule [{id}] appears two times"));
+        }
+        rules.push(PolicyRule {
+            id: id.to_owned(),
+            text: text.to_owned(),
+        });
+    }
+    if rules.len() > MAX_POLICY_RULES {
+        return Err(format!(
+            "The policy has {} rules. The limit is {MAX_POLICY_RULES}.",
+            rules.len()
+        ));
+    }
+    Ok(rules)
+}
+
 pub fn short(hash: &str) -> &str {
     &hash[..hash
         .char_indices()
@@ -126,6 +192,22 @@ pub fn short(hash: &str) -> &str {
 
 pub fn dependencies(text: &str) -> Vec<String> {
     parse_change_hashes(text, &DEPENDENCY)
+}
+
+/// Read the message of a native change text. An absent message gives an empty string.
+pub fn message(text: &str) -> String {
+    let mut header = String::new();
+    for line in splitlines(text) {
+        if line.starts_with('[') || line.trim().is_empty() {
+            break;
+        }
+        header.push_str(line);
+        header.push('\n');
+    }
+    toml::from_str::<toml::Value>(&header)
+        .ok()
+        .and_then(|value| value.get("message").and_then(toml::Value::as_str).map(str::to_owned))
+        .unwrap_or_default()
 }
 
 pub fn related_changes(text: &str) -> Vec<String> {
@@ -723,5 +805,29 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn policy_rules_need_one_unique_identifier_and_text() {
+        let text = "# Policy\n\n- [R1] Reject a secret.\n\n## Reject\n1. [R2] Reject build output.\n2. No identifier here.\n";
+        assert_eq!(
+            policy_rules(text).unwrap(),
+            vec![
+                PolicyRule {
+                    id: "R1".into(),
+                    text: "Reject a secret.".into()
+                },
+                PolicyRule {
+                    id: "R2".into(),
+                    text: "Reject build output.".into()
+                }
+            ]
+        );
+        assert_eq!(policy_rules("# Policy\nAccept safe changes.\n").unwrap(), vec![]);
+        assert!(policy_rules("- [X1] Wrong prefix.\n").is_err());
+        assert!(policy_rules("- [R1]\n").is_err());
+        assert!(policy_rules("- [R1] One.\n- [R1] Two.\n").is_err());
+        assert!(policy_rules("- [R1234] Too many digits.\n").is_err());
+        assert!(policy_rules("- [R1 No closing bracket.\n").is_err());
     }
 }

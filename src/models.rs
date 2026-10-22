@@ -273,6 +273,26 @@ pub fn select() -> Result<Selection> {
     resolve(document, setting(PROFILE)?, &path, overrides()?)
 }
 
+/// Select one named profile without the primary environment overrides.
+///
+/// Use it for a second, larger typed tier. The profile must exist.
+pub fn select_named(name: &str) -> Result<Selection> {
+    let path = match setting(PATH)? {
+        Some(value) => home_path(&value)?,
+        None => default_path()?,
+    };
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("Cannot read the model profiles file {}", path.display()))?;
+    let document = parse(&text)
+        .with_context(|| format!("The model profiles file {} is invalid", path.display()))?;
+    resolve(
+        Some(document),
+        Some(name.to_owned()),
+        &path,
+        Overrides::default(),
+    )
+}
+
 /// Read a bearer key from a file that only its owner can read. The returned
 /// value never appears in an error message.
 pub fn read_key(path: &Path) -> Result<String> {

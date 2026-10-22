@@ -32,17 +32,30 @@ const MERGE_REPLY: &str = "Reply with a JSON object:\n\
 - \"choice\": the text of one choice, exactly as the list shows it, or \"escalate\".\n\
 - \"reason\": one sentence that tells why this choice keeps the intent of the changes.\n";
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Verdict {
     pub decision: String,
     pub summary: String,
     pub reason: String,
+    /// The typed answer probability of the selected label. Chat replies have none.
+    pub confidence: Option<f64>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct MergeChoice {
     pub choice: String,
     pub reason: String,
+    /// The typed answer probability of the selected label. Chat replies have none.
+    pub confidence: Option<f64>,
+}
+
+/// One typed review question per policy rule, with the global verdict.
+#[derive(Debug, Default)]
+pub struct TypedBatch {
+    pub answers: std::collections::BTreeMap<String, MergeChoice>,
+    pub evidence: Vec<RequestEvidence>,
+    /// Questions that still have no valid typed answer.
+    pub invalid: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -180,6 +193,7 @@ impl Model {
                         decision: choice.choice,
                         summary: String::new(),
                         reason: choice.reason,
+                        confidence: choice.confidence,
                     })
                 }));
         }
@@ -201,6 +215,148 @@ impl Model {
             schema,
         )?;
         Ok(content.map(|content| parse_verdict(&content)))
+    }
+
+    /// Ask the global verdict and one question per identified policy rule.
+    ///
+    /// The request sends every question at one time. A server that answers
+    /// some questions only gets one request for each absent question.
+    pub fn review_questions(
+        &self,
+        policy: &str,
+        state: &RawValue,
+        rules: &[crate::change::PolicyRule],
+    ) -> Result<TypedBatch> {
+        let instructions = review_instructions(self.api, policy);
+        let mut criteria: Vec<(String, Value)> = vec![(
+            "review".into(),
+            json!({
+                "accept": "The change satisfies the policy. No reject or escalate rule applies.",
+                "reject": "The change violates a reject rule in the policy.",
+                "escalate": "A human must decide. The policy requires review, does not cover the change, or the answer is uncertain."
+            }),
+        )];
+        for rule in rules {
+            let text = &rule.text;
+            criteria.push((
+                format!("rule-{}", rule.id),
+                json!({
+                    "allows": format!("Rule [{}] permits this change: {text}", rule.id),
+                    "rejects": format!("Rule [{}] rejects this change: {text}", rule.id),
+                    "needs-human": format!("Rule [{}] requires a human decision: {text}", rule.id),
+                    "not-covered": format!("Rule [{}] does not apply to this change: {text}", rule.id),
+                }),
+            ));
+        }
+        if let Api::OpenAi = self.api {
+            let response = self.review(policy, state)?;
+            let mut batch = TypedBatch {
+                evidence: vec![response.evidence],
+                ..TypedBatch::default()
+            };
+            match response.value {
+                Some(verdict) => {
+                    batch.answers.insert(
+                        "review".into(),
+                        MergeChoice {
+                            choice: verdict.decision,
+                            reason: verdict.reason,
+                            confidence: verdict.confidence,
+                        },
+                    );
+                }
+                None => batch.invalid.push("review".into()),
+            }
+            return Ok(batch);
+        }
+        let questions: serde_json::Map<String, Value> = criteria
+            .iter()
+            .map(|(name, criteria)| {
+                (
+                    name.clone(),
+                    json!({
+                        "type": "choice",
+                        "instructions": instructions,
+                        "criteria": criteria
+                    }),
+                )
+            })
+            .collect();
+        let schema = Value::Object(questions.clone());
+        let evidence = RequestEvidence::new(
+            "review",
+            "systemone",
+            &self.name,
+            self.declared_revision.as_deref(),
+            &json!({"instructions": instructions, "state": state}),
+            &schema,
+        )?;
+        let body = json!({
+            "model": self.name,
+            "state": state,
+            "questions": questions,
+            "truncate": false
+        });
+        let reply = self.post(&body)?;
+        let mut batch = TypedBatch {
+            evidence: vec![evidence],
+            ..TypedBatch::default()
+        };
+        let mut missing = Vec::new();
+        for (name, question) in &criteria {
+            let Some(value) = &reply else {
+                missing.push(name.clone());
+                continue;
+            };
+            let criteria = question
+                .as_object()
+                .expect("choice criteria is an object");
+            match systemone_choice(value, name, criteria) {
+                Ok(Some(choice)) => {
+                    batch.answers.insert(name.clone(), choice);
+                }
+                Ok(None) | Err(_) => missing.push(name.clone()),
+            }
+        }
+        for name in missing {
+            let criteria = criteria
+                .iter()
+                .find(|(question, _)| question == &name)
+                .map(|(_, criteria)| criteria.clone())
+                .expect("a missing question has criteria");
+            let response = self.systemone(&name, &instructions, state, criteria)?;
+            batch.evidence.push(response.evidence);
+            match response.value {
+                Some(choice) => {
+                    batch.answers.insert(name, choice);
+                }
+                None => batch.invalid.push(name),
+            }
+        }
+        Ok(batch)
+    }
+
+    /// Ask one extra typed choice about the reviewed change.
+    pub fn choose(
+        &self,
+        operation: &str,
+        question: &str,
+        instructions: &str,
+        state: &RawValue,
+        criteria: Value,
+    ) -> Result<Response<MergeChoice>> {
+        match self.api {
+            Api::SystemOne => self.systemone(question, instructions, state, criteria),
+            Api::OpenAi => bail!("A typed evidence question needs the systemone API"),
+        }
+        .map(|response| Response {
+            value: response.value.map(|choice| MergeChoice {
+                choice: choice.choice,
+                reason: format!("{operation}: {}", choice.reason),
+                confidence: choice.confidence,
+            }),
+            evidence: response.evidence,
+        })
     }
 
     pub fn merge(&self, prompt: &str, labels: &[&str]) -> Result<Response<MergeChoice>> {
@@ -376,6 +532,7 @@ fn systemone_choice(
     Ok(Some(MergeChoice {
         choice: choice.to_owned(),
         reason: format!("SystemOne selected {choice:?} with option probability {probability:.4}."),
+        confidence: Some(probability),
     }))
 }
 
@@ -440,6 +597,7 @@ fn parse_verdict(content: &Value) -> Option<Verdict> {
         decision: decision.to_owned(),
         summary: summary.to_owned(),
         reason: reason.to_owned(),
+        confidence: None,
     })
 }
 
@@ -456,6 +614,7 @@ fn parse_merge(content: &Value, labels: &[&str]) -> Option<MergeChoice> {
     Some(MergeChoice {
         choice: choice.to_owned(),
         reason: reason.to_owned(),
+        confidence: None,
     })
 }
 
@@ -751,7 +910,8 @@ pub(crate) mod tests {
             Some(Verdict {
                 decision: "accept".into(),
                 summary: "Change text.".into(),
-                reason: "Policy rule.".into()
+                reason: "Policy rule.".into(),
+                confidence: None
             })
         );
         assert!(
@@ -787,7 +947,8 @@ pub(crate) mod tests {
             parse_merge(&reply, &labels),
             Some(MergeChoice {
                 choice: "keep both".into(),
-                reason: "Both changes apply.".into()
+                reason: "Both changes apply.".into(),
+                confidence: None
             })
         );
         for reply in [
@@ -849,6 +1010,7 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(selected.choice, "accept");
+        assert_eq!(selected.confidence, Some(0.75));
         let invalid = json!({"answers": {"review": {
             "type": "choice", "choice": "unlisted", "confidence": 0.99
         }}});

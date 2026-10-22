@@ -11,6 +11,7 @@ mod gate;
 mod isolation;
 mod model;
 mod models;
+mod patch_view;
 mod pijul;
 mod protected;
 pub mod provenance;
@@ -32,6 +33,7 @@ use clap::{Parser, Subcommand};
 
 use change::short;
 use gate::{Gate, Item, Selection, Settings, State};
+use pijul::Pijul;
 
 #[derive(Parser)]
 #[command(
@@ -63,9 +65,29 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Fold configured lane channels into the inbox without a review.
+    Lanes {
+        #[arg(long)]
+        json: bool,
+    },
     /// Explain a change, its dependencies, and its decision evidence.
     Explain {
         change: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the native palimpsest of one change.
+    Show {
+        change: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attribute channel lines to native changes and their gate decisions.
+    Blame {
+        path: String,
+        /// The channel to read. Default: the main channel.
+        #[arg(long)]
+        channel: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -138,10 +160,13 @@ enum Command {
         #[arg(long, requires = "review_selection")]
         include_dependencies: bool,
     },
-    /// Show the effective model profile without a model request.
+    /// Show the effective model profile, and optionally probe its typed questions.
     Model {
         #[arg(long)]
         json: bool,
+        /// Send two harmless typed questions to the endpoint.
+        #[arg(long)]
+        probe: bool,
     },
     /// Diagnose setup without repository changes.
     Doctor {
@@ -168,6 +193,9 @@ enum Command {
         /// The reason for the decision.
         #[arg(short = 'm', long)]
         reason: Option<String>,
+        /// Refuse the decision when this native main state token is stale.
+        #[arg(long)]
+        expected_state: Option<String>,
     },
     /// Reject a change by hand.
     Reject {
@@ -176,6 +204,19 @@ enum Command {
         /// The reason for the decision.
         #[arg(short = 'm', long)]
         reason: Option<String>,
+    },
+    /// Remove one accepted change and its merge from main exactly.
+    Revert {
+        /// The change hash, or the start of the hash.
+        change: String,
+        /// The reason for the revert.
+        #[arg(short = 'm', long)]
+        reason: Option<String>,
+        /// Refuse the revert when this native main state token is stale.
+        #[arg(long)]
+        expected_state: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
     /// Show the decisions and merges, newest first.
     Log {
@@ -653,6 +694,54 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 );
             }
         }
+        Command::Lanes { json } => {
+            let mut gate = Gate::new(settings)?;
+            let reports = gate.sync_lanes()?;
+            if json {
+                #[derive(serde::Serialize)]
+                struct LanesReport {
+                    schema_version: u8,
+                    lanes: Vec<gate::LaneReport>,
+                }
+                print_json(&LanesReport {
+                    schema_version: 1,
+                    lanes: reports,
+                })?;
+            } else if reports.is_empty() {
+                println!("No lane channel is configured. Set PATCHGATE_LANES.");
+            } else {
+                for lane in &reports {
+                    println!("{}  folded {} change(s)", lane.lane, lane.applied.len());
+                    for hash in &lane.applied {
+                        println!("          {}", short(hash));
+                    }
+                }
+            }
+        }
+        Command::Show { change, json } => {
+            let pijul = Pijul::new(settings.repo.clone());
+            let report = patch_view::show(&pijul, &change)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                patch_view::print_show(&report);
+            }
+        }
+        Command::Blame {
+            path,
+            channel,
+            json,
+        } => {
+            let channel = channel.unwrap_or_else(|| settings.main.clone());
+            let pijul = Pijul::new(settings.repo.clone());
+            let ledger = gate::Ledger::new(&settings.repo);
+            let report = patch_view::blame(&pijul, &ledger, &channel, &path)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                patch_view::print_blame(&report);
+            }
+        }
         Command::Explain { change, json } => {
             let mut gate = Gate::new(settings)?;
             let explanation = gate.explain(&change)?;
@@ -750,7 +839,7 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
             show_review(&report, json)?;
         }
         Command::Cases { command } => run_cases(settings, command)?,
-        Command::Model { json } => {
+        Command::Model { json, probe } => {
             let selection = models::select()?;
             if json {
                 #[derive(serde::Serialize)]
@@ -760,6 +849,7 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                     url: &'a str,
                     model: &'a str,
                     api: &'a str,
+                    typed_decisions: bool,
                     revision: Option<&'a str>,
                     key_file: Option<&'a std::path::Path>,
                     profiles_file: Option<&'a std::path::Path>,
@@ -771,6 +861,7 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                     url: &selection.url,
                     model: &selection.model,
                     api: selection.api.as_str(),
+                    typed_decisions: matches!(selection.api, model::Api::SystemOne),
                     revision: selection.revision.as_deref(),
                     key_file: selection.key_file.as_deref(),
                     profiles_file: selection.source.as_deref(),
@@ -781,6 +872,14 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 println!("Endpoint: {}", selection.url);
                 println!("Model: {}", selection.model);
                 println!("API: {}", selection.api.as_str());
+                println!(
+                    "Decision path: {}",
+                    if matches!(selection.api, model::Api::SystemOne) {
+                        "typed choices with label probabilities"
+                    } else {
+                        "chat generation (legacy)"
+                    }
+                );
                 if let Some(revision) = &selection.revision {
                     println!("Revision: {revision}");
                 }
@@ -794,7 +893,12 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 if !selection.available.is_empty() {
                     println!("Profiles: {}", selection.available.join(", "));
                 }
-                println!("This reports configuration only. It makes no model request.");
+                if !probe {
+                    println!("This reports configuration only. It makes no model request.");
+                }
+            }
+            if probe {
+                run_probe(&selection, json)?;
             }
         }
         Command::Doctor { json, runtime } => {
@@ -893,8 +997,10 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
             change,
             resolution,
             reason,
+            expected_state,
         } => {
             let mut gate = Gate::new(settings)?;
+            gate.require_state(expected_state.as_deref())?;
             let item = if let Some(workspace) = resolution {
                 gate.accept_resolution(&workspace, reason.as_deref())?
             } else {
@@ -909,6 +1015,25 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
         Command::Reject { change, reason } => {
             let mut gate = Gate::new(settings)?;
             show(&gate.decide_by_hand(&change, "reject", reason.as_deref())?)
+        }
+        Command::Revert {
+            change,
+            reason,
+            expected_state,
+            json,
+        } => {
+            let mut gate = Gate::new(settings)?;
+            gate.require_state(expected_state.as_deref())?;
+            let report = gate.revert(&change, reason.as_deref())?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!("Reverted {} from main.", short(&report.target));
+                for hash in &report.reverted {
+                    println!("          {}", short(hash));
+                }
+                println!("The inbox keeps the changes. The ledger records the revert.");
+            }
         }
         Command::Log { limit, json } => {
             let gate = Gate::new(settings)?;
@@ -988,7 +1113,69 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("patchgate: {error:#}");
+            if error.downcast_ref::<gate::StateTokenMismatch>().is_some() {
+                return std::process::ExitCode::from(gate::STATE_TOKEN_MISMATCH);
+            }
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// Send two harmless typed questions, so a caller can see the question-set support.
+fn run_probe(selection: &models::Selection, json: bool) -> Result<()> {
+    if !matches!(selection.api, model::Api::SystemOne) {
+        if json {
+            print_json(&serde_json::json!({
+                "schema_version": 1,
+                "typed_questions": false,
+                "detail": "chat generation has no typed question set"
+            }))?;
+        } else {
+            println!("Probe: chat generation has no typed question set.");
+        }
+        return Ok(());
+    }
+    let key = selection
+        .key_file
+        .as_deref()
+        .map(models::read_key)
+        .transpose()?;
+    let model = model::Model::new(
+        &selection.url,
+        &selection.model,
+        Duration::from_secs(60),
+        selection.api,
+        selection.revision.as_deref(),
+        key.as_deref(),
+    )?;
+    let rules = [change::PolicyRule {
+        id: "R1".into(),
+        text: "The probe has no change to review.".into(),
+    }];
+    let state = serde_json::value::to_raw_value(&serde_json::json!({
+        "schema_version": 1,
+        "probe": true
+    }))?;
+    let batch = model.review_questions(
+        "This is a capability probe. It has no policy and no change.",
+        &state,
+        &rules,
+    )?;
+    let answered = batch.answers.len();
+    let invalid = batch.invalid.len();
+    if json {
+        print_json(&serde_json::json!({
+            "schema_version": 1,
+            "typed_questions": true,
+            "questions": 2,
+            "answered": answered,
+            "invalid": invalid
+        }))?;
+    } else {
+        println!("Probe: {answered} of 2 typed questions answered, {invalid} invalid.");
+    }
+    if invalid > 0 {
+        bail!("The typed endpoint did not answer every probe question.");
+    }
+    Ok(())
 }

@@ -423,7 +423,7 @@ fn inspect_workspace(private: &Pijul, prepared: &Prepared, report: &mut Readines
             "Prepared review or policy data is absent, unsafe, or changed.",
         );
     }
-    match private.conflicts() {
+    match private.conflicts(&prepared.main) {
         Ok(conflicts) => {
             report.recorded_conflicts =
                 Some(conflicts.into_iter().map(readiness_conflict).collect());
@@ -680,7 +680,7 @@ fn prepare_plan(
     detach_files(&workspace.join(".pijul"))?;
     validate_native_metadata(&workspace.join(".pijul"))?;
     let conflicts = pijul
-        .conflicts()?
+        .conflicts(main)?
         .into_iter()
         .map(|conflict| Conflict {
             kind: conflict.kind,
@@ -1060,7 +1060,7 @@ fn record_workspace(
         .context("Cannot record the human resolution")?;
     drop(environment);
     ensure!(
-        pijul.conflicts()?.is_empty(),
+        pijul.conflicts(&trusted.main)?.is_empty(),
         "The human workspace still contains unresolved conflicts"
     );
     let after = native_order(&pijul, &trusted)?;

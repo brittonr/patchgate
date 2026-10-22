@@ -54,7 +54,8 @@ patchgate examines the inbox changes that are not in main, in the order of the i
 patchgate reads the policy from main, not from the working copy. Thus a pending change cannot change the rules for its own review. A change to `POLICY.md` always goes to a human.
 
 The decisions and the merges go into `.pijul/patchgate/ledger.jsonl`.
-Exact model verdicts also go into `.pijul/patchgate/decisions/`, keyed by the candidate, policy bytes, reviewed main state, and model identity.
+Exact model verdicts also go into `.pijul/patchgate/decisions/`, keyed by the candidate, policy bytes, reviewed main state, model identity, and confidence threshold.
+Typed conflict choices go into `.pijul/patchgate/merges/`, keyed by the conflict prompt, the exact options, and the model identity.
 The gate refuses a cache entry whose key, binding, size, or file type differs.
 An invalid entry causes a model request, not an acceptance.
 
@@ -199,6 +200,11 @@ The gate cancels the prepared journal and writes no acceptance.
 Retry `review` or `accept` against the current main state.
 Other native failures retain the journal for crash recovery.
 
+`patchgate status --json` and `patchgate review --json` report the exact native main state as `main.state`.
+An agent can give that token to `patchgate accept --expected-state <state>` or `patchgate revert --expected-state <state>`.
+A stale token stops the command before any decision, and the command exits with code 42.
+Use the word `empty` for a main channel with no state.
+
 Independent Pijul commands can still change main before or after this transaction.
 They cannot write main between the conditional state comparison and commit.
 Direct commands still bypass gate policy.
@@ -223,6 +229,37 @@ patchgate builds each merge that it can make exactly from the lines of the sides
 patchgate records the merge in the scratch clone as a new Pijul change. The author of the change is `patchgate`, and pijul signs it with the key of the gate in `.pijul/patchgate/key`. patchgate makes that key at the first merge, and it runs a private ssh-agent for each merge. Then patchgate applies the conflicting change and the merge to main together. It also applies the merge to the inbox.
 
 If the working copy has unrecorded changes, pijul does not apply the merge to the inbox. `patchgate status` then shows the merge, and the command that applies it.
+
+### Patch theory views
+
+patchgate exposes native patch data without acceptance authority.
+
+| Command | Native source | What it shows |
+| --- | --- | --- |
+| `patchgate show <hash>` | `pijul change --context` | Each added, deleted, and kept span with its old and new line numbers. |
+| `patchgate blame <path> --channel main` | `pijul credit` | Each line with the changes that affected it, plus the recorded gate decision of each change. |
+| `patchgate lanes` | `pijul log`, `pijul apply` | Each configured lane channel and the changes that it folded into the inbox. |
+| `patchgate revert <hash>` | `pijul dependents`, `pijul unrecord` | The exact native removal of one accepted change and its recorded merge. |
+
+`show` reads one change directly. It does not clone, apply, or archive.
+
+`blame` reads native attribution only. A line can list more than one change. A change with no recorded decision shows `unrecorded`.
+
+### Lane channels
+
+Set `PATCHGATE_LANES` to channel names, with commas between them. Each author or agent can record in its own channel. Then `patchgate review`, `patchgate watch`, and `patchgate lanes` fold every lane change that the inbox does not have into the inbox. The fold uses `pijul apply`, so native prerequisites enter with the lane change. Lane channels must differ from `inbox` and `main`.
+
+### Revert an accepted change
+
+`patchgate revert <hash>` removes one accepted change and the merge that recorded it. The native `pijul unrecord --channel main` command refuses the set when a change in main still depends on it. patchgate reads `pijul dependents` first and reports those changes.
+
+Revert an accepted change, not a merge hash. patchgate names the accepted changes that a merge resolves.
+
+The revert keeps the inbox unchanged. The ledger gets one `revert` record for each removed hash. `patchgate status` then shows the change with the state `reverted`. `patchgate log` shows the revert.
+
+The revert uses a durable journal like acceptance. A process stop before the native unrecord leaves no revert record. A process stop after it restores the records exactly once.
+
+A direct `pijul apply` or `pijul unrecord` command can change main during a revert. patchgate compares the state under the ledger lock, but the native unrecord has no state condition. Do not run native write commands during a revert.
 
 ### When a human must merge
 
@@ -362,13 +399,14 @@ Raw results remain in `.devenv/clef-tests/clef-flash-4bit.json` and `.devenv/cle
 
 CLEF uses typed decisions, not text generation. Use the bundled `clef_mlx.py` loader from the [MLX checkpoints](https://huggingface.co/mlx-community/clef-flash-4bit). The loader executes the backbone and the joint decision head. LM Studio text generation does not execute that decision head.
 
-Set `PATCHGATE_MODEL_API=systemone` for a server with a `/v1/systemone` endpoint. Keep the `/v1` suffix in `PATCHGATE_MODEL_URL`. patchgate submits one choice question for each review or conflict.
+Set `PATCHGATE_MODEL_API=systemone` for a server with a `/v1/systemone` endpoint. Keep the `/v1` suffix in `PATCHGATE_MODEL_URL`. patchgate submits typed choice questions, never generated text.
 
 SystemOne receives the structured review object in `state`.
 Chat receives the same object as JSON user content.
 Both APIs receive exact policy text as trusted instructions, outside that data.
 
 CLEF does not generate a summary or a written reason. The ledger keeps an empty summary and a reason that states the selected option and its probability. Do not treat that probability as proof of correctness.
+The shipped default profile uses chat generation, so the documented LM Studio setup works. Use a SystemOne profile for decisions. `patchgate model` reports the active decision path.
 
 For a local server on port 8123:
 
@@ -378,6 +416,51 @@ PATCHGATE_MODEL=mlx-community/clef-flash-4bit \
 PATCHGATE_MODEL_URL=http://127.0.0.1:8123/v1 \
 patchgate review
 ```
+
+### Typed policy rules
+
+Give each rule in the policy a stable identifier, for example `[R1]`. patchgate then asks one typed question for each identified rule.
+It also asks the global verdict question, `review`.
+A policy without identifiers keeps the single-verdict path.
+
+The labels of a rule question are `allows`, `rejects`, `needs-human`, and `not-covered`.
+patchgate combines the answers in a fixed order:
+
+| Global verdict | One rule rejects | One rule needs a human | Result |
+| --- | --- | --- | --- |
+| `accept` | yes | any | `reject` |
+| `accept` | no | yes | `escalate` |
+| `accept` | no | no | `accept` |
+| `reject` | any | any | `reject` |
+| `escalate` | any | any | `escalate` |
+
+The confidence of the combined answer is the lowest probability of the answers that decide it.
+An invalid or absent rule answer is an invalid model reply. patchgate then decides nothing.
+
+A rule identifier must be `R` followed by one to three digits. A policy can hold 16 rules or fewer.
+An invalid rule line stops the review with an explicit error, because the policy is trusted input.
+
+### Typed citations
+
+When the rules permit an accept, patchgate asks two more typed questions.
+The first question selects the path that holds the decisive evidence.
+The second question selects one native span in that path, identified by change, start, and end.
+patchgate accepts only a selected path and span that the change itself holds.
+A different path or span escalates the change.
+
+The record keeps every typed answer under `answers`. Each answer holds the operation, the question, the label, the probability, the option count, and the option digest.
+The record keeps no source text in these answers.
+
+### Two typed tiers
+
+Set `PATCHGATE_ESCALATE_PROFILE` to a larger typed profile. That profile must use the SystemOne API.
+When a typed answer has a selected-label probability below `PATCHGATE_ESCALATE_CONFIDENCE`, patchgate asks that profile the same questions.
+The default escalation probability is 0.9.
+patchgate uses the answers of the larger profile for the decision, and the ledger keeps both tiers.
+The larger profile answers a conflict choice too.
+The decision cache key includes the identity of the larger profile, so a changed tier causes new requests.
+
+`PATCHGATE_MIN_CONFIDENCE` still applies after the larger profile answers. A weak answer becomes an escalation.
 
 ## Requirements
 
@@ -518,6 +601,14 @@ $ pijul unrecord UBJWLW7I3DXC
 $ pijul record -a -m "Add the deploy configuration without the key"
 ```
 
+To clean up a series before review, squash the changes. `pijul squash` replaces the series with one exact change. Do not squash after review, because each decision binds the native hash.
+
+```console
+$ pijul squash -a <first-hash> <last-hash>
+```
+
+Use `patchgate show` and `patchgate blame` to inspect native attribution. Use `patchgate revert` to remove an accepted change exactly.
+
 To publish the reviewed work, push main: `pijul push <remote> --from-channel main`.
 
 ## Commands
@@ -531,10 +622,15 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate watch` | Reviews and merges new changes every 10 seconds until you stop it. `devenv up` runs it. |
 | `patchgate accept <hash>` | A human accepts the change. patchgate applies it to main, with the escalated conflicting changes that it resolves. |
 | `patchgate reject <hash>` | A human rejects the change. |
+| `patchgate revert <hash>` | Removes one accepted change and its recorded merge from main exactly. |
+| `patchgate show <hash>` | Shows the native added, deleted, and kept spans. |
+| `patchgate blame <path>` | Shows native line attribution and the recorded decision of each change. |
+| `patchgate lanes` | Folds each configured lane channel into the inbox without a review. |
 | `patchgate log` | Shows the decisions and the merges, newest first. |
 | `patchgate explain <hash>` | Shows paths, unmet dependency chains, current policy/main bindings, and recorded decision and verification evidence. |
 | `patchgate review --dry-run` | Runs the review, merge, and check flow in an isolated repository without source acceptance. |
-| `patchgate model` | Shows the effective model profile, endpoint, and key-file presence. It makes no model request. |
+| `patchgate model` | Shows the effective model profile, endpoint, decision path, and key-file presence. It makes no model request. |
+| `patchgate model --probe` | Sends two harmless typed questions and reports whether every question has a valid answer. |
 | `patchgate doctor` | Diagnoses setup and gives repair commands without repository changes. |
 | `patchgate-eval replay <manifest>` | Compares labeled historical changes across model and policy variants. |
 | `patchgate resolve <hash> --workspace <path>` | Prepares a separate human workspace without acceptance. |
@@ -1179,7 +1275,7 @@ The `api` value is `openai` or `systemone`.
 A `key_file` holds a bearer token for one line. patchgate sends it as `Authorization: Bearer <token>`. The file must not be readable by other users: `chmod 600`. patchgate never writes the token to a record, a report, or an error message.
 `PATCHGATE_MODEL_KEY_FILE` supplies a key file without a profile.
 
-`patchgate model` shows the effective selection. Its JSON report holds no token.
+`patchgate model` shows the effective selection. Its JSON report holds no token. `patchgate model --probe` tests the typed question set. Use it before a review, when a server cannot answer several questions at one time.
 
 ### Environment settings
 
@@ -1201,6 +1297,10 @@ A `key_file` holds a bearer token for one line. patchgate sends it as `Authoriza
 | `PATCHGATE_TIMEOUT` | `300` | The seconds to wait for one reply. The first reply includes the time to load the model. |
 | `PATCHGATE_CHECK_TIMEOUT` | `900` | The positive seconds allowed for Nix verification of one candidate. |
 | `PATCHGATE_INBOX`, `PATCHGATE_MAIN` | `inbox`, `main` | The channel names. The `--inbox` and `--main` options also set them. |
+| `PATCHGATE_LANES` | unset | Lane channels, with commas between them. A review folds them into the inbox first. |
+| `PATCHGATE_MIN_CONFIDENCE` | unset | A typed answer below this selected-label probability becomes `escalate`. Use a value between 0 and 1. |
+| `PATCHGATE_ESCALATE_PROFILE` | unset | A larger typed profile that answers a weak review or conflict again. It must use the SystemOne API. |
+| `PATCHGATE_ESCALATE_CONFIDENCE` | `0.9` | A typed answer below this probability goes to the larger typed profile. It needs `PATCHGATE_ESCALATE_PROFILE`. |
 
 ## Limits
 
@@ -1211,7 +1311,9 @@ A `key_file` holds a bearer token for one line. patchgate sends it as `Authoriza
   Set the model context and `PATCHGATE_MAX_CHANGE_CHARS` together.
 - patchgate merges only the conflicts in the table above. A merge that needs a new line, for example a line that combines both sides, goes to a human.
 - Two gate processes can review at the same time. Each acceptance still needs the exact reviewed main state. A moved state stops that command without acceptance.
-- A reused verdict makes no model request. Remove `.pijul/patchgate/decisions/` to force a new request.
+- A reused verdict or conflict choice makes no model request. Remove `.pijul/patchgate/decisions/` or `.pijul/patchgate/merges/` to force a new request.
+- A typed rule citation that names a path or span outside the change escalates the change. patchgate does not accept a wrong citation.
+- The global verdict and the rule answers can disagree. A rejecting rule decides over an accepting global verdict.
 - A deterministic documentation acceptance skips only the model. Every secret check and Nix check still applies.
 - A local model makes mistakes. Examine `patchgate log` and correct a decision with `patchgate accept` or `patchgate reject`. To remove a merge from main, run `pijul unrecord --channel main <hash>`.
 
