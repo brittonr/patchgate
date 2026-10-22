@@ -404,6 +404,12 @@ impl Store {
         self.records(&repo)
     }
 
+    pub fn get(&self, prefix: &str) -> Result<CaseRecord> {
+        let repo = self.repository()?;
+        let records = self.records(&repo)?;
+        Ok(select(&records, prefix)?.clone())
+    }
+
     pub fn label(&self, prefix: &str, expected: Label, reason: &str) -> Result<CaseRecord> {
         ensure!(
             !reason.trim().is_empty(),

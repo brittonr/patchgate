@@ -1,6 +1,7 @@
 mod apply_race;
 #[path = "../../artifact.rs"]
 pub mod artifact;
+mod baseline;
 #[path = "../../bundle.rs"]
 pub mod bundle;
 #[path = "../../change.rs"]
@@ -12,10 +13,14 @@ mod executable;
 mod generalization;
 mod graphs;
 mod hostile;
+#[path = "../../isolation.rs"]
+pub mod isolation;
 #[path = "../../pijul.rs"]
 pub mod pijul;
 mod real_model;
 mod recovery;
+#[path = "../../release_policy.rs"]
+pub mod release_policy;
 mod replay;
 #[path = "../../secrets.rs"]
 pub mod secrets;
@@ -62,6 +67,7 @@ enum Action {
     VerifyHarbor(controls::ControlArgs),
     ModelHarbor(real_model::LiveArgs),
     Replay(replay::ReplayArgs),
+    Baseline(baseline::BaselineArgs),
     #[command(disable_help_flag = true)]
     InterceptPijul {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -250,6 +256,7 @@ fn run() -> Result<()> {
         Action::VerifyHarbor(args) => controls::verify_harbor(args)?,
         Action::ModelHarbor(args) => real_model::model_harbor(args)?,
         Action::Replay(args) => replay::run(args)?,
+        Action::Baseline(args) => baseline::run(args)?,
         Action::InterceptPijul { args } => recovery::intercept_pijul(&args)?,
         Action::InterceptApplyRace { args } => apply_race::intercept_pijul(&args)?,
     }

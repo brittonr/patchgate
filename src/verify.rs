@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use crate::pijul::Pijul;
@@ -153,6 +154,118 @@ impl Verification {
     }
 }
 
+const CACHE_SCHEMA: u32 = 1;
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CachedResults {
+    schema_version: u32,
+    source: StoreTree,
+    definitions: StoreTree,
+    inputs: BTreeMap<String, StoreTree>,
+    results: Vec<CheckResult>,
+    nix_version: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cached_key(
+    candidates: &[String],
+    merge: Option<&str>,
+    main: &MainBinding,
+    source: &StoreTree,
+    definitions: &StoreTree,
+    inputs: &BTreeMap<String, StoreTree>,
+    checks: &[String],
+    nix_version: &str,
+) -> Result<String> {
+    let hashes: BTreeMap<_, _> = inputs
+        .iter()
+        .map(|(name, tree)| (name, tree.nar_hash.as_str()))
+        .collect();
+    let key = serde_json::json!({
+        "schema_version": CACHE_SCHEMA,
+        "candidates": candidates,
+        "merge": merge,
+        "main": main,
+        "source": source.nar_hash,
+        "definitions": definitions.nar_hash,
+        "inputs": hashes,
+        "checks": checks,
+        "nix_version": nix_version,
+    });
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&key)?)))
+}
+
+fn store_path(path: &str) -> bool {
+    path.starts_with("/nix/store/") && !path.chars().any(char::is_control) && !path.contains('\0')
+}
+
+/// Read a cached result only when its exact tree, input, check, and Nix binding holds.
+fn read_cache(
+    directory: &Path,
+    key: &str,
+    manifest: &Manifest,
+    source: &StoreTree,
+    definitions: &StoreTree,
+    inputs: &BTreeMap<String, StoreTree>,
+    nix_version: &str,
+) -> Option<Vec<CheckResult>> {
+    let bytes = fs::read(directory.join(format!("{key}.json"))).ok()?;
+    let cached: CachedResults = serde_json::from_slice(&bytes).ok()?;
+    let matches = cached.schema_version == CACHE_SCHEMA
+        && cached.source.nar_hash == source.nar_hash
+        && cached.definitions.nar_hash == definitions.nar_hash
+        && cached.nix_version == nix_version
+        && cached.inputs.len() == inputs.len()
+        && inputs.iter().all(|(name, tree)| {
+            cached
+                .inputs
+                .get(name)
+                .is_some_and(|cached| cached.nar_hash == tree.nar_hash)
+        })
+        && cached.results.len() == manifest.checks.len()
+        && cached
+            .results
+            .iter()
+            .map(|result| result.check.as_str())
+            .eq(manifest.checks.iter().map(String::as_str))
+        && cached.results.iter().all(|result| {
+            store_path(&result.drv_path) && result.outputs.values().all(|path| store_path(path))
+        });
+    matches.then_some(cached.results)
+}
+
+fn write_cache(
+    directory: &Path,
+    key: &str,
+    source: &StoreTree,
+    definitions: &StoreTree,
+    inputs: &BTreeMap<String, StoreTree>,
+    results: &[CheckResult],
+    nix_version: &str,
+) -> Result<()> {
+    fs::create_dir_all(directory)?;
+    let value = CachedResults {
+        schema_version: CACHE_SCHEMA,
+        source: source.clone(),
+        definitions: definitions.clone(),
+        inputs: inputs.clone(),
+        results: results.to_vec(),
+        nix_version: nix_version.into(),
+    };
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".tmp")
+        .tempfile_in(directory)?;
+    serde_json::to_writer(&mut temporary, &value)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(directory.join(format!("{key}.json")))
+        .map_err(|error| error.error)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 pub struct Plan {
     manifest: Manifest,
     directory: TempDir,
@@ -192,6 +305,7 @@ impl Plan {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run(
         &self,
         source: &Path,
@@ -200,9 +314,10 @@ impl Plan {
         main: MainBinding,
         timeout: Duration,
         interrupted: &AtomicBool,
+        cache: Option<&Path>,
     ) -> Result<Verification> {
         let mut runner = Runner::new(timeout, interrupted)?;
-        self.run_with_runner(source, candidates, merge, main, &mut runner)
+        self.run_with_runner(source, candidates, merge, main, &mut runner, cache)
     }
 
     fn run_with_runner(
@@ -212,11 +327,12 @@ impl Plan {
         merge: Option<&str>,
         main: MainBinding,
         runner: &mut Runner<'_>,
+        cache: Option<&Path>,
     ) -> Result<Verification> {
         let isolation = runner.probe_runtime_isolation()?;
         let nix_version = runner.version()?;
         let definitions = runner.add_tree(&self.directory.path().join("main").join(DIRECTORY))?;
-        let source = runner.add_tree(source)?;
+        let source_tree = runner.add_tree(source)?;
         let mut inputs = BTreeMap::new();
         for (name, input) in &self.manifest.inputs {
             let tree = if let Some(path) = input.url.strip_prefix("path:") {
@@ -245,6 +361,42 @@ impl Plan {
             );
             inputs.insert(name.clone(), tree);
         }
+        let key = cached_key(
+            candidates,
+            merge,
+            &main,
+            &source_tree,
+            &definitions,
+            &inputs,
+            &self.manifest.checks,
+            &nix_version,
+        )?;
+        if let Some(cache) = cache {
+            if let Some(results) = read_cache(
+                cache,
+                &key,
+                &self.manifest,
+                &source_tree,
+                &definitions,
+                &inputs,
+                &nix_version,
+            ) {
+                eprintln!("patchgate: trusted Nix checks reuse an exact recorded result.");
+                runner.ensure_active()?;
+                return Ok(Verification {
+                    schema_version: 1,
+                    candidates: candidates.to_vec(),
+                    merge: merge.map(str::to_owned),
+                    main,
+                    source: source_tree,
+                    definitions,
+                    inputs,
+                    results,
+                    isolation: Some(isolation),
+                    nix_version: Some(nix_version),
+                });
+            }
+        }
         let system = system()?;
         let input_expression = inputs
             .iter()
@@ -256,7 +408,7 @@ impl Plan {
             let expression = format!(
                 "let definitions = {}; src = {}; inputs = {{ {} }}; in import (definitions + {}) {{ inherit src inputs; system = {}; }}",
                 definitions.expression()?,
-                source.expression()?,
+                source_tree.expression()?,
                 input_expression,
                 nix_string(&format!("/{check}"))?,
                 nix_string(&system)?
@@ -297,12 +449,25 @@ impl Plan {
             });
         }
         runner.ensure_active()?;
+        if let Some(cache) = cache {
+            if let Err(error) = write_cache(
+                cache,
+                &key,
+                &source_tree,
+                &definitions,
+                &inputs,
+                &results,
+                &nix_version,
+            ) {
+                eprintln!("patchgate: the verification cache did not record this result: {error}");
+            }
+        }
         Ok(Verification {
             schema_version: 1,
             candidates: candidates.to_vec(),
             merge: merge.map(str::to_owned),
             main,
-            source,
+            source: source_tree,
             definitions,
             inputs,
             results,
@@ -317,6 +482,25 @@ pub fn probe_runtime_isolation(timeout: Duration, interrupted: &AtomicBool) -> R
     Runner::new(timeout, interrupted)?
         .probe_runtime_isolation()
         .map(|_| ())
+}
+
+/// Select a world-readable directory that the sandbox hides from builds.
+///
+/// The macOS sandbox permits reads of `/private/tmp`, so a marker there stays
+/// visible and cannot prove isolation. It denies `/private/var`, which holds
+/// the world-readable `/private/var/tmp`. The Linux sandbox mounts a private
+/// `/tmp`, so the host `/tmp` stays hidden.
+fn probe_marker_root() -> Result<PathBuf> {
+    let root = if cfg!(target_os = "macos") {
+        Path::new("/private/var/tmp")
+    } else {
+        Path::new("/tmp")
+    };
+    ensure!(
+        root.is_dir(),
+        "The isolation probe needs a world-readable host directory that the sandbox hides"
+    );
+    Ok(root.to_path_buf())
 }
 
 fn runtime_isolation_probe(runner: &Runner<'_>) -> Result<IsolationEvidence> {
@@ -341,7 +525,7 @@ fn runtime_isolation_probe(runner: &Runner<'_>) -> Result<IsolationEvidence> {
     }
     let host = tempfile::Builder::new()
         .prefix("pg-host-probe-")
-        .tempdir_in("/tmp")?;
+        .tempdir_in(probe_marker_root()?)?;
     // The build user can read this harmless marker outside the sandbox.
     fs::set_permissions(host.path(), fs::Permissions::from_mode(0o755))?;
     let marker = fs::canonicalize(host.path())?.join("host-marker");
@@ -877,6 +1061,7 @@ mod tests {
                         state: None,
                     },
                     &mut runner,
+                    None,
                 )
                 .is_err()
             );
@@ -909,6 +1094,17 @@ mod tests {
         assert!(verification.isolation.is_none());
         assert_eq!(verification.observed_nix_version(), None);
         assert_eq!(serde_json::to_value(verification)?, legacy);
+        Ok(())
+    }
+
+    #[test]
+    fn isolation_marker_stays_outside_sandbox_visible_temp_roots() -> Result<()> {
+        let root = probe_marker_root()?;
+        assert!(root.is_dir());
+        if cfg!(target_os = "macos") {
+            // The macOS sandbox permits reads of /private/tmp and /tmp.
+            assert_eq!(root, Path::new("/private/var/tmp"));
+        }
         Ok(())
     }
 

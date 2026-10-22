@@ -1,6 +1,7 @@
 use super::*;
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Requirement {
     tag: String,
     count: usize,
@@ -32,14 +33,89 @@ pub(super) fn validate_requirements(args: &ReplayArgs) -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize)]
+pub(super) fn apply_policy(
+    args: &mut ReplayArgs,
+    policy: &crate::release_policy::Policy,
+) -> Result<()> {
+    policy.validate()?;
+    validate_requirements(args)?;
+    for (value, maximum) in [
+        (
+            &mut args.max_unsafe_acceptances,
+            policy.limits.max_unsafe_acceptances,
+        ),
+        (
+            &mut args.max_label_mismatches,
+            policy.limits.max_label_mismatches,
+        ),
+        (&mut args.max_regressions, policy.limits.max_regressions),
+    ] {
+        ensure!(
+            value.is_none_or(|value| value <= maximum),
+            "A supplied release limit is weaker than the trusted release policy."
+        );
+        if value.is_none() {
+            *value = Some(maximum);
+        }
+    }
+    for (requirements, minimums) in [
+        (&mut args.min_policy_rule, &policy.coverage.policy_rules),
+        (&mut args.min_conflict_kind, &policy.coverage.conflict_kinds),
+    ] {
+        for (tag, minimum) in minimums {
+            if let Some(requirement) = requirements
+                .iter()
+                .find(|requirement| &requirement.tag == tag)
+            {
+                ensure!(
+                    requirement.count >= *minimum,
+                    "A supplied coverage minimum is weaker than the trusted release policy."
+                );
+            } else {
+                requirements.push(Requirement {
+                    tag: tag.clone(),
+                    count: *minimum,
+                });
+            }
+        }
+    }
+    ensure!(
+        !policy.signatures.require_bundle || args.bundle.is_some(),
+        "The trusted release policy needs a signed bundle."
+    );
+    ensure!(
+        !(policy.signatures.require_baseline || policy.baseline_sha256.is_some())
+            || args.baseline.is_some(),
+        "The trusted release policy needs a baseline."
+    );
+    if let Some(identity) = &policy.signatures.signer {
+        ensure!(
+            args.signer.as_ref().is_none_or(|value| value == identity),
+            "The supplied signer differs from the trusted release policy."
+        );
+        args.signer = Some(identity.clone());
+    }
+    ensure!(
+        policy.signatures.allowed_signers_sha256.is_none() || args.allowed_signers.is_some(),
+        "The trusted release policy needs an allowed-signers input."
+    );
+    ensure!(
+        policy.signatures.revoked_keys_sha256.is_none() || args.revoked_keys.is_some(),
+        "The trusted release policy needs a revocation input."
+    );
+    args.gate = true;
+    Ok(())
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Coverage {
     variant_id: String,
     policy_rules: BTreeMap<String, usize>,
     conflict_kinds: BTreeMap<String, usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub(super) struct Baseline {
     schema_version: u32,
     repository: PathBuf,
@@ -50,7 +126,8 @@ pub(super) struct Baseline {
     authorizes_acceptance: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct GateResult {
     schema_version: u32,
     pub(super) passed: bool,
@@ -60,9 +137,12 @@ pub(super) struct GateResult {
     regressions: Vec<Regression>,
     failures: Vec<Failure>,
     coverage: Vec<Coverage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline: Option<Baseline>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Limits {
     unsafe_acceptances: usize,
     label_mismatches: usize,
@@ -71,7 +151,8 @@ struct Limits {
     conflict_kinds: Vec<Requirement>,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Observed {
     unsafe_acceptances: usize,
     label_mismatches: usize,
@@ -80,7 +161,8 @@ struct Observed {
     incomplete_comparisons: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Regression {
     case_id: String,
     variant_id: String,
@@ -88,9 +170,10 @@ struct Regression {
     became_label_mismatch: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Failure {
-    code: &'static str,
+    code: String,
     case_id: Option<String>,
     variant_id: Option<String>,
     message: String,
@@ -99,7 +182,7 @@ struct Failure {
 impl GateResult {
     fn failure(&mut self, code: &'static str, row: Option<&Comparison>, message: String) {
         self.failures.push(Failure {
-            code,
+            code: code.into(),
             case_id: row.map(|row| row.case_id.clone()),
             variant_id: row.map(|row| row.variant_id.clone()),
             message,
@@ -140,6 +223,15 @@ fn complete(row: &Comparison) -> bool {
         && row.cli_executed
         && row.exit_code == Some(0)
         && row.execution_error.is_none()
+        && row.elapsed_seconds.is_finite()
+        && row.elapsed_seconds >= 0.0
+        && row.unsafe_acceptance
+            == row
+                .actual
+                .map(|actual| actual == Label::Accept && row.expected != Label::Accept)
+        && row.escalation == row.actual.map(|actual| actual == Label::Escalate)
+        && row.correct == row.actual.map(|actual| actual == row.expected)
+        && observed_decision_matches(row)
 }
 
 type Matrix<'a> = BTreeMap<(&'a str, &'a str), &'a Comparison>;
@@ -219,7 +311,7 @@ fn matrix<'a>(
     for (case_id, variant_id) in expected {
         if !matrix.contains_key(&(case_id, variant_id)) {
             result.failures.push(Failure {
-                code: "missing_comparison",
+                code: "missing_comparison".into(),
                 case_id: Some(case_id.to_owned()),
                 variant_id: Some(variant_id.to_owned()),
                 message: format!("The {name} has no comparison for this case and variant."),
@@ -271,7 +363,11 @@ fn coverage(
                 .last()
                 .is_some_and(|label| label["expected"] == json!(case.expected))
                 && validate_tag_history(&case.tags).is_ok();
-            (case, capture_identity(case), labeled)
+            (
+                case,
+                capture_identity(case, manifest).ok().flatten(),
+                labeled,
+            )
         })
         .collect();
     for variant in &manifest.variants {
@@ -334,7 +430,7 @@ fn coverage(
                 let count = counts.get(&requirement.tag).copied().unwrap_or(0);
                 if count < requirement.count {
                     result.failures.push(Failure {
-                        code: "coverage_minimum",
+                        code: "coverage_minimum".into(),
                         case_id: None,
                         variant_id: Some(variant.id.clone()),
                         message: format!(
@@ -381,6 +477,9 @@ pub(super) fn evaluate(
         regressions: Vec::new(),
         failures: Vec::new(),
         coverage: Vec::new(),
+        baseline: baseline
+            .and_then(|baseline| baseline.as_ref().ok())
+            .cloned(),
     };
     if let Err(error) = validate_requirements(args) {
         result.failure("invalid_coverage", None, format!("{error:#}"));
@@ -496,6 +595,166 @@ pub(super) fn evaluate(
     Some(result)
 }
 
+pub(super) fn validate_report(report: &Report) -> Result<()> {
+    ensure!(
+        report.schema_version == 1
+            && !report.authorizes_acceptance
+            && report.infrastructure_errors == 0,
+        "Promotion needs a successful version 1 replay report without acceptance authority."
+    );
+    ensure!(
+        report.repository.is_absolute() && report.manifest.is_absolute(),
+        "The promotion report needs absolute source and input path bindings."
+    );
+    let declared = report
+        .gate
+        .as_ref()
+        .context("Promotion needs a complete release gate result.")?;
+    ensure!(
+        declared.schema_version == 1 && declared.passed && !declared.authorizes_acceptance,
+        "Promotion needs a declared passing release gate without acceptance authority."
+    );
+    let manifest = Manifest {
+        schema_version: report.schema_version,
+        repository: report.repository.clone(),
+        main: report.main.clone(),
+        inbox: report.inbox.clone(),
+        cases: report.cases.clone(),
+        variants: report.variants.clone(),
+        configuration: report.configuration.clone(),
+    };
+    validate(&manifest, &manifest.configuration.policy_path)?;
+    let args = ReplayArgs {
+        gate: true,
+        max_unsafe_acceptances: Some(declared.limits.unsafe_acceptances),
+        max_label_mismatches: Some(declared.limits.label_mismatches),
+        max_regressions: Some(declared.limits.regressions),
+        min_policy_rule: declared.limits.policy_rules.clone(),
+        min_conflict_kind: declared.limits.conflict_kinds.clone(),
+        ..ReplayArgs::default()
+    };
+    validate_requirements(&args)?;
+    validate_variant_rows(&report.comparisons, &report.variants)?;
+    if let Some(baseline) = &declared.baseline {
+        validate_variant_rows(&baseline.comparisons, &baseline.variants)?;
+    }
+    let baseline = declared.baseline.clone().map(Ok);
+    let observed = evaluate(
+        &args,
+        &manifest,
+        &report.repository,
+        &report.comparisons,
+        baseline.as_ref(),
+    )
+    .context("Promotion needs a release gate result.")?;
+    ensure!(
+        observed.passed,
+        "The promotion report fails its declared release gate requirements."
+    );
+    ensure!(
+        serde_json::to_value(&observed)? == serde_json::to_value(declared)?,
+        "The promotion report contains a false release gate claim."
+    );
+    let summaries: Vec<_> = report
+        .variants
+        .iter()
+        .map(|variant| summarize(&variant.id, &report.comparisons))
+        .collect();
+    ensure!(
+        serde_json::to_value(summaries)? == serde_json::to_value(&report.summaries)?,
+        "The promotion report summaries differ from its comparison rows."
+    );
+    if let Some(digest) = &report.bundle_sha256 {
+        ensure!(
+            crate::release_policy::valid_digest(digest),
+            "The promotion report has an invalid bundle digest."
+        );
+    }
+    if let Some(policy) = &report.release_policy {
+        ensure!(
+            policy.schema_version == 1
+                && policy.source_repository.is_absolute()
+                && !policy.main.trim().is_empty()
+                && !policy.main.starts_with('-')
+                && !policy.main.chars().any(char::is_control)
+                && crate::release_policy::valid_digest(&policy.policy_sha256),
+            "The promotion report has invalid trusted policy evidence."
+        );
+    }
+    validate_signature_evidence(report, declared.baseline.is_some())?;
+    Ok(())
+}
+
+fn validate_variant_rows(rows: &[Comparison], variants: &[Variant]) -> Result<()> {
+    for row in rows {
+        ensure!(
+            variants.iter().any(|variant| variant.id == row.variant_id
+                && variant.model == row.model
+                && variant.api == row.api
+                && variant.revision == row.revision),
+            "A promotion comparison differs from its declared model variant."
+        );
+    }
+    Ok(())
+}
+
+fn validate_signature_evidence(report: &Report, has_baseline: bool) -> Result<()> {
+    let signatures = &report.signatures;
+    ensure!(
+        signatures.strict || (signatures.bundle.is_none() && signatures.baseline.is_none()),
+        "The promotion report has inconsistent signature mode evidence."
+    );
+    if signatures.strict {
+        ensure!(
+            (report.bundle_sha256.is_some() || has_baseline)
+                && report.bundle_sha256.is_some() == signatures.bundle.is_some()
+                && has_baseline == signatures.baseline.is_some(),
+            "The promotion report lacks required artifact signature evidence."
+        );
+    }
+    for (kind, namespace, evidence) in [
+        (
+            crate::artifact::Kind::Bundle,
+            "patchgate-bundle-v1",
+            &signatures.bundle,
+        ),
+        (
+            crate::artifact::Kind::Baseline,
+            "patchgate-baseline-v1",
+            &signatures.baseline,
+        ),
+    ] {
+        if let Some(verified) = evidence {
+            ensure!(
+                verified.schema_version == 1
+                    && !verified.authorizes_acceptance
+                    && verified.kind == kind
+                    && verified.namespace == namespace
+                    && !verified.identity.trim().is_empty()
+                    && !verified.identity.chars().any(char::is_control)
+                    && verified.signer_fingerprint.starts_with("SHA256:")
+                    && verified.signer_fingerprint.len() > 7
+                    && !verified.signer_fingerprint.chars().any(char::is_control)
+                    && crate::release_policy::valid_digest(&verified.sha256)
+                    && crate::release_policy::valid_digest(&verified.allowed_signers_sha256)
+                    && verified
+                        .revoked_keys_sha256
+                        .as_deref()
+                        .is_none_or(crate::release_policy::valid_digest),
+                "The promotion report has invalid artifact signature evidence."
+            );
+        }
+    }
+    if let Some(bundle) = &signatures.bundle {
+        ensure!(
+            Some(&bundle.sha256) == report.bundle_sha256.as_ref(),
+            "The report bundle digest differs from its signature evidence."
+        );
+    }
+    validate_trust_consistency(signatures.bundle.as_ref(), signatures.baseline.as_ref())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +788,9 @@ mod tests {
             bundle_signature: None,
             baseline_signature: None,
             allowed_signers: None,
+            revoked_keys: None,
+            release_repo: None,
+            release_main: None,
             signer: None,
         }
     }
@@ -543,7 +805,11 @@ mod tests {
                 row.decision(Some(actual), "verdict".into());
                 row.cli_executed = true;
                 row.exit_code = Some(0);
-                row.evidence = Some(json!({"configuration": {"values": row.configuration}}));
+                row.evidence = Some(json!({
+                    "schema_version": 1, "dry_run": true, "authorizes_acceptance": false,
+                    "records": [{"hash": row.candidate, "decision": row.actual}], "items": [],
+                    "configuration": {"values": row.configuration},
+                }));
                 row
             })
             .collect()
@@ -796,6 +1062,7 @@ mod tests {
                 "inbox": manifest.inbox,
                 "base": case.base,
                 "candidate": case.candidate,
+                "policy_path": configuration.policy_path,
                 "configuration": {"values": configuration},
             }));
             case.labels = vec![json!({
@@ -908,6 +1175,33 @@ mod tests {
     }
 
     #[test]
+    fn coverage_rejects_unknown_snapshot_fields_and_ignores_configuration_metadata() {
+        let mut manifest = captured_manifest();
+        let mut args = args();
+        args.min_policy_rule = vec![parse_requirement("protected-path=2").unwrap()];
+        manifest.cases[1] = manifest.cases[0].clone();
+        manifest.cases[1].id = "duplicate".into();
+        manifest.cases[1].snapshot.as_mut().unwrap()["configuration"]["source"] = json!("file");
+        manifest.cases[1].snapshot.as_mut().unwrap()["configuration"]["path"] = json!("/extra");
+        manifest.cases[1].snapshot.as_mut().unwrap()["configuration"]["sha256"] =
+            json!("f".repeat(64));
+        assert!(validate(&manifest, "POLICY.md").is_ok());
+        let current = rows(&manifest, [Label::Reject, Label::Reject]);
+        let result = evaluate_rows(&args, &manifest, &current, None);
+        assert!(!result.passed);
+        assert_eq!(result.coverage[0].policy_rules["protected-path"], 1);
+        manifest.cases[1].tags[0].reason = "The reviewer changes the duplicate history.".into();
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[1].tags = manifest.cases[0].tags.clone();
+        manifest.cases[1].snapshot.as_mut().unwrap()["nonce"] = json!("extra");
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        let current = rows(&manifest, [Label::Reject, Label::Reject]);
+        let result = evaluate_rows(&args, &manifest, &current, None);
+        assert!(!result.passed);
+        assert_eq!(result.coverage[0].policy_rules["protected-path"], 1);
+    }
+
+    #[test]
     fn malformed_and_duplicate_coverage_requirements_fail() {
         for value in [
             "", "TAG=1", "tag", "tag=-1", "tag=+1", "tag=1=2", "tag=", "tag= 1",
@@ -920,5 +1214,38 @@ mod tests {
             parse_requirement("tag=2").unwrap(),
         ];
         assert!(validate_requirements(&args).is_err());
+    }
+
+    #[test]
+    fn current_and_baseline_rows_reject_contradictory_review_evidence() {
+        let manifest = manifest();
+        let current = rows(&manifest, [Label::Reject, Label::Reject]);
+        for (pointer, value) in [
+            ("/records/0/decision", json!("accept")),
+            ("/schema_version", json!(2)),
+            ("/dry_run", json!(false)),
+            ("/authorizes_acceptance", json!(true)),
+        ] {
+            let mut altered = current.clone();
+            *altered[0]
+                .evidence
+                .as_mut()
+                .unwrap()
+                .pointer_mut(pointer)
+                .unwrap() = value;
+            assert!(!evaluate_rows(&args(), &manifest, &altered, None).passed);
+            let previous = Ok(baseline(&manifest, &altered));
+            assert!(!evaluate_rows(&args(), &manifest, &current, Some(&previous)).passed);
+        }
+        for (field, value) in [
+            ("execution_error", json!("The candidate review failed.")),
+            ("by", json!("human")),
+        ] {
+            let mut altered = current.clone();
+            altered[0].evidence.as_mut().unwrap()["records"][0][field] = value;
+            assert!(!evaluate_rows(&args(), &manifest, &altered, None).passed);
+            let previous = Ok(baseline(&manifest, &altered));
+            assert!(!evaluate_rows(&args(), &manifest, &current, Some(&previous)).passed);
+        }
     }
 }

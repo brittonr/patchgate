@@ -26,28 +26,37 @@ patchgate examines the inbox changes that are not in main, in the order of the i
 3. patchgate checks the complete review context and trusted policy for supported credential formats.
    A match rejects the change without a model request.
 
-4. If the structured review data exceeds `PATCHGATE_MAX_CHANGE_CHARS`, patchgate escalates the change.
+4. If the complete reviewed file set matches `documentation_paths`, patchgate accepts the change without a model request.
+   The deterministic checks in step 3 and the trusted Nix checks in step 8 still apply.
+
+5. If the structured review data exceeds `PATCHGATE_MAX_CHANGE_CHARS`, patchgate escalates the change.
    It never truncates review data.
 
-5. Else, patchgate sends structured native context and the trusted policy from main to the model.
+6. Else, patchgate sends structured native context and the trusted policy from main to the model.
    The model accepts, rejects, or escalates the candidate.
+   patchgate reuses an exact earlier verdict when the candidate, the policy bytes, the reviewed main state, and the model identity match.
+   A reused record has `reused: true`, and it makes no model request.
 
-6. patchgate applies each accepted change to a scratch clone of main.
-   If the change conflicts with main, the model selects an exact merge.
+7. patchgate applies the accepted changes that are ready together to one scratch clone of main.
+   If a change conflicts with main, the model selects an exact merge.
+   If the set refuses as a whole, patchgate lands each accepted change alone.
 
-7. patchgate scans the final scratch source before Nix import or acceptance.
+8. patchgate scans the final scratch source before Nix import or acceptance.
    Every declared Nix check must pass.
 
-8. patchgate checks main after each model reply and after Nix verification.
+9. patchgate checks main after each model reply and after Nix verification.
    If main changed, the command stops without that acceptance.
 
-9. Pijul compares the reviewed main state inside its write transaction.
-   It applies the candidate and merge only if that state matches.
+10. Pijul compares the reviewed main state inside one write transaction.
+    It applies the ready set and the merges only if that state matches.
 
 
 patchgate reads the policy from main, not from the working copy. Thus a pending change cannot change the rules for its own review. A change to `POLICY.md` always goes to a human.
 
 The decisions and the merges go into `.pijul/patchgate/ledger.jsonl`.
+Exact model verdicts also go into `.pijul/patchgate/decisions/`, keyed by the candidate, policy bytes, reviewed main state, and model identity.
+The gate refuses a cache entry whose key, binding, size, or file type differs.
+An invalid entry causes a model request, not an acceptance.
 
 ### Structured review data
 
@@ -67,6 +76,8 @@ Model decisions store a `review` object in the ledger.
 It identifies candidate hashes, the SHA-256 digest of exact policy bytes, and the native reviewed main state.
 Model merge records retain the same main snapshot.
 Gate and human decisions do not claim model review evidence.
+A deterministic documentation-only acceptance records `by: "gate"` and the exact reviewed file set.
+A reused verdict records `reused: true` and keeps its original request evidence.
 Earlier ledger records remain readable without retroactive review claims.
 
 Both environments use `nix/pijul.nix` to correct empty-directory archive headers in the pinned Pijul package.
@@ -144,6 +155,9 @@ The probe and checks share one operation deadline.
 Every declared check must pass before the acceptance journal or main application.
 A failed check prevents both model acceptance and `patchgate accept`.
 Nix can reuse valid cached build results.
+patchgate also reuses an exact earlier check result from `.pijul/patchgate/verification/`.
+That entry must match the source NAR hash, the trusted definition NAR hash, every pinned input NAR hash, the check names, the Nix version, and the candidate and merge binding.
+patchgate still runs the fresh isolation probe before it reuses a result.
 `PATCHGATE_CHECK_TIMEOUT` limits the Nix commands for one candidate.
 SIGINT cancels an active check without acceptance.
 
@@ -166,7 +180,7 @@ A broken trusted check needs an owner-controlled main update.
 
 ### Safe paths and crash recovery
 
-A repository lock serializes gate reviews and human decisions. It does not lock independent Pijul commands.
+A repository lock serializes acceptance journal writes and each human decision. It does not serialize model requests or Nix verification. It does not lock independent Pijul commands.
 The gate refuses writes through file links, including links in its state directory.
 Protected-path checks include nested rename targets from the channel archive.
 File names and change messages remain data, including names with spaces, quotes, Unicode, or a leading hyphen.
@@ -520,6 +534,7 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate log` | Shows the decisions and the merges, newest first. |
 | `patchgate explain <hash>` | Shows paths, unmet dependency chains, current policy/main bindings, and recorded decision and verification evidence. |
 | `patchgate review --dry-run` | Runs the review, merge, and check flow in an isolated repository without source acceptance. |
+| `patchgate model` | Shows the effective model profile, endpoint, and key-file presence. It makes no model request. |
 | `patchgate doctor` | Diagnoses setup and gives repair commands without repository changes. |
 | `patchgate-eval replay <manifest>` | Compares labeled historical changes across model and policy variants. |
 | `patchgate resolve <hash> --workspace <path>` | Prepares a separate human workspace without acceptance. |
@@ -539,6 +554,11 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate cases tag <id> --policy-rule <tag> --conflict-kind <tag> -m <reason>` | Records human policy and conflict tags. |
 | `patchgate artifact sign <file> --kind bundle --key <key> --output <signature>` | Signs an artifact digest with a separate reviewer key. |
 | `patchgate artifact verify <file> --kind bundle --signature <signature> --allowed-signers <file> --identity <name>` | Verifies an artifact against explicit trusted signers. |
+| `patchgate cases show <id>` | Shows captured policy and change context without model verdicts. |
+| `patchgate verify --resolution <path>` | Validates a human workspace in isolation without acceptance. |
+| `patchgate artifact verify <file> --revoked-keys <file>` | Rejects a revoked reviewer key and reports its fingerprint. |
+| `patchgate-eval replay --release-repo <path>` | Applies the trusted release policy of an explicit repository. |
+| `patchgate-eval baseline promote <report> --signature <file>` | Records an explicit signed baseline approval in a private store. |
 
 
 A hash can be the start of a hash, for example `FTH4472WYKIZ`.
@@ -572,6 +592,7 @@ Explanation reports separate the current binding from historical records.
 Their dependency graph contains direct prerequisites and complete unmet chains.
 
 Model records retain their original `review` binding.
+A reused verdict has `reused: true` and retains the request evidence of its original request.
 Successful verified acceptances retain `verification` evidence with source, input, derivation, and output identities.
 A gate or human decision does not claim a model verdict.
 An invalid model reply uses `execution_error: \"invalid-model-reply\"`.
@@ -984,6 +1005,95 @@ Signature output is new, private, and atomic.
 Verification shows that an allowed key signed the artifact digest.
 It does not establish source safety or grant acceptance authority.
 
+#### Signer fingerprints and revocation
+
+`patchgate artifact verify` and `patchgate-eval replay` accept `--revoked-keys <file>`.
+The file uses standard OpenSSH public-key revocation or a key revocation list (KRL).
+A revoked key fails even when its identity remains allowed.
+An unreadable or invalid revocation file is never absent.
+Verification reports include the verified signer fingerprint and the revocation digest.
+The fingerprint comes from the verified signature, not from the allowlist or caller metadata.
+
+### Trusted release policy
+
+Record `release-policy.json` on main of the release repository.
+`patchgate-eval replay` reads this file through private native metadata.
+The working copy, the bundle, and the candidate cannot select the trusted policy.
+
+| Policy field | Meaning |
+| --- | --- |
+| `schema_version` | Use `1`. |
+| `limits` | Maximum unsafe acceptances, label mismatches, and regressions. |
+| `coverage` | Minimum counts for policy rules and conflict kinds. |
+| `signatures` | Bundle and baseline signature requirements. |
+| `baseline_sha256` | Optional exact approved baseline digest. |
+
+The signatures object contains `require_bundle`, `require_baseline`, optional `signer`, optional `allowed_signers_sha256`, and optional `revoked_keys_sha256`.
+A signature requirement needs a signer and an allowed-signers digest.
+A revocation digest needs an actual revocation input.
+Digests use lowercase SHA-256 values.
+Malformed policy, unknown fields, and unsafe metadata fail.
+
+```console
+$ patchgate-eval replay --bundle ../cases.tar.gz --release-repo ../release-authority --report ../policy-report.json
+```
+
+Use `--release-repo <path>` with an explicit release repository.
+`--release-main <channel>` changes its trusted channel, and it needs `--release-repo`.
+Without `--release-repo`, replay reads the policy of the enclosing repository if that file exists.
+A missing automatic policy keeps the existing opt-in behavior.
+A loaded policy always activates the release gate.
+
+The command applies the policy limits and coverage minimums.
+A stricter command-line limit or coverage count is permitted, and a weaker one fails.
+The policy can pin the signer, the allowed-signers bytes, the revocation bytes, and the exact baseline.
+A selected baseline is mandatory when `baseline_sha256` exists.
+Replay authenticates selected artifacts before archive extraction.
+Reports retain the policy evidence and the effective gate requirements.
+A report destination cannot replace a file of the release repository.
+
+### Historical case inspection
+
+```console
+$ patchgate cases show <case-id> --json
+```
+
+The command shows the captured snapshot, the tag history, the captured policy text, and the exact candidate change context.
+It uses the recorded base order, native state, and captured bindings, not the current inbox state.
+It never reads model decisions or ledger contents, calls a model, or records in the source.
+Captured source goes to the caller only, never to a model.
+Incomplete or altered native data fails instead of inventing source text.
+
+### Human workspace verification
+
+```console
+$ patchgate verify --resolution ../human-workspace --json
+```
+
+The command runs the complete human acceptance validation on private source and workspace copies.
+Original source files, native metadata, keys, and audit bytes stay unchanged.
+Pending tracked edits and native add/remove state remain in the private copy.
+Untracked files stay out of the staged result.
+Readable read-only inputs are supported.
+The report declares `authorizes_acceptance: false`.
+Actual acceptance repeats all live guards.
+A failure exits nonzero and makes no acceptance claim.
+
+### Signed baseline promotion
+
+```console
+$ patchgate-eval baseline promote ../comparison.json --signature ../baseline.sig --allowed-signers ../allowed-signers --identity reviewer --store ../approved-baselines -m "Approve the signed passing replay." --json
+```
+
+Promotion authenticates the exact private report bytes before JSON parsing.
+It then recomputes the release gate from comparison rows and retained CLI evidence.
+Contradictory decisions, false gate claims, and weaker limits fail.
+The store holds immutable objects, approval records, and one atomic current pointer.
+Repeated promotion keeps earlier approvals and links each approval to the previous one.
+A store path cannot share a source repository path.
+The store uses private directories and one operation lock.
+Promotion never calls a model, executes replay, changes policy, or authorizes acceptance.
+
 
 
 ## Configuration
@@ -998,12 +1108,20 @@ Record `patchgate.json` on main to define repository review rules:
   "settings": {
     "policy_path": "POLICY.md",
     "protected": ["src/**"],
+    "documentation_paths": ["docs/*", "*.md"],
     "max_change_chars": 8000,
     "timeout_seconds": 300,
     "check_timeout_seconds": 900
   }
 }
 ```
+
+`documentation_paths` is optional. It is empty by default, so the model reviews every change.
+A change whose complete reviewed file set matches these patterns receives deterministic review.
+patchgate accepts it without a model request.
+The deterministic secret checks and the trusted Nix checks still apply.
+Protected paths take precedence, so `POLICY.md` and `nix/` still need a human.
+An empty reviewed file set never qualifies.
 
 Only the recorded main file controls these settings.
 Inbox candidates and unrecorded edits cannot change their own review rules.
@@ -1020,6 +1138,7 @@ Unknown fields, invalid schema versions, unsafe paths, and credential data cause
 Recorded links and directories also cause an error.
 A malformed file never activates environment defaults.
 Paths must be safe and relative.
+`documentation_paths` patterns use the same safe syntax as `protected` patterns.
 Time limits must be finite positive seconds, and fractional seconds are valid.
 
 The gate refreshes these settings before each review pass and human decision.
@@ -1030,6 +1149,38 @@ Older records remain unchanged.
 Without the file, the original environment settings apply.
 Removal of the file restores those original values, including within an active watch process.
 
+### Model profiles
+
+A profiles file makes a model swap one selector.
+The default path is `~/.config/patchgate/models.toml`.
+Set `PATCHGATE_MODELS` to use another file.
+Select a profile with `PATCHGATE_MODEL_PROFILE=<name>`. Without that variable, the `default` profile applies.
+Without a profiles file, the environment settings below apply.
+
+```toml
+default = "local"
+
+[profiles.local]
+url = "http://127.0.0.1:1234/v1"
+model = "google/gemma-4-e4b"
+
+[profiles.hosted]
+url = "https://api.example.com/v1"
+model = "hosted-review-model"
+api = "openai"
+revision = "2026-10-01"
+key_file = "~/.config/patchgate/hosted.key"
+```
+
+Each profile supports `url`, `model`, `api`, `revision`, and `key_file`. Only `url` and `model` are required.
+The `api` value is `openai` or `systemone`.
+`PATCHGATE_MODEL_URL`, `PATCHGATE_MODEL`, `PATCHGATE_MODEL_API`, and `PATCHGATE_MODEL_REVISION` override the selected profile.
+
+A `key_file` holds a bearer token for one line. patchgate sends it as `Authorization: Bearer <token>`. The file must not be readable by other users: `chmod 600`. patchgate never writes the token to a record, a report, or an error message.
+`PATCHGATE_MODEL_KEY_FILE` supplies a key file without a profile.
+
+`patchgate model` shows the effective selection. Its JSON report holds no token.
+
 ### Environment settings
 
 
@@ -1037,7 +1188,10 @@ Removal of the file restores those original values, including within an active w
 
 | Variable | Default | Use |
 | --- | --- | --- |
-| `PATCHGATE_MODEL_URL` | `http://127.0.0.1:1234/v1` | The API base URL, including `/v1`. Ollama uses `http://127.0.0.1:11434/v1`. |
+| `PATCHGATE_MODELS` | `~/.config/patchgate/models.toml` | The model profiles file. |
+| `PATCHGATE_MODEL_PROFILE` | the `default` profile | The profile to select. |
+| `PATCHGATE_MODEL_KEY_FILE` | unset | A bearer key file for the model endpoint. |
+| `PATCHGATE_MODEL_URL` | `http://127.0.0.1:1234/v1` | The API base URL, including `/v1`. Ollama uses `http://127.0.0.1:11434/v1`. A profile supplies this value too. |
 | `PATCHGATE_MODEL` | `google/gemma-4-e4b` | The name of the model on the server. |
 | `PATCHGATE_MODEL_API` | `openai` | Use `openai` for chat completions or `systemone` for typed choices. |
 | `PATCHGATE_MODEL_REVISION` | unset | The declared checkpoint revision. The client does not verify server weights or identity. |
@@ -1056,6 +1210,9 @@ Removal of the file restores those original values, including within an active w
   Policy instructions and replies also need space in the model context.
   Set the model context and `PATCHGATE_MAX_CHANGE_CHARS` together.
 - patchgate merges only the conflicts in the table above. A merge that needs a new line, for example a line that combines both sides, goes to a human.
+- Two gate processes can review at the same time. Each acceptance still needs the exact reviewed main state. A moved state stops that command without acceptance.
+- A reused verdict makes no model request. Remove `.pijul/patchgate/decisions/` to force a new request.
+- A deterministic documentation acceptance skips only the model. Every secret check and Nix check still applies.
 - A local model makes mistakes. Examine `patchgate log` and correct a decision with `patchgate accept` or `patchgate reject`. To remove a merge from main, run `pijul unrecord --channel main <hash>`.
 
 ## Tests
@@ -1560,5 +1717,31 @@ python3 harbor/model_check.py \
   --url http://127.0.0.1:8123/v1 \
   --revision b5adbe2c3a95200d4bf04a0727c8ec457157d5e1 \
   --output .devenv/clef-tests/clef-flash-4bit.json
+```
+
+#### Compare several models
+
+Compare mode runs the same seven cases against each selected model profile, one after another. It uses the profiles file from `### Model profiles`, so each model keeps its endpoint, API, revision, and key file.
+
+```bash
+python3 harbor/model_check.py \
+  --profiles ~/.config/patchgate/models.toml \
+  --profile clef-flash-4bit \
+  --profile ternary-bonsai-27b-mlx \
+  --output .devenv/clef-tests/model-comparison.json
+```
+
+The report keeps one section for each model. Its `comparison` section shows:
+- `agreement`: the cases where every model made the same decision sequence.
+- `cases[].decisions`: the decision sequence of each model for one case.
+- `cases[].passed`: the case expectations that each model met.
+- `seconds`: the total review seconds of each model.
+
+Compare mode exits `1` when a model fails a case expectation. Add `--fail-on-disagreement` to exit `1` when the models decide differently too. A difference does not prove which decision is correct. Use `patchgate cases` and `patchgate-eval replay` to keep labeled evidence for a decision.
+
+Test the comparison report without a model server:
+
+```bash
+python3 -m unittest discover -s harbor -p test_model_check.py -v
 ```
 

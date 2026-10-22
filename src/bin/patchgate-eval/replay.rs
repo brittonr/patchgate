@@ -11,7 +11,7 @@ use std::sync::Arc;
 #[path = "replay_gate.rs"]
 mod release_gate;
 
-#[derive(Args)]
+#[derive(Args, Default)]
 pub struct ReplayArgs {
     #[arg(required_unless_present = "bundle", conflicts_with = "bundle")]
     pub manifest: Option<PathBuf>,
@@ -43,6 +43,12 @@ pub struct ReplayArgs {
     pub baseline_signature: Option<PathBuf>,
     #[arg(long)]
     pub allowed_signers: Option<PathBuf>,
+    #[arg(long)]
+    pub revoked_keys: Option<PathBuf>,
+    #[arg(long)]
+    pub release_repo: Option<PathBuf>,
+    #[arg(long, requires = "release_repo")]
+    pub release_main: Option<String>,
     #[arg(long)]
     pub signer: Option<String>,
 }
@@ -92,7 +98,7 @@ fn inbox_channel() -> String {
     "inbox".into()
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Case {
     id: String,
@@ -158,13 +164,61 @@ fn validate_tag_history(tags: &[TagRecord]) -> Result<()> {
     Ok(())
 }
 
-fn capture_identity(case: &Case) -> Option<String> {
-    case.snapshot.as_ref().map(|snapshot| {
-        format!(
-            "{:x}",
-            Sha256::digest(serde_json::to_vec(snapshot).expect("JSON snapshot"))
-        )
-    })
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureSnapshot {
+    repository: PathBuf,
+    main: String,
+    inbox: String,
+    main_state: Option<String>,
+    base: Vec<String>,
+    candidate: String,
+    policy_path: String,
+    policy_sha256: Option<String>,
+    configuration: Value,
+}
+
+fn capture_identity(case: &Case, manifest: &Manifest) -> Result<Option<String>> {
+    let Some(snapshot) = &case.snapshot else {
+        return Ok(None);
+    };
+    let snapshot = CaptureSnapshot::deserialize(snapshot)
+        .map_err(|_| anyhow!("The case snapshot has invalid fields."))?;
+    let configuration = Configuration::deserialize(&snapshot.configuration["values"])
+        .map_err(|_| anyhow!("The captured settings are not valid."))?;
+    ensure!(
+        snapshot.repository.is_absolute()
+            && snapshot.base == case.base
+            && snapshot.candidate == case.candidate
+            && snapshot.main == manifest.main
+            && snapshot.inbox == manifest.inbox
+            && snapshot.policy_path == configuration.policy_path
+            && configuration
+                == *case
+                    .configuration
+                    .as_ref()
+                    .unwrap_or(&manifest.configuration)
+            && snapshot
+                .policy_sha256
+                .as_deref()
+                .is_none_or(crate::release_policy::valid_digest),
+        "The case snapshot differs from its replay bindings."
+    );
+    let bindings = (
+        snapshot.repository,
+        snapshot.main,
+        snapshot.inbox,
+        snapshot.main_state,
+        snapshot.base,
+        snapshot.candidate,
+        snapshot.policy_path,
+        snapshot.policy_sha256,
+        configuration,
+    );
+    Ok(Some(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&bindings)?)
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -175,7 +229,7 @@ enum Label {
     Escalate,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Variant {
     id: String,
@@ -186,7 +240,8 @@ struct Variant {
     policy: Option<PathBuf>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Comparison {
     case_id: String,
     variant_id: String,
@@ -257,7 +312,8 @@ impl Comparison {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Summary {
     variant_id: String,
     comparisons: usize,
@@ -271,7 +327,8 @@ struct Summary {
     latency: Latency,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Latency {
     samples: usize,
     total_seconds: f64,
@@ -280,7 +337,8 @@ struct Latency {
     p95_seconds: Option<f64>,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Report {
     schema_version: u32,
     manifest: PathBuf,
@@ -289,6 +347,7 @@ struct Report {
     inbox: String,
     configuration: Configuration,
     variants: Vec<Variant>,
+    cases: Vec<Case>,
     comparisons: Vec<Comparison>,
     summaries: Vec<Summary>,
     infrastructure_errors: usize,
@@ -298,20 +357,39 @@ struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     gate: Option<release_gate::GateResult>,
     signatures: SignatureEvidence,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    release_policy: Option<crate::release_policy::Evidence>,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SignatureEvidence {
     strict: bool,
     bundle: Option<crate::artifact::Verified>,
     baseline: Option<crate::artifact::Verified>,
 }
 
+fn validate_trust_consistency(
+    bundle: Option<&crate::artifact::Verified>,
+    baseline: Option<&crate::artifact::Verified>,
+) -> Result<()> {
+    if let (Some(bundle), Some(baseline)) = (bundle, baseline) {
+        ensure!(
+            bundle.identity == baseline.identity
+                && bundle.allowed_signers_sha256 == baseline.allowed_signers_sha256
+                && bundle.revoked_keys_sha256 == baseline.revoked_keys_sha256,
+            "The report artifacts use different trust inputs."
+        );
+    }
+    Ok(())
+}
+
 fn strict_signatures(args: &ReplayArgs) -> Result<bool> {
     let strict = args.bundle_signature.is_some()
         || args.baseline_signature.is_some()
         || args.allowed_signers.is_some()
-        || args.signer.is_some();
+        || args.signer.is_some()
+        || args.revoked_keys.is_some();
     if strict {
         ensure!(
             args.bundle.is_some() || args.baseline.is_some(),
@@ -343,21 +421,155 @@ fn signature_trust(args: &ReplayArgs, signature: &Path) -> crate::artifact::Trus
             .expect("validated trust")
             .clone(),
         identity: args.signer.as_ref().expect("validated trust").clone(),
+        revoked_keys: args.revoked_keys.clone(),
     }
 }
 
+fn load_release_policy(args: &ReplayArgs) -> Result<crate::release_policy::Loaded> {
+    ensure!(
+        args.release_main.is_none() || args.release_repo.is_some(),
+        "An explicit release channel needs an explicit release repository."
+    );
+    if let Some(repository) = &args.release_repo {
+        let loaded = crate::release_policy::load(
+            repository,
+            args.release_main.as_deref().unwrap_or("main"),
+        )?;
+        ensure!(
+            loaded.policy.is_some(),
+            "The explicit release repository has no recorded release policy."
+        );
+        return Ok(loaded);
+    }
+    let cwd = std::env::current_dir().context("Read the caller directory.")?;
+    caller_release_policy(&cwd)
+}
+
+fn caller_release_policy(cwd: &Path) -> Result<crate::release_policy::Loaded> {
+    for repository in cwd.ancestors() {
+        match fs::symlink_metadata(repository.join(".pijul")) {
+            Ok(_) => return crate::release_policy::load(repository, "main"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => bail!("Cannot inspect the caller repository metadata."),
+        }
+    }
+    Ok(crate::release_policy::Loaded {
+        policy: None,
+        evidence: None,
+    })
+}
+
+fn validate_policy_artifact(
+    policy: &crate::release_policy::Policy,
+    verified: &crate::artifact::Verified,
+) -> Result<()> {
+    let trust = &policy.signatures;
+    ensure!(
+        trust
+            .signer
+            .as_ref()
+            .is_none_or(|identity| identity == &verified.identity)
+            && trust
+                .allowed_signers_sha256
+                .as_ref()
+                .is_none_or(|digest| digest == &verified.allowed_signers_sha256)
+            && trust
+                .revoked_keys_sha256
+                .as_ref()
+                .is_none_or(|digest| Some(digest) == verified.revoked_keys_sha256.as_ref()),
+        "The artifact trust inputs differ from the trusted release policy."
+    );
+    Ok(())
+}
+
+fn baseline_input_pinned(
+    path: &Path,
+    trust: Option<&crate::artifact::Trust>,
+    policy: Option<&crate::release_policy::Policy>,
+) -> Result<(release_gate::Baseline, Option<crate::artifact::Verified>)> {
+    let bytes = release_gate::baseline_bytes(path)?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    if let Some(expected) = policy.and_then(|policy| policy.baseline_sha256.as_ref()) {
+        ensure!(
+            &digest == expected,
+            "The baseline bytes differ from the trusted release policy."
+        );
+    }
+    let verified = trust
+        .map(|trust| {
+            crate::artifact::verify_digest(crate::artifact::Kind::Baseline, &digest, trust)
+        })
+        .transpose()?;
+    if let (Some(policy), Some(verified)) = (policy, &verified) {
+        validate_policy_artifact(policy, verified)?;
+    }
+    Ok((release_gate::read_baseline(&bytes)?, verified))
+}
+
+#[cfg(test)]
 fn baseline_input(
     path: &Path,
     trust: Option<&crate::artifact::Trust>,
 ) -> Result<(release_gate::Baseline, Option<crate::artifact::Verified>)> {
-    let bytes = release_gate::baseline_bytes(path)?;
-    let verified = trust
-        .map(|trust| {
-            let digest = format!("{:x}", Sha256::digest(&bytes));
-            crate::artifact::verify_digest(crate::artifact::Kind::Baseline, &digest, trust)
-        })
-        .transpose()?;
-    Ok((release_gate::read_baseline(&bytes)?, verified))
+    baseline_input_pinned(path, trust, None)
+}
+
+pub(super) fn validate_promotion_report(bytes: &[u8]) -> Result<()> {
+    let report: Report = serde_json::from_slice(bytes)
+        .map_err(|_| anyhow!("The promotion report has invalid JSON or fields."))?;
+    release_gate::validate_report(&report)
+}
+
+#[cfg(test)]
+pub(super) fn successful_promotion_report() -> Vec<u8> {
+    let manifest: Manifest = serde_json::from_value(json!({
+        "schema_version": 1,
+        "repository": "/captured/source",
+        "cases": [{"id": "case", "base": [], "candidate": "A".repeat(53), "expected": "reject"}],
+        "variants": [{"id": "model", "model_url": "http://localhost:8080", "model": "model", "api": "openai", "revision": "revision"}]
+    })).unwrap();
+    let mut row = Comparison::new(
+        &manifest.cases[0],
+        &manifest.variants[0],
+        &manifest.configuration,
+    );
+    row.decision(Some(Label::Reject), "verdict".into());
+    row.cli_executed = true;
+    row.exit_code = Some(0);
+    row.evidence = Some(json!({
+        "schema_version": 1, "dry_run": true, "authorizes_acceptance": false,
+        "records": [{"hash": row.candidate, "decision": row.actual}], "items": [],
+        "configuration": {"values": row.configuration},
+    }));
+    let comparisons = vec![row];
+    let args = ReplayArgs {
+        gate: true,
+        ..ReplayArgs::default()
+    };
+    let gate = release_gate::evaluate(&args, &manifest, &manifest.repository, &comparisons, None);
+    let report = Report {
+        schema_version: 1,
+        manifest: "/captured/manifest.json".into(),
+        repository: manifest.repository,
+        main: manifest.main,
+        inbox: manifest.inbox,
+        configuration: manifest.configuration,
+        summaries: manifest
+            .variants
+            .iter()
+            .map(|variant| summarize(&variant.id, &comparisons))
+            .collect(),
+        variants: manifest.variants,
+        cases: manifest.cases,
+        comparisons,
+        infrastructure_errors: 0,
+        authorizes_acceptance: false,
+        bundle_sha256: None,
+        gate,
+        signatures: SignatureEvidence::default(),
+        release_policy: None,
+    };
+    serde_json::to_vec(&report).unwrap()
 }
 
 fn valid_hash(hash: &str) -> bool {
@@ -429,7 +641,7 @@ fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
                 .unwrap_or(&manifest.configuration),
         )?;
         validate_tag_history(&case.tags)?;
-        if let Some(identity) = capture_identity(case) {
+        if let Some(identity) = capture_identity(case, manifest)? {
             if let Some((tags, labels, expected)) =
                 captures.insert(identity, (&case.tags, &case.labels, case.expected))
             {
@@ -457,20 +669,7 @@ fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
                 "Each case label needs a user, time, expected value, and explicit reason."
             );
         }
-        if let Some(snapshot) = &case.snapshot {
-            ensure!(
-                snapshot["base"] == json!(case.base)
-                    && snapshot["candidate"] == case.candidate
-                    && snapshot["main"] == manifest.main
-                    && snapshot["inbox"] == manifest.inbox
-                    && snapshot["configuration"]["values"]
-                        == serde_json::to_value(
-                            case.configuration
-                                .as_ref()
-                                .unwrap_or(&manifest.configuration)
-                        )?,
-                "The case snapshot differs from its replay bindings."
-            );
+        if case.snapshot.is_some() {
             ensure!(
                 case.labels
                     .last()
@@ -884,6 +1083,27 @@ fn observed_configuration_matches(row: &Comparison) -> bool {
     })
 }
 
+fn candidate_actor(report: &Value, hash: &str) -> Option<String> {
+    report["records"]
+        .as_array()
+        .and_then(|records| {
+            records
+                .iter()
+                .rev()
+                .find(|record| record["hash"].as_str() == Some(hash))
+        })
+        .and_then(|record| record["by"].as_str())
+        .map(str::to_owned)
+}
+
+fn observed_decision_matches(row: &Comparison) -> bool {
+    row.evidence.as_ref().is_some_and(|report| {
+        candidate_decision(report, &row.candidate)
+            .is_ok_and(|(actual, outcome)| actual == row.actual && outcome == row.outcome)
+            && candidate_actor(report, &row.candidate) == row.decision_actor
+    })
+}
+
 fn candidate_decision(report: &Value, hash: &str) -> Result<(Option<Label>, String)> {
     ensure!(
         report["schema_version"] == 1
@@ -1021,15 +1241,7 @@ fn execute(
     comparison.decision_actor = comparison
         .evidence
         .as_ref()
-        .and_then(|report| report["records"].as_array())
-        .and_then(|records| {
-            records
-                .iter()
-                .rev()
-                .find(|record| record["hash"].as_str() == Some(case.candidate.as_str()))
-        })
-        .and_then(|record| record["by"].as_str())
-        .map(str::to_owned);
+        .and_then(|report| candidate_actor(report, &case.candidate));
     comparison.decision(actual, outcome);
     Ok(())
 }
@@ -1141,23 +1353,40 @@ fn report_outside_source(path: &Path, source: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn report_outside_repositories(path: &Path, source: &Path, origin: &Path) -> Result<PathBuf> {
+fn report_outside_repositories(
+    path: &Path,
+    source: &Path,
+    origin: &Path,
+    release_repository: Option<&Path>,
+) -> Result<PathBuf> {
     let path = report_outside_source(path, source)?;
     ensure!(
         source == origin || !crate::bundle::directory_contains(origin, &path)?,
         "The report path must be outside the captured source repository."
     );
+    if let Some(repository) = release_repository {
+        ensure!(
+            !crate::bundle::directory_contains(repository, &path)?,
+            "The report path must be outside the trusted release repository."
+        );
+    }
     Ok(path)
 }
 
-fn write_report(path: &Path, source: &Path, origin: &Path, bytes: &[u8]) -> Result<()> {
-    let path = report_outside_repositories(path, source, origin)?;
+fn write_report(
+    path: &Path,
+    source: &Path,
+    origin: &Path,
+    release_repository: Option<&Path>,
+    bytes: &[u8],
+) -> Result<()> {
+    let path = report_outside_repositories(path, source, origin, release_repository)?;
     let parent = path.parent().context("The report parent is absent.")?;
     fs::create_dir_all(parent)?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
-    report_outside_repositories(&path, source, origin)?;
+    report_outside_repositories(&path, source, origin, release_repository)?;
     file.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -1190,8 +1419,19 @@ fn trusted_runtime_path() -> Result<std::ffi::OsString> {
 }
 
 pub fn run(args: ReplayArgs) -> Result<()> {
-    let strict = strict_signatures(&args)?;
     release_gate::validate_requirements(&args)?;
+    let policy = load_release_policy(&args)?;
+    run_with_release_policy(args, policy)
+}
+
+fn run_with_release_policy(
+    mut args: ReplayArgs,
+    policy: crate::release_policy::Loaded,
+) -> Result<()> {
+    if let Some(policy) = &policy.policy {
+        release_gate::apply_policy(&mut args, policy)?;
+    }
+    let strict = strict_signatures(&args)?;
     let mut signatures = SignatureEvidence {
         strict,
         ..SignatureEvidence::default()
@@ -1217,6 +1457,28 @@ pub fn run(args: ReplayArgs) -> Result<()> {
             )
         })
         .transpose()?;
+    if let (Some(policy), Some(snapshot)) = (&policy.policy, &authenticated) {
+        validate_policy_artifact(policy, &snapshot.verified)?;
+    }
+    let baseline = args.baseline.as_deref().map(|path| {
+        let trust = args
+            .baseline_signature
+            .as_ref()
+            .map(|signature| signature_trust(&args, signature));
+        let (baseline, verified) =
+            baseline_input_pinned(path, trust.as_ref(), policy.policy.as_ref())?;
+        signatures.baseline = verified;
+        Ok(baseline)
+    });
+    if strict || policy.policy.is_some() {
+        if let Some(Err(error)) = &baseline {
+            bail!("The selected release baseline is not valid: {error:#}");
+        }
+    }
+    validate_trust_consistency(
+        authenticated.as_ref().map(|snapshot| &snapshot.verified),
+        signatures.baseline.as_ref(),
+    )?;
     let mut loaded = args
         .bundle
         .as_ref()
@@ -1228,20 +1490,6 @@ pub fn run(args: ReplayArgs) -> Result<()> {
         })
         .transpose()?;
     signatures.bundle = authenticated.map(|snapshot| snapshot.verified);
-    let baseline = args.baseline.as_deref().map(|path| {
-        let trust = args
-            .baseline_signature
-            .as_ref()
-            .map(|signature| signature_trust(&args, signature));
-        let (baseline, verified) = baseline_input(path, trust.as_ref())?;
-        signatures.baseline = verified;
-        Ok(baseline)
-    });
-    if strict {
-        if let Some(Err(error)) = &baseline {
-            bail!("The signed baseline is not valid: {error:#}");
-        }
-    }
     let mut manifest: Manifest = match &mut loaded {
         Some(bundle) => serde_json::from_value(std::mem::take(&mut bundle.manifest)),
         None => serde_json::from_slice(&fs::read(&manifest_path)?),
@@ -1270,7 +1518,17 @@ pub fn run(args: ReplayArgs) -> Result<()> {
     let report_path = args
         .report
         .as_deref()
-        .map(|path| report_outside_repositories(path, &source, &origin))
+        .map(|path| {
+            report_outside_repositories(
+                path,
+                &source,
+                &origin,
+                policy
+                    .evidence
+                    .as_ref()
+                    .map(|evidence| evidence.source_repository.as_path()),
+            )
+        })
         .transpose()?;
     let mut policies = BTreeMap::new();
     let mut policy_errors = BTreeMap::new();
@@ -1398,6 +1656,7 @@ pub fn run(args: ReplayArgs) -> Result<()> {
         inbox: manifest.inbox,
         configuration: manifest.configuration,
         variants: manifest.variants,
+        cases: manifest.cases,
         comparisons,
         summaries,
         infrastructure_errors,
@@ -1405,12 +1664,22 @@ pub fn run(args: ReplayArgs) -> Result<()> {
         bundle_sha256: loaded.as_ref().map(|bundle| bundle.sha256.clone()),
         gate,
         signatures,
+        release_policy: policy.evidence,
     };
     let mut text = serde_json::to_string_pretty(&report)?;
     text.push('\n');
     print!("{text}");
     if let Some(path) = report_path {
-        write_report(&path, &source, &report.repository, text.as_bytes())?;
+        write_report(
+            &path,
+            &source,
+            &report.repository,
+            report
+                .release_policy
+                .as_ref()
+                .map(|evidence| evidence.source_repository.as_path()),
+            text.as_bytes(),
+        )?;
     }
     ensure!(
         gate_passed,
@@ -1482,6 +1751,8 @@ mod tests {
     fn captured_bindings_and_human_labels_remain_explicit() {
         let mut manifest = fixture();
         manifest.cases[0].snapshot = Some(json!({
+            "repository": "/captured/source",
+            "policy_path": "POLICY.md",
             "base": [],
             "candidate": manifest.cases[0].candidate,
             "main": "main",
@@ -1516,8 +1787,10 @@ mod tests {
     fn duplicate_capture_tag_histories_must_match() {
         let mut manifest = fixture();
         manifest.cases[0].snapshot = Some(json!({
+            "repository": "/captured/source",
             "base": [], "candidate": manifest.cases[0].candidate,
-            "main": "main", "inbox": "inbox",
+            "main": "main", "inbox": "inbox", "main_state": null,
+            "policy_path": "POLICY.md", "policy_sha256": null,
             "configuration": {"values": manifest.configuration},
         }));
         manifest.cases[0].labels = vec![json!({
@@ -2007,16 +2280,18 @@ mod tests {
         fs::write(&original, b"source bytes")?;
         let alias = directory.path().join("report");
         fs::hard_link(&original, &alias)?;
-        write_report(&alias, &source, &source, b"report bytes")?;
+        write_report(&alias, &source, &source, None, b"report bytes")?;
         assert_eq!(fs::read(&original)?, b"source bytes");
         assert_eq!(fs::read(&alias)?, b"report bytes");
         let dangling = directory.path().join("dangling");
         std::os::unix::fs::symlink(source.join("missing"), &dangling)?;
-        assert!(write_report(&dangling, &source, &source, b"must not enter source").is_err());
+        assert!(write_report(&dangling, &source, &source, None, b"must not enter source").is_err());
         assert!(!source.join("missing").exists());
         let parent = directory.path().join("parent-alias");
         std::os::unix::fs::symlink(&source, &parent)?;
-        assert!(write_report(&parent.join("nested/report"), &source, &source, b"no").is_err());
+        assert!(
+            write_report(&parent.join("nested/report"), &source, &source, None, b"no").is_err()
+        );
         assert!(!source.join("nested").exists());
         Ok(())
     }
@@ -2031,16 +2306,60 @@ mod tests {
         fs::create_dir(&runtime)?;
         let original = source.join("POLICY.md");
         fs::write(&original, b"Retain the original source.\n")?;
-        assert!(write_report(&original, &runtime, &source, b"report").is_err());
+        assert!(write_report(&original, &runtime, &source, None, b"report").is_err());
         assert_eq!(fs::read(&original)?, b"Retain the original source.\n");
         let alias = source.with_file_name("SOURCE").join("POLICY.md");
         if alias.is_file() {
-            assert!(write_report(&alias, &runtime, &source, b"report").is_err());
+            assert!(write_report(&alias, &runtime, &source, None, b"report").is_err());
             assert_eq!(fs::read(&original)?, b"Retain the original source.\n");
         }
         fs::remove_dir_all(&source)?;
-        assert!(write_report(&original, &runtime, &source, b"report").is_err());
+        assert!(write_report(&original, &runtime, &source, None, b"report").is_err());
         assert!(!source.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn reports_cannot_replace_trusted_release_repository_files() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let source = root.join("source");
+        let origin = root.join("origin");
+        let trusted = root.join("trusted");
+        fs::create_dir(&source)?;
+        fs::create_dir(&origin)?;
+        fs::create_dir_all(trusted.join(".pijul/patchgate"))?;
+        let key = trusted.join(".pijul/patchgate/key");
+        fs::write(&key, b"private authority bytes")?;
+        assert!(write_report(&key, &source, &origin, Some(&trusted), b"report").is_err());
+        assert_eq!(fs::read(&key)?, b"private authority bytes");
+        let nested = trusted.join("new/directory/report.json");
+        assert!(write_report(&nested, &source, &origin, Some(&trusted), b"report").is_err());
+        assert!(!trusted.join("new").exists());
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&trusted, &alias)?;
+        assert!(
+            write_report(
+                &alias.join(".pijul/patchgate/key"),
+                &source,
+                &origin,
+                Some(&trusted),
+                b"report",
+            )
+            .is_err()
+        );
+        let case_alias = trusted
+            .with_file_name("TRUSTED")
+            .join(".pijul/patchgate/key");
+        if case_alias.is_file() {
+            assert!(
+                write_report(&case_alias, &source, &origin, Some(&trusted), b"report").is_err()
+            );
+        }
+        assert_eq!(fs::read(&key)?, b"private authority bytes");
+        let outside = root.join("reports/report.json");
+        write_report(&outside, &source, &origin, Some(&trusted), b"report")?;
+        assert_eq!(fs::read(outside)?, b"report");
         Ok(())
     }
 }
@@ -2211,8 +2530,8 @@ mod input_tests {
             std::ffi::OsStr::new("--report"),
             report.as_os_str(),
         ])?;
-        let error = run(cli.replay).unwrap_err();
-        assert!(format!("{error:#}").starts_with("The signed baseline is not valid:"));
+        let policy = caller_release_policy(directory.path())?;
+        assert!(run_with_release_policy(cli.replay, policy).is_err());
         assert!(!report.exists());
         assert_eq!(fs::read(&manifest)?, b"{}");
         assert_eq!(fs::read(&baseline)?, b"{}");
@@ -2359,6 +2678,7 @@ mod input_tests {
         let trust = crate::artifact::Trust {
             signature,
             allowed_signers: allowed,
+            revoked_keys: None,
             identity: "reviewer".into(),
         };
         let (_baseline, verified) = baseline_input(&path, Some(&trust))?;
@@ -2377,6 +2697,296 @@ mod input_tests {
         assert_eq!(json["baseline"]["identity"], "reviewer");
         assert_eq!(json["baseline"]["authorizes_acceptance"], false);
         assert_eq!(json["baseline"]["namespace"], "patchgate-baseline-v1");
+        Ok(())
+    }
+
+    #[test]
+    fn strict_artifacts_reject_trust_file_changes_between_verifications() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = fs::canonicalize(directory.path())?;
+        let key = root.join("reviewer");
+        checked_output(
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&key)
+                .output()?,
+            "Create the review key",
+        )?;
+        let allowed = root.join("allowed-signers");
+        let allowed_bytes = format!(
+            "reviewer {}",
+            fs::read_to_string(key.with_extension("pub"))?
+        );
+        fs::write(&allowed, &allowed_bytes)?;
+        let revoked = root.join("revoked-keys");
+        fs::write(&revoked, b"")?;
+        let bundle = root.join("bundle.tar.gz");
+        fs::write(&bundle, b"exact bundle bytes")?;
+        let bundle_signature = root.join("bundle.sig");
+        crate::artifact::sign(
+            &root,
+            &bundle,
+            crate::artifact::Kind::Bundle,
+            &key,
+            &bundle_signature,
+        )?;
+        let baseline = root.join("baseline.json");
+        fs::write(&baseline, successful_promotion_report())?;
+        let baseline_signature = root.join("baseline.sig");
+        crate::artifact::sign(
+            &root,
+            &baseline,
+            crate::artifact::Kind::Baseline,
+            &key,
+            &baseline_signature,
+        )?;
+        let mut trust = crate::artifact::Trust {
+            signature: bundle_signature,
+            allowed_signers: allowed.clone(),
+            revoked_keys: Some(revoked.clone()),
+            identity: "reviewer".into(),
+        };
+        let authenticated =
+            crate::artifact::snapshot(&bundle, crate::artifact::Kind::Bundle, &trust)?;
+        trust.signature = baseline_signature;
+        let (_, verified) = baseline_input(&baseline, Some(&trust))?;
+        validate_trust_consistency(Some(&authenticated.verified), verified.as_ref())?;
+        for (path, replacement) in [
+            (&allowed, format!("{allowed_bytes}# New trust snapshot\n")),
+            (&revoked, "# New revocation snapshot\n".into()),
+        ] {
+            fs::write(path, replacement)?;
+            let (_, verified) = baseline_input(&baseline, Some(&trust))?;
+            assert!(
+                validate_trust_consistency(Some(&authenticated.verified), verified.as_ref())
+                    .is_err()
+            );
+            fs::write(&allowed, &allowed_bytes)?;
+            fs::write(&revoked, b"")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod release_policy_tests {
+    use super::*;
+
+    fn policy() -> crate::release_policy::Policy {
+        serde_json::from_value(json!({
+            "schema_version": 1,
+            "limits": {"max_unsafe_acceptances": 1, "max_label_mismatches": 2, "max_regressions": 3},
+            "coverage": {"policy_rules": {"security": 2}, "conflict_kinds": {"order": 1}},
+            "signatures": {"require_bundle": false, "require_baseline": false}
+        })).unwrap()
+    }
+
+    #[test]
+    fn policy_rejects_weaker_overrides_and_preserves_stricter_requirements() {
+        let policy = policy();
+        let mut args = ReplayArgs {
+            max_label_mismatches: Some(1),
+            min_policy_rule: vec![
+                release_gate::parse_requirement("security=3").unwrap(),
+                release_gate::parse_requirement("extra=1").unwrap(),
+            ],
+            ..ReplayArgs::default()
+        };
+        release_gate::apply_policy(&mut args, &policy).unwrap();
+        assert!(args.gate);
+        assert_eq!(args.max_unsafe_acceptances, Some(1));
+        assert_eq!(args.max_label_mismatches, Some(1));
+        assert_eq!(args.min_policy_rule.len(), 2);
+        assert_eq!(args.min_conflict_kind.len(), 1);
+        for mut args in [
+            ReplayArgs {
+                max_unsafe_acceptances: Some(2),
+                ..ReplayArgs::default()
+            },
+            ReplayArgs {
+                max_label_mismatches: Some(3),
+                ..ReplayArgs::default()
+            },
+            ReplayArgs {
+                max_regressions: Some(4),
+                ..ReplayArgs::default()
+            },
+            ReplayArgs {
+                min_policy_rule: vec![release_gate::parse_requirement("security=1").unwrap()],
+                ..ReplayArgs::default()
+            },
+            ReplayArgs {
+                min_policy_rule: vec![
+                    release_gate::parse_requirement("security=2").unwrap(),
+                    release_gate::parse_requirement("security=3").unwrap(),
+                ],
+                ..ReplayArgs::default()
+            },
+        ] {
+            assert!(release_gate::apply_policy(&mut args, &policy).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_requires_selected_artifacts_and_exact_verified_trust() {
+        let mut policy = policy();
+        policy.signatures.require_bundle = true;
+        policy.signatures.signer = Some("reviewer".into());
+        policy.signatures.allowed_signers_sha256 = Some("a".repeat(64));
+        policy.signatures.revoked_keys_sha256 = Some("b".repeat(64));
+        policy.baseline_sha256 = Some("c".repeat(64));
+        let mut args = ReplayArgs::default();
+        assert!(release_gate::apply_policy(&mut args, &policy).is_err());
+        args.bundle = Some("bundle.tar.gz".into());
+        args.baseline = Some("baseline.json".into());
+        args.allowed_signers = Some("allowed-signers".into());
+        args.revoked_keys = Some("revoked-keys".into());
+        release_gate::apply_policy(&mut args, &policy).unwrap();
+        assert!(strict_signatures(&args).is_err());
+        args.bundle_signature = Some("bundle.sig".into());
+        args.baseline_signature = Some("baseline.sig".into());
+        assert!(strict_signatures(&args).unwrap());
+        let mut verified: crate::artifact::Verified = serde_json::from_value(json!({
+            "schema_version": 1, "authorizes_acceptance": false,
+            "kind": "bundle", "sha256": "d".repeat(64), "identity": "reviewer",
+            "allowed_signers_sha256": "a".repeat(64),
+            "signer_fingerprint": "SHA256:verified",
+            "revoked_keys_sha256": "b".repeat(64), "namespace": "patchgate-bundle-v1"
+        }))
+        .unwrap();
+        validate_policy_artifact(&policy, &verified).unwrap();
+        verified.allowed_signers_sha256 = "e".repeat(64);
+        assert!(validate_policy_artifact(&policy, &verified).is_err());
+        verified.allowed_signers_sha256 = "a".repeat(64);
+        verified.revoked_keys_sha256 = None;
+        assert!(validate_policy_artifact(&policy, &verified).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let baseline = directory.path().join("baseline.json");
+        fs::write(&baseline, b"{}").unwrap();
+        assert!(baseline_input_pinned(&baseline, None, Some(&policy)).is_err());
+    }
+
+    #[test]
+    fn promotion_recomputes_rows_bounds_and_gate_claims() {
+        let bytes = successful_promotion_report();
+        validate_promotion_report(&bytes).unwrap();
+        let original: Value = serde_json::from_slice(&bytes).unwrap();
+        let mut allowed = original.clone();
+        allowed["comparisons"][0]["actual"] = json!("accept");
+        allowed["comparisons"][0]["evidence"]["records"][0]["decision"] = json!("accept");
+        allowed["comparisons"][0]["unsafe_acceptance"] = json!(true);
+        allowed["comparisons"][0]["correct"] = json!(false);
+        allowed["gate"]["limits"]["unsafe_acceptances"] = json!(1);
+        allowed["gate"]["limits"]["label_mismatches"] = json!(1);
+        allowed["gate"]["observed"]["unsafe_acceptances"] = json!(1);
+        allowed["gate"]["observed"]["label_mismatches"] = json!(1);
+        allowed["summaries"][0]["unsafe_acceptances"] = json!(1);
+        allowed["summaries"][0]["label_mismatches"] = json!(1);
+        validate_promotion_report(&serde_json::to_vec(&allowed).unwrap()).unwrap();
+        for (pointer, value) in [
+            ("/comparisons", json!([])),
+            ("/comparisons/0/exit_code", json!(1)),
+            ("/comparisons/0/configuration/max_change_chars", json!(1)),
+            ("/comparisons/0/elapsed_seconds", json!(-1)),
+            ("/gate/observed/unsafe_acceptances", json!(99)),
+            ("/gate/limits/regressions", json!(-1)),
+            ("/gate/passed", json!(false)),
+            ("/gate", Value::Null),
+            ("/summaries/0/comparisons", json!(99)),
+        ] {
+            let mut report = original.clone();
+            *report.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                validate_promotion_report(&serde_json::to_vec(&report).unwrap()).is_err(),
+                "{pointer}"
+            );
+        }
+        allowed["gate"]["limits"]["unsafe_acceptances"] = json!(0);
+        assert!(validate_promotion_report(&serde_json::to_vec(&allowed).unwrap()).is_err());
+    }
+
+    #[test]
+    fn promotion_rejects_contradictory_current_and_baseline_review_evidence() {
+        let mut original: Value = serde_json::from_slice(&successful_promotion_report()).unwrap();
+        original["gate"]["baseline"] = json!({
+            "schema_version": 1, "repository": original["repository"],
+            "main": original["main"], "inbox": original["inbox"],
+            "variants": original["variants"], "comparisons": original["comparisons"],
+            "authorizes_acceptance": false,
+        });
+        validate_promotion_report(&serde_json::to_vec(&original).unwrap()).unwrap();
+        for rows in ["/comparisons", "/gate/baseline/comparisons"] {
+            for (field, value) in [
+                ("decision", json!("accept")),
+                ("execution_error", json!("The candidate review failed.")),
+                ("by", json!("human")),
+            ] {
+                let mut report = original.clone();
+                report.pointer_mut(rows).unwrap()[0]["evidence"]["records"][0][field] = value;
+                assert!(validate_promotion_report(&serde_json::to_vec(&report).unwrap()).is_err());
+            }
+            for field in ["dry_run", "authorizes_acceptance"] {
+                let mut report = original.clone();
+                report.pointer_mut(rows).unwrap()[0]["evidence"][field] =
+                    json!(field == "authorizes_acceptance");
+                assert!(validate_promotion_report(&serde_json::to_vec(&report).unwrap()).is_err());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod caller_policy_tests {
+    use super::*;
+
+    #[test]
+    fn caller_main_policy_cannot_be_omitted_or_replaced_by_working_policy() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("repo");
+        let cwd = root.join("nested");
+        fs::create_dir_all(&cwd)?;
+        let pijul = crate::pijul::Pijul::new(root.clone());
+        pijul.run(["init"])?;
+        fs::write(root.join("base.txt"), "base\n")?;
+        pijul.run(["add", "base.txt"])?;
+        let signer = crate::pijul::Signer::new(root.join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        let record = |message: &str| -> Result<()> {
+            pijul.call_with_env(
+                ["record", "-a", "-m", message, "--author", "patchgate"],
+                &environment.vars,
+            )?;
+            Ok(())
+        };
+        record("Record the base")?;
+        let path = root.join(crate::release_policy::PATH);
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "limits": {"max_unsafe_acceptances": 0, "max_label_mismatches": 2, "max_regressions": 0},
+                "coverage": {"policy_rules": {}, "conflict_kinds": {}},
+                "signatures": {"require_bundle": false, "require_baseline": false}
+            }))?,
+        )?;
+        assert!(caller_release_policy(&cwd)?.policy.is_none());
+        let explicit = ReplayArgs {
+            release_repo: Some(root.clone()),
+            ..ReplayArgs::default()
+        };
+        assert!(load_release_policy(&explicit).is_err());
+        pijul.run(["add", crate::release_policy::PATH])?;
+        record("Record release requirements")?;
+        fs::write(&path, "unrecorded invalid policy")?;
+        let loaded = caller_release_policy(&cwd)?;
+        let mut args = ReplayArgs::default();
+        release_gate::apply_policy(&mut args, loaded.policy.as_ref().unwrap())?;
+        assert!(args.gate);
+        assert_eq!(args.max_label_mismatches, Some(2));
+        assert_eq!(fs::read_to_string(&path)?, "unrecorded invalid policy");
+        record("Record invalid release requirements")?;
+        assert!(caller_release_policy(&cwd).is_err());
+        assert!(load_release_policy(&explicit).is_err());
         Ok(())
     }
 }

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{
@@ -33,6 +33,8 @@ pub struct Settings {
     pub model: String,
     pub model_api: Api,
     pub model_revision: Option<String>,
+    pub model_profile: Option<String>,
+    pub model_key_file: Option<PathBuf>,
     pub policy: String,
     protected: Vec<String>,
     max_change_chars: usize,
@@ -50,23 +52,17 @@ impl Settings {
     ) -> Result<Self> {
         let timeout: f64 = number("PATCHGATE_TIMEOUT", 300.0)?;
         let check_timeout: f64 = number("PATCHGATE_CHECK_TIMEOUT", 900.0)?;
-        let model_revision = match env::var("PATCHGATE_MODEL_REVISION") {
-            Ok(value) if value.trim().is_empty() => None,
-            Ok(value) => Some(value),
-            Err(env::VarError::NotPresent) => None,
-            Err(_) => bail!("The declared model revision is not valid UTF-8"),
-        };
+        let model = crate::models::select()?;
         Ok(Self {
             repo,
             inbox,
             main,
-            model_url: env::var("PATCHGATE_MODEL_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into()),
-            model: env::var("PATCHGATE_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".into()),
-            model_api: env::var("PATCHGATE_MODEL_API")
-                .unwrap_or_else(|_| "openai".into())
-                .parse()?,
-            model_revision,
+            model_url: model.url,
+            model: model.model,
+            model_api: model.api,
+            model_revision: model.revision,
+            model_profile: model.profile,
+            model_key_file: model.key_file,
             policy: env::var("PATCHGATE_POLICY").unwrap_or_else(|_| "POLICY.md".into()),
             protected: env::var("PATCHGATE_PROTECTED")
                 .unwrap_or_default()
@@ -84,10 +80,20 @@ impl Settings {
         })
     }
 
+    /// Read the bearer key for the selected profile. The key never reaches a
+    /// record, a report, or an error message.
+    pub(crate) fn model_key(&self) -> Result<Option<String>> {
+        self.model_key_file
+            .as_deref()
+            .map(crate::models::read_key)
+            .transpose()
+    }
+
     pub(crate) fn baseline_values(&self) -> crate::configuration::Values {
         crate::configuration::Values {
             policy_path: self.policy.clone(),
             protected: self.protected.clone(),
+            documentation_paths: Vec::new(),
             max_change_chars: self.max_change_chars,
             timeout_seconds: self.timeout.as_secs_f64(),
             check_timeout_seconds: self.check_timeout.as_secs_f64(),
@@ -233,6 +239,8 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<ResolutionAcceptance>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     conflict: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     merge: Option<String>,
@@ -263,6 +271,7 @@ impl Record {
             case_id: None,
             reconsideration: None,
             resolution: None,
+            reused: false,
             conflict: false,
             merge: None,
             for_hashes: Vec::new(),
@@ -286,6 +295,7 @@ impl Record {
         self.model = None;
         self.review = None;
         self.user = None;
+        self.reused = false;
         self.findings = findings;
     }
 }
@@ -472,6 +482,21 @@ impl std::fmt::Display for SecretViolation {
 
 impl std::error::Error for SecretViolation {}
 
+#[derive(Debug)]
+struct StaleMain(String);
+
+impl std::fmt::Display for StaleMain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StaleMain {}
+
+fn stale(message: String) -> anyhow::Error {
+    anyhow::Error::new(StaleMain(message))
+}
+
 #[derive(Deserialize, Serialize)]
 struct Acceptance {
     version: u32,
@@ -541,6 +566,7 @@ impl Ledger {
             &self.directory.join("lock"),
             &self.intent_path(),
             &self.directory.join("acceptance.tmp"),
+            &self.directory.join("verification"),
         ] {
             crate::pijul::safe_path(&self.repo, path.strip_prefix(&self.repo)?)?;
         }
@@ -599,6 +625,15 @@ impl Ledger {
 
     fn intent_path(&self) -> PathBuf {
         self.directory.join("acceptance.json")
+    }
+
+    fn verification_directory(&self) -> Result<PathBuf> {
+        self.validate()?;
+        let directory =
+            crate::pijul::safe_path(&self.repo, Path::new(".pijul/patchgate/verification"))?;
+        fs::create_dir_all(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        Ok(directory)
     }
 
     fn pending(&self) -> Result<Option<Acceptance>> {
@@ -746,9 +781,12 @@ pub struct Gate {
     pub settings: Settings,
     pijul: Pijul,
     pub ledger: Ledger,
+    decisions: crate::decision::Cache,
     signer: Signer,
     model: Model,
     protected: RegexSet,
+    documentation: RegexSet,
+    documentation_patterns: Vec<String>,
     policy_path: PathBuf,
     changes: HashMap<String, Rc<str>>,
     baseline: crate::configuration::Values,
@@ -774,6 +812,8 @@ impl Gate {
                 .map(|pattern| crate::protected::pattern_regex(pattern)),
         )?;
         let policy_path = crate::pijul::normalize_path(Path::new(&settings.policy))?;
+        let model_key = settings.model_key()?;
+        let decisions = crate::decision::Cache::new(&settings.repo)?;
         let mut gate = Self {
             pijul: Pijul::new(settings.repo.clone()),
             signer: Signer::new(ledger.directory.clone()),
@@ -783,11 +823,15 @@ impl Gate {
                 settings.timeout,
                 settings.model_api,
                 settings.model_revision.as_deref(),
+                model_key.as_deref(),
             )?,
             protected,
+            documentation: RegexSet::empty(),
+            documentation_patterns: Vec::new(),
             policy_path,
             settings,
             ledger,
+            decisions,
             changes: HashMap::new(),
             baseline,
             configuration,
@@ -831,17 +875,29 @@ impl Gate {
                     .map(|pattern| crate::protected::pattern_regex(pattern)),
             )?;
         }
+        if self.documentation_patterns != values.documentation_paths {
+            self.documentation = RegexSet::new(
+                values
+                    .documentation_paths
+                    .iter()
+                    .map(|pattern| crate::protected::pattern_regex(pattern)),
+            )?;
+            self.documentation_patterns
+                .clone_from(&values.documentation_paths);
+        }
         if self.settings.policy != values.policy_path {
             self.policy_path = crate::pijul::normalize_path(Path::new(&values.policy_path))?;
         }
         let timeout = Duration::try_from_secs_f64(values.timeout_seconds)?;
         if timeout != self.settings.timeout {
+            let model_key = self.settings.model_key()?;
             self.model = Model::new(
                 &self.settings.model_url,
                 &self.settings.model,
                 timeout,
                 self.settings.model_api,
                 self.settings.model_revision.as_deref(),
+                model_key.as_deref(),
             )?;
         }
         self.settings.policy.clone_from(&values.policy_path);
@@ -1027,6 +1083,12 @@ impl Gate {
         }
         original.history()?;
         let isolated = crate::isolation::copy_repository(&settings.repo)?;
+        for entry in fs::read_dir(isolated.pijul.repo.join(".pijul"))? {
+            let entry = entry?;
+            if entry.file_name() != "changes" {
+                crate::resolution::detach_files(&entry.path())?;
+            }
+        }
         if materialize {
             isolated.materialize()?;
         }
@@ -1034,11 +1096,53 @@ impl Gate {
         let mut gate = Self::new(settings)?;
         gate.capture_enabled = false;
         match fs::copy(&original.path, &gate.ledger.path) {
-            Ok(_) => {}
+            Ok(_) => crate::resolution::detach_files(&gate.ledger.path)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
         Ok((isolated, gate))
+    }
+
+    pub fn verify_resolution(
+        settings: Settings,
+        workspace: &Path,
+    ) -> Result<crate::resolution::VerificationReport> {
+        (|| -> Result<_> {
+            let prepared = crate::resolution::load(&settings.repo, workspace)?;
+            let (isolated, mut gate) = Self::isolated(settings, false)?;
+            crate::resolution::detach_files(&isolated.pijul.repo.join(".pijul"))?;
+            gate.accept_prepared_resolution(prepared.clone(), Some("Verify the human workspace"), true)?;
+            let records: Vec<_> = gate
+                .ledger
+                .history()?
+                .into_iter()
+                .filter(|record| {
+                    record.resolution.as_ref().is_some_and(|resolution| resolution.id == prepared.id)
+                        && record.decision == "accept"
+                })
+                .collect();
+            if records.is_empty() {
+                bail!("The private validation audit is absent.");
+            }
+            Ok(crate::resolution::VerificationReport {
+                schema_version: 1,
+                authorizes_acceptance: false,
+                prepared,
+                validated_hashes: records.iter().map(|record| record.hash.clone()).collect(),
+                validation: crate::resolution::ValidationEvidence {
+                    source_authority: true,
+                    current_bindings: true,
+                    permitted_dependencies: true,
+                    native_expected_state: true,
+                    credential_scan: true,
+                    conflicts_absent: true,
+                },
+                verification: records.iter().find_map(|record| record.verification.clone()),
+            })
+        })()
+        .map_err(|_| anyhow!(
+            "Workspace verification failed. Check source authority, current bindings, dependencies, native configuration, credentials, conflicts, and trusted Nix checks."
+        ))
     }
 
     fn case_snapshot(
@@ -1231,8 +1335,7 @@ impl Gate {
         if reason.trim().is_empty() {
             bail!("Give an explicit reason for reconsideration.");
         }
-        let _lock = self.ledger.lock()?;
-        self.recover()?;
+        self.recover_under_lock()?;
         let main = self.pijul.snapshot(&self.settings.main)?;
         self.refresh_configuration(&main)?;
         let inbox = self.pijul.snapshot(&self.settings.inbox)?;
@@ -1513,13 +1616,13 @@ impl Gate {
         let file = Path::new(path);
         file == self.policy_path
             || file == Path::new(crate::configuration::PATH)
+            || file == Path::new(crate::release_policy::PATH)
             || file.starts_with(verify::DIRECTORY)
             || self.protected.is_match(path)
     }
 
     pub fn review_report(&mut self, dry_run: bool, selection: &Selection) -> Result<ReviewReport> {
-        let _lock = self.ledger.lock()?;
-        self.recover()?;
+        self.recover_under_lock()?;
         let main = self.pijul.snapshot(&self.settings.main)?;
         self.refresh_configuration(&main)?;
         let inbox = self.pijul.snapshot(&self.settings.inbox)?;
@@ -1565,8 +1668,7 @@ impl Gate {
         selection: &Selection,
         report: impl FnMut(&Item),
     ) -> Result<(Vec<Item>, Option<SelectionReport>)> {
-        let _lock = self.ledger.lock()?;
-        self.recover()?;
+        self.recover_under_lock()?;
         self.walk(true, selection, report)
     }
 
@@ -1576,8 +1678,7 @@ impl Gate {
         decision: &str,
         reason: Option<&str>,
     ) -> Result<Item> {
-        let _lock = self.ledger.lock()?;
-        self.recover()?;
+        self.recover_under_lock()?;
         let main = self.pijul.snapshot(&self.settings.main)?;
         self.refresh_configuration(&main)?;
         let inbox = self.pijul.log(&self.settings.inbox)?;
@@ -1655,8 +1756,7 @@ impl Gate {
             record
         };
         if decision != "accept" {
-            self.ledger.history()?;
-            self.ledger.append(&record(&item.hash))?;
+            self.append_under_lock(&record(&item.hash))?;
             item.state = State::from_decision(decision);
             return Ok(item);
         }
@@ -1674,7 +1774,7 @@ impl Gate {
                     .requests
                     .extend(merge_requests);
                 refusal.reject_secrets(findings);
-                self.ledger.append(&refusal)?;
+                self.append_under_lock(&refusal)?;
                 bail!("{}", refusal.reason);
             }
             Err(error) => {
@@ -1699,11 +1799,17 @@ impl Gate {
     }
 
     pub fn accept_resolution(&mut self, workspace: &Path, reason: Option<&str>) -> Result<Item> {
-        let _lock = self.ledger.lock()?;
-        self.recover()?;
+        self.recover_under_lock()?;
+        let prepared = crate::resolution::load(&self.settings.repo, workspace)?;
+        self.accept_prepared_resolution(prepared, reason, false)
+    }
+
+    fn resolution_plan(
+        &mut self,
+        prepared: &crate::resolution::Prepared,
+    ) -> Result<(ChannelSnapshot, Item)> {
         let main = self.pijul.snapshot(&self.settings.main)?;
         self.refresh_configuration(&main)?;
-        let prepared = crate::resolution::load(&self.settings.repo, workspace)?;
         if prepared.main != self.settings.main
             || prepared.inbox != self.settings.inbox
             || prepared.binding.main.state != main.state
@@ -1717,11 +1823,24 @@ impl Gate {
         if prepared.configuration != *self.configuration {
             bail!("Effective review settings changed after preparation. Prepare a new workspace.");
         }
+        let policy = self
+            .pijul
+            .read_file(&self.settings.main, &self.settings.policy)?;
+        let binding = ReviewBinding::new(
+            &prepared.candidates,
+            &self.settings.policy,
+            policy.as_deref(),
+            &self.settings.main,
+            &main,
+        );
+        if serde_json::to_value(&binding)? != serde_json::to_value(&prepared.binding)? {
+            bail!("The trusted policy or review binding changed after preparation.");
+        }
         let primary = prepared
             .candidates
             .last()
             .context("The resolution has no candidate")?;
-        let mut item = Item::from(self.find_entry(primary, false)?);
+        let item = Item::from(self.find_entry(primary, false)?);
         let inbox = self.pijul.log(&self.settings.inbox)?;
         if self.with_conflicting_dependencies(primary, &main.hashes, &inbox)? != prepared.candidates
         {
@@ -1729,13 +1848,37 @@ impl Gate {
                 "The permitted candidate set changed after preparation. Prepare a new workspace."
             );
         }
+        self.require_current_main(&main)?;
+        Ok((main, item))
+    }
+
+    fn accept_prepared_resolution(
+        &mut self,
+        prepared: crate::resolution::Prepared,
+        reason: Option<&str>,
+        verification_only: bool,
+    ) -> Result<Item> {
+        let (main, mut item) = self.resolution_plan(&prepared)?;
+        let primary = prepared
+            .candidates
+            .last()
+            .context("The resolution has no candidate")?;
         let user = env::var("USER").unwrap_or_else(|_| "a human".into());
         let reason = reason
             .filter(|reason| !reason.trim().is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{user} accepted the prepared human resolution."));
         self.require_current_main(&main)?;
-        let completed = crate::resolution::record(&prepared, &self.signer, &reason)?;
+        let private = if verification_only {
+            Some(crate::resolution::copy_workspace(&prepared)?)
+        } else {
+            None
+        };
+        let completed = if let Some(private) = &private {
+            crate::resolution::record_private(&prepared, &private.pijul, &self.signer, &reason)?
+        } else {
+            crate::resolution::record(&prepared, &self.signer, &reason)?
+        };
         self.require_current_main(&main)?;
         let entries: HashMap<_, _> = completed
             .pijul
@@ -1792,7 +1935,7 @@ impl Gate {
                 .cloned()
                 .context("The resolution audit lacks its candidate")?;
             refusal.reject_secrets(findings);
-            self.ledger.append(&refusal)?;
+            self.append_under_lock(&refusal)?;
             bail!("{}", refusal.reason);
         }
         for hash in &completed.hashes {
@@ -1830,7 +1973,7 @@ impl Gate {
                     .cloned()
                     .context("The resolution audit lacks its candidate")?;
                 refusal.reject_secrets(findings);
-                self.ledger.append(&refusal)?;
+                self.append_under_lock(&refusal)?;
                 bail!("{}", refusal.reason);
             }
             result => result?,
@@ -2021,6 +2164,7 @@ impl Gate {
         };
         let mut states = HashMap::new();
         let mut items = Vec::new();
+        let mut chunk: Vec<(Item, Rc<str>)> = Vec::new();
         for (index, entry) in inbox.into_iter().enumerate() {
             if main.contains(&entry.hash) {
                 continue;
@@ -2037,6 +2181,13 @@ impl Gate {
                     item.paths.clear();
                 }
             } else {
+                if !chunk.is_empty() {
+                    self.land_chunk(&mut chunk, &mut main, &mut report)?;
+                    for (item, _) in chunk.drain(..) {
+                        states.insert(item.hash.clone(), item.state);
+                        items.push(item);
+                    }
+                }
                 let text = self.change_text(&item.hash)?;
                 item.needs = change::dependencies(&text)
                     .into_iter()
@@ -2060,8 +2211,9 @@ impl Gate {
                         };
                     }
                 } else if decide && selected {
-                    self.decide_and_land(&mut item, &text, &mut main, None)?;
-                    report(&item);
+                    // A contiguous ready set lands under one conditional transaction.
+                    chunk.push((item, Rc::clone(&text)));
+                    continue;
                 }
             }
             states.insert(item.hash.clone(), item.state);
@@ -2069,72 +2221,148 @@ impl Gate {
                 items.push(item);
             }
         }
+        if !chunk.is_empty() {
+            self.land_chunk(&mut chunk, &mut main, &mut report)?;
+            for (item, _) in chunk.drain(..) {
+                states.insert(item.hash.clone(), item.state);
+                items.push(item);
+            }
+        }
         Ok((items, plan.map(|plan| plan.report)))
     }
 
-    fn decide_and_land(
+    /// Decide each ready change against one snapshot, then land the accepted set once.
+    fn land_chunk(
+        &mut self,
+        chunk: &mut [(Item, Rc<str>)],
+        main: &mut HashSet<String>,
+        report: &mut impl FnMut(&Item),
+    ) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let reviewed = self.pijul.snapshot(&self.settings.main)?;
+        *main = reviewed.hashes.clone();
+        self.refresh_configuration(&reviewed)?;
+        let mut decided = Vec::with_capacity(chunk.len());
+        for (item, text) in chunk.iter_mut() {
+            decided.push(self.decide_ready(item, text, &reviewed, None)?);
+        }
+        let accepted: Vec<usize> = decided
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.decision == "accept")
+            .map(|(index, _)| index)
+            .collect();
+        if accepted.is_empty() {
+            for record in &decided {
+                self.append_under_lock(record)?;
+            }
+            for ((item, _), record) in chunk.iter_mut().zip(&decided) {
+                self.apply_decision(item, record);
+                report(item);
+            }
+            return Ok(());
+        }
+        let hashes: Vec<String> = accepted
+            .iter()
+            .map(|&index| chunk[index].0.hash.clone())
+            .collect();
+        let records: Vec<Record> = accepted
+            .iter()
+            .map(|&index| decided[index].clone())
+            .collect();
+        let mut requests = Vec::new();
+        match self.land(&hashes, &reviewed, &records, None, &mut requests) {
+            Ok(Landing {
+                main: after,
+                extra,
+                merge,
+                note,
+            }) => {
+                *main = after;
+                for record in &decided {
+                    if record.decision != "accept" {
+                        self.append_under_lock(record)?;
+                    }
+                }
+                for ((item, _), record) in chunk.iter_mut().zip(&decided) {
+                    if record.decision == "accept" {
+                        item.state = State::Accepted;
+                        item.merge.clone_from(&merge);
+                        item.note.clone_from(&note);
+                        item.decided = true;
+                    } else {
+                        self.apply_decision(item, record);
+                    }
+                    report(item);
+                }
+                self.check_extra(&extra)
+            }
+            Err(error) if error.is::<SecretViolation>() || error.is::<Unmerged>() => {
+                // The set refused as a whole. Decide each accepted change alone.
+                for (index, record) in decided.iter().enumerate() {
+                    if record.decision != "accept" {
+                        self.append_under_lock(record)?;
+                    } else {
+                        self.land_one(&mut chunk[index].0, record.clone(), &reviewed, main)?;
+                    }
+                }
+                for (item, _) in chunk.iter_mut() {
+                    report(item);
+                }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Land one decided change and record the result of a refusal or a conflict.
+    fn land_one(
         &mut self,
         item: &mut Item,
-        text: &str,
+        mut record: Record,
+        reviewed: &ChannelSnapshot,
         main: &mut HashSet<String>,
-        reconsideration: Option<Reconsideration>,
     ) -> Result<()> {
-        let reviewed = self.pijul.snapshot(&self.settings.main)?;
-        if reviewed.hashes != *main {
-            bail!(
-                "Channel {} changed during review. Run patchgate review again before another decision.",
-                self.settings.main
-            );
-        }
-        self.refresh_configuration(&reviewed)?;
-        let case_id = self.capture_record_case(&item.hash, &reviewed)?;
-        let mut record = self.decide(item, text, &reviewed)?;
-        if reconsideration.is_some() && record.execution_error.is_some() {
-            return Err(InvalidModelReply.into());
-        }
-        record.case_id = case_id;
-        record.reconsideration = reconsideration;
-        self.require_current_main(&reviewed)?;
-        let mut extra = BTreeSet::new();
         let mut merge_requests = Vec::new();
-        if record.decision == "accept" {
-            match self.land(
-                std::slice::from_ref(&item.hash),
-                &reviewed,
-                std::slice::from_ref(&record),
-                None,
-                &mut merge_requests,
-            ) {
-                Err(error) if error.is::<SecretViolation>() => {
-                    let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
-                    record.reject_secrets(findings);
+        match self.land(
+            std::slice::from_ref(&item.hash),
+            reviewed,
+            std::slice::from_ref(&record),
+            None,
+            &mut merge_requests,
+        ) {
+            Err(error) if error.is::<SecretViolation>() => {
+                let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
+                record.reject_secrets(findings);
+            }
+            Err(error) => {
+                let invalid_reply = error.is::<InvalidModelReply>();
+                let problem = error.downcast::<Unmerged>()?;
+                record.decision = "escalate".into();
+                record.by = "gate".into();
+                if invalid_reply {
+                    record.execution_error = Some("invalid-model-reply".into());
                 }
-                Err(error) => {
-                    let invalid_reply = error.is::<InvalidModelReply>();
-                    let problem = error.downcast::<Unmerged>()?;
-                    record.decision = "escalate".into();
-                    record.by = "gate".into();
-                    if invalid_reply {
-                        record.execution_error = Some("invalid-model-reply".into());
-                    }
-                    record.conflict = true;
-                    record.reason = format!(
-                        "The change conflicts with {}, and patchgate did not merge it. {problem} To merge it by hand, edit the conflict in {}, record the result, and run: patchgate accept <hash of the result>",
-                        self.settings.main, self.settings.inbox
-                    );
-                }
-                Ok(Landing {
-                    main: after,
-                    extra: unexpected,
-                    merge,
-                    note,
-                }) => {
-                    *main = after;
-                    extra = unexpected;
-                    record.merge = merge.as_ref().map(|merge| merge.hash.clone());
-                    item.merge = merge;
-                    item.note = note;
-                }
+                record.conflict = true;
+                record.reason = format!(
+                    "The change conflicts with {}, and patchgate did not merge it. {problem} To merge it by hand, edit the conflict in {}, record the result, and run: patchgate accept <hash of the result>",
+                    self.settings.main, self.settings.inbox
+                );
+            }
+            Ok(Landing {
+                main: after,
+                extra,
+                merge,
+                note,
+            }) => {
+                *main = after;
+                item.state = State::Accepted;
+                item.merge = merge;
+                item.note = note;
+                item.decided = true;
+                return self.check_extra(&extra);
             }
         }
         if !merge_requests.is_empty() {
@@ -2145,24 +2373,56 @@ impl Gate {
                 .requests
                 .extend(merge_requests);
         }
-        if record.reconsideration.is_some() && record.execution_error.is_some() {
-            return Err(InvalidModelReply.into());
-        }
-        if record.decision != "accept" {
-            self.ledger.append(&record)?;
-        }
-        item.state = if record.decision == "accept" {
-            State::Accepted
-        } else {
-            State::from_decision(&record.decision)
-        };
+        self.append_under_lock(&record)?;
+        self.apply_decision(item, &record);
+        Ok(())
+    }
+
+    fn apply_decision(&self, item: &mut Item, record: &Record) {
+        item.state = State::from_decision(&record.decision);
         if !record.findings.is_empty() {
             item.paths.clear();
         }
-        item.message = record.message;
-        item.reason = record.reason;
+        item.message.clone_from(&record.message);
+        item.reason.clone_from(&record.reason);
         item.decided = true;
-        self.check_extra(&extra)
+    }
+
+    fn decide_ready(
+        &mut self,
+        item: &mut Item,
+        text: &str,
+        reviewed: &ChannelSnapshot,
+        reconsideration: Option<Reconsideration>,
+    ) -> Result<Record> {
+        let case_id = self.capture_record_case(&item.hash, reviewed)?;
+        let mut record = self.decide(item, text, reviewed)?;
+        if reconsideration.is_some() && record.execution_error.is_some() {
+            return Err(InvalidModelReply.into());
+        }
+        record.case_id = case_id;
+        record.reconsideration = reconsideration;
+        self.require_current_main(reviewed)?;
+        Ok(record)
+    }
+
+    fn decide_and_land(
+        &mut self,
+        item: &mut Item,
+        text: &str,
+        main: &mut HashSet<String>,
+        reconsideration: Option<Reconsideration>,
+    ) -> Result<()> {
+        let reviewed = self.pijul.snapshot(&self.settings.main)?;
+        *main = reviewed.hashes.clone();
+        self.refresh_configuration(&reviewed)?;
+        let record = self.decide_ready(item, text, &reviewed, reconsideration)?;
+        if record.decision != "accept" {
+            self.append_under_lock(&record)?;
+            self.apply_decision(item, &record);
+            return Ok(());
+        }
+        self.land_one(item, record, &reviewed, main)
     }
 
     fn decide(&mut self, item: &Item, text: &str, main: &ChannelSnapshot) -> Result<Record> {
@@ -2234,6 +2494,36 @@ impl Gate {
             record.reject_secrets(findings);
             return Ok(record);
         }
+        let reviewed: BTreeSet<String> = candidate
+            .context
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .chain(
+                candidate
+                    .metadata_context
+                    .iter()
+                    .map(|entry| entry.path.as_str()),
+            )
+            .filter_map(|path| {
+                crate::pijul::normalize_path(Path::new(path))
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect();
+        if !reviewed.is_empty()
+            && reviewed
+                .iter()
+                .all(|path| self.documentation.is_match(path))
+        {
+            record.decision = "accept".into();
+            record.by = "gate".into();
+            record.reason = format!(
+                "The change touches only documentation paths ({}). Deterministic secret checks and the trusted Nix checks apply, and the model does not review it.",
+                reviewed.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+            return Ok(record);
+        }
         let binding = ReviewBinding::new(
             std::slice::from_ref(&item.hash),
             &self.settings.policy,
@@ -2251,7 +2541,24 @@ impl Gate {
             return Ok(record);
         }
         self.require_current_main(main)?;
+        if let Some(cached) = self.cached_verdict(&binding, &item.hash)? {
+            record.decision = cached.decision;
+            record.summary = cached.summary;
+            record.reason = cached.reason;
+            record.by = "model".into();
+            record.model = Some(cached.model);
+            record.review = Some(binding);
+            record.reused = true;
+            record
+                .provenance
+                .as_mut()
+                .context("Decision provenance is absent")?
+                .requests
+                .push(cached.request);
+            return Ok(record);
+        }
         let response = self.model.review(&policy, &input)?;
+        let evidence = response.evidence.clone();
         record
             .provenance
             .as_mut()
@@ -2261,6 +2568,10 @@ impl Gate {
         record.model = Some(self.settings.model.clone());
         match response.value {
             Some(verdict) => {
+                if let Err(error) = self.remember_verdict(&binding, &item.hash, &verdict, evidence)
+                {
+                    eprintln!("patchgate: the decision cache did not record this verdict: {error}");
+                }
                 record.decision = verdict.decision;
                 record.summary = verdict.summary;
                 record.reason = verdict.reason;
@@ -2276,6 +2587,71 @@ impl Gate {
             }
         }
         Ok(record)
+    }
+
+    fn cached_verdict(
+        &self,
+        binding: &ReviewBinding,
+        candidate: &str,
+    ) -> Result<Option<crate::decision::Entry>> {
+        let key = crate::decision::key(
+            binding,
+            candidate,
+            &self.settings.model,
+            self.settings.model_api.as_str(),
+            self.settings.model_revision.as_deref(),
+        )?;
+        self.decisions.load(
+            &key,
+            binding,
+            candidate,
+            &self.settings.model,
+            self.settings.model_api.as_str(),
+            self.settings.model_revision.as_deref(),
+        )
+    }
+
+    fn remember_verdict(
+        &self,
+        binding: &ReviewBinding,
+        candidate: &str,
+        verdict: &crate::model::Verdict,
+        request: crate::provenance::RequestEvidence,
+    ) -> Result<()> {
+        let key = crate::decision::key(
+            binding,
+            candidate,
+            &self.settings.model,
+            self.settings.model_api.as_str(),
+            self.settings.model_revision.as_deref(),
+        )?;
+        let entry = crate::decision::Entry {
+            schema_version: 1,
+            key,
+            candidate: candidate.into(),
+            policy_path: binding.policy.as_ref().map(|policy| policy.path.clone()),
+            policy_sha256: binding.policy.as_ref().map(|policy| policy.sha256.clone()),
+            main_channel: binding.main.channel.clone(),
+            main_state: binding.main.state.clone(),
+            model: self.settings.model.clone(),
+            api: self.settings.model_api.as_str().into(),
+            revision: self.settings.model_revision.clone(),
+            decision: verdict.decision.clone(),
+            summary: verdict.summary.clone(),
+            reason: verdict.reason.clone(),
+            request,
+        };
+        self.decisions.store(&entry)
+    }
+
+    fn append_under_lock(&self, record: &Record) -> Result<()> {
+        let _lock = self.ledger.lock()?;
+        self.ledger.append(record)
+    }
+
+    fn recover_under_lock(&self) -> Result<()> {
+        let _lock = self.ledger.lock()?;
+        self.recover()
     }
 
     fn land(
@@ -2327,9 +2703,9 @@ impl Gate {
         ])?;
         let scratch = Pijul::new(path);
         if scratch.snapshot(&self.settings.main)? != *main {
-            bail!(
-                "The main channel changed before candidate verification. Run patchgate review again."
-            );
+            return Err(stale(
+                "The main channel changed before candidate verification. Run patchgate review again.".into(),
+            ));
         }
         let checks = verify::Plan::load(&scratch, &self.settings.main)?;
         let mut reported = Vec::new();
@@ -2408,6 +2784,7 @@ impl Gate {
         }
         if let Some(checks) = checks {
             self.require_current_main(main)?;
+            let cache = self.ledger.verification_directory()?;
             let verification = Rc::new(checks.run(
                 &source,
                 hashes,
@@ -2418,6 +2795,7 @@ impl Gate {
                 },
                 self.settings.check_timeout,
                 &self.settings.interrupted,
+                Some(&cache),
             )?);
             for record in &mut audit {
                 record.verification = Some(Rc::clone(&verification));
@@ -2429,6 +2807,7 @@ impl Gate {
                     .nix = verification.observed_nix_version().map(str::to_owned);
             }
         }
+        let _journal = self.ledger.lock()?;
         self.pijul
             .check_paths(&paths)
             .map_err(|error| Unmerged(error.to_string()))?;
@@ -2444,10 +2823,10 @@ impl Gate {
             .apply_if_current(&self.settings.main, main.state.as_deref(), &args)?
         {
             self.ledger.finish()?;
-            bail!(
+            return Err(stale(format!(
                 "Channel {} changed before application. Run patchgate review again.",
                 self.settings.main
-            );
+            )));
         }
         let after = self.pijul.hashes(&self.settings.main)?;
         let mut missing: Vec<_> = expected
@@ -2492,10 +2871,10 @@ impl Gate {
 
     fn require_current_main(&self, expected: &ChannelSnapshot) -> Result<()> {
         if self.pijul.snapshot(&self.settings.main)? != *expected {
-            bail!(
+            return Err(stale(format!(
                 "Channel {} changed during review. Run patchgate review again before another decision.",
                 self.settings.main
-            );
+            )));
         }
         Ok(())
     }
@@ -3160,6 +3539,8 @@ mod feature_tests {
             model: "feature-test".into(),
             model_api: Api::OpenAi,
             model_revision: None,
+            model_profile: None,
+            model_key_file: None,
             policy: "POLICY.md".into(),
             protected: Vec::new(),
             max_change_chars: 100_000,
@@ -3511,6 +3892,122 @@ mod feature_tests {
     }
 
     #[test]
+    fn workspace_verification_preserves_source_workspace_and_later_live_guards() -> Result<()> {
+        let (directory, settings, candidate) = pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let prepared = Gate::prepare_resolution(
+            settings.clone(),
+            &candidate,
+            &fs::canonicalize(directory.path())?.join("workspace"),
+        )?;
+        fs::write(prepared.workspace.join("value.txt"), "pending human work\n")?;
+        fs::write(
+            prepared.workspace.join("untracked.txt"),
+            "untracked human work\n",
+        )?;
+        fs::write(settings.repo.join("value.txt"), "dirty source bytes\n")?;
+        let source = source_bytes(&settings.repo)?;
+        let workspace = source_bytes(&prepared.workspace)?;
+        let report = Gate::verify_resolution(settings.clone(), &prepared.workspace)?;
+        assert_eq!(report.schema_version, 1);
+        assert!(!report.authorizes_acceptance);
+        assert_eq!(report.prepared.id, prepared.id);
+        assert!(report.validated_hashes.contains(&candidate));
+        assert!(report.validation.native_expected_state);
+        assert!(report.verification.is_none());
+        assert_eq!(source_bytes(&settings.repo)?, source);
+        assert_eq!(source_bytes(&prepared.workspace)?, workspace);
+        let credential = ["ghp_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+        fs::write(prepared.workspace.join("first\nsecond"), &credential)?;
+        Pijul::new(prepared.workspace.clone()).run(["add", "first\nsecond"])?;
+        let changed = source_bytes(&prepared.workspace)?;
+        let error = Gate::verify_resolution(settings.clone(), &prepared.workspace)
+            .err()
+            .context("The credential did not stop private verification")?;
+        assert!(!format!("{error:#}").contains(&credential));
+        assert_eq!(source_bytes(&settings.repo)?, source);
+        assert_eq!(source_bytes(&prepared.workspace)?, changed);
+        let mut gate = Gate::new(settings)?;
+        assert!(gate.accept_resolution(&prepared.workspace, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_verification_accepts_read_only_inputs_without_permission_or_byte_changes()
+    -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn file_modes(root: &Path) -> Result<BTreeMap<PathBuf, u32>> {
+            source_bytes(root)?
+                .into_keys()
+                .map(|path| {
+                    let mode = fs::metadata(root.join(&path))?.permissions().mode();
+                    Ok((path, mode))
+                })
+                .collect()
+        }
+        let (directory, settings, candidate) = pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let gate = Gate::new(settings.clone())?;
+        gate.ledger.append(&Record::new(
+            candidate.clone(),
+            "Change source".into(),
+            "escalate",
+            "human",
+            "A human must inspect the workspace.".into(),
+        ))?;
+        let prepared = Gate::prepare_resolution(
+            settings.clone(),
+            &candidate,
+            &fs::canonicalize(directory.path())?.join("workspace"),
+        )?;
+        fs::write(prepared.workspace.join("value.txt"), "pending human work\n")?;
+        fs::write(prepared.workspace.join("new\nfile"), "new native work\n")?;
+        Pijul::new(prepared.workspace.clone()).run(["add", "new\nfile"])?;
+        let credential = ["ghp_", "0123456789abcdefghijklmnopqrstuvwxyz"].concat();
+        for alias in ["new", "file"] {
+            fs::write(prepared.workspace.join(alias), &credential)?;
+        }
+        for root in [&settings.repo, &prepared.workspace] {
+            for path in source_bytes(root)?.into_keys() {
+                fs::set_permissions(root.join(path), fs::Permissions::from_mode(0o444))?;
+            }
+        }
+        let source = source_bytes(&settings.repo)?;
+        let workspace = source_bytes(&prepared.workspace)?;
+        let source_modes = file_modes(&settings.repo)?;
+        let workspace_modes = file_modes(&prepared.workspace)?;
+        let report = Gate::verify_resolution(settings.clone(), &prepared.workspace)?;
+        assert!(!report.authorizes_acceptance);
+        assert!(report.validation.credential_scan);
+        assert!(report.validation.native_expected_state);
+        assert!(report.validated_hashes.contains(&candidate));
+        assert_eq!(source_bytes(&settings.repo)?, source);
+        assert_eq!(source_bytes(&prepared.workspace)?, workspace);
+        assert_eq!(file_modes(&settings.repo)?, source_modes);
+        assert_eq!(file_modes(&prepared.workspace)?, workspace_modes);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_verification_refuses_editable_native_configuration_without_writes() -> Result<()> {
+        let (directory, settings, candidate) = pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let prepared = Gate::prepare_resolution(
+            settings.clone(),
+            &candidate,
+            &fs::canonicalize(directory.path())?.join("workspace"),
+        )?;
+        fs::write(
+            prepared.workspace.join(".pijul/config.toml"),
+            "[hooks]\nrecord = [\"false\"]\n",
+        )?;
+        let source = source_bytes(&settings.repo)?;
+        let workspace = source_bytes(&prepared.workspace)?;
+        assert!(Gate::verify_resolution(settings.clone(), &prepared.workspace).is_err());
+        assert_eq!(source_bytes(&settings.repo)?, source);
+        assert_eq!(source_bytes(&prepared.workspace)?, workspace);
+        Ok(())
+    }
+
+    #[test]
     fn supplemental_credentials_never_enter_acceptance_audit() -> Result<()> {
         let (directory, settings, candidate) = pending_fixture(&[("value.txt", b"candidate\n")])?;
         let prepared = Gate::prepare_resolution(
@@ -3700,6 +4197,8 @@ mod feature_tests {
                 model: "dry-run-test".into(),
                 model_api: Api::OpenAi,
                 model_revision: None,
+                model_profile: None,
+                model_key_file: None,
                 policy: "POLICY.md".into(),
                 protected: Vec::new(),
                 max_change_chars: 100_000,
@@ -3723,6 +4222,182 @@ mod feature_tests {
         assert_eq!(source_bytes(&root)?, before);
         assert_eq!(pijul.snapshot("main")?, main);
         assert_eq!(pijul.snapshot("inbox")?, inbox);
+        Ok(())
+    }
+
+    /// Serve exactly `requests` review replies, then stop listening.
+    fn accepting_server(requests: usize) -> Result<(String, thread::JoinHandle<Result<()>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let address = listener.local_addr()?;
+        let worker = thread::spawn(move || -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            for _ in 0..requests {
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                bail!("The model fixture received too few requests");
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                stream.set_nonblocking(false)?;
+                stream.set_read_timeout(Some(Duration::from_secs(20)))?;
+                let mut stream = BufReader::new(stream);
+                let mut line = String::new();
+                let mut length = 0;
+                loop {
+                    line.clear();
+                    if stream.read_line(&mut line)? == 0 {
+                        bail!("The model request is incomplete");
+                    }
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse()?;
+                        }
+                    }
+                }
+                let mut body = vec![0; length];
+                stream.read_exact(&mut body)?;
+                let body = r#"{"choices":[{"message":{"content":"{\"decision\":\"accept\",\"summary\":\"Safe.\",\"reason\":\"The policy allows it.\"}"}}]}"#;
+                write!(
+                    stream.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )?;
+            }
+            Ok(())
+        });
+        Ok((format!("http://{address}/v1"), worker))
+    }
+
+    #[test]
+    fn contiguous_ready_changes_land_in_one_review() -> Result<()> {
+        let (_directory, mut settings, first) = pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let second = fixture_edit(&settings, "second.txt", "second\n", "patchgate")?;
+        let (url, worker) = accepting_server(2)?;
+        settings.model_url = url;
+        let mut gate = Gate::new(settings)?;
+        let (items, _) = gate.review(&Selection::default(), |_| {})?;
+        worker.join().expect("The model fixture panicked")?;
+        let main = gate.pijul.hashes("main")?;
+        assert!(main.contains(&first) && main.contains(&second));
+        let latest = gate.ledger.latest()?;
+        assert_eq!(latest.len(), 2);
+        assert_eq!(latest[&first].decision, "accept");
+        assert_eq!(latest[&second].decision, "accept");
+        assert!(items.iter().all(|item| item.state == State::Accepted));
+        assert!(!gate.ledger.pending()?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn documentation_only_changes_skip_the_model() -> Result<()> {
+        let (_directory, mut settings, source_change) =
+            pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let pijul = Pijul::new(settings.repo.clone());
+        pijul.run(["channel", "switch", "main"])?;
+        fs::write(
+            settings.repo.join(crate::configuration::PATH),
+            r#"{"schema_version":1,"settings":{"documentation_paths":["docs/*"]}}"#,
+        )?;
+        pijul.run(["add", crate::configuration::PATH])?;
+        let signer = Signer::new(settings.repo.join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        pijul.call_with_env(
+            [
+                "record",
+                "-a",
+                "-m",
+                "Declare documentation paths",
+                "--author",
+                "patchgate",
+            ],
+            &environment.vars,
+        )?;
+        pijul.run(["channel", "switch", "inbox"])?;
+        fs::create_dir_all(settings.repo.join("docs"))?;
+        let documentation = fixture_edit(&settings, "docs/guide.md", "Guide\n", "patchgate")?;
+        assert_eq!(
+            crate::configuration::load(&pijul, "main", &settings.baseline_values())?
+                .values
+                .documentation_paths,
+            ["docs/*"]
+        );
+        let (url, worker) = accepting_server(1)?;
+        settings.model_url = url;
+        let mut gate = Gate::new(settings)?;
+        gate.review(&Selection::default(), |_| {})?;
+        worker.join().expect("The model fixture panicked")?;
+        let latest = gate.ledger.latest()?;
+        assert_eq!(latest[&documentation].decision, "accept");
+        assert_eq!(latest[&documentation].by, "gate");
+        assert!(
+            latest[&documentation]
+                .reason
+                .contains("documentation paths")
+        );
+        assert_eq!(latest[&source_change].by, "model");
+        let main = gate.pijul.hashes("main")?;
+        assert!(main.contains(&documentation) && main.contains(&source_change));
+        Ok(())
+    }
+
+    #[test]
+    fn an_exact_cached_verdict_avoids_the_model_request() -> Result<()> {
+        let (_directory, settings, candidate) = pending_fixture(&[("value.txt", b"candidate\n")])?;
+        // Any real request fails: the cached verdict alone must decide this change.
+        let mut gate = Gate::new(settings)?;
+        let main = gate.pijul.snapshot("main")?;
+        let policy = gate
+            .pijul
+            .read_file("main", "POLICY.md")?
+            .context("The policy is absent")?;
+        let binding = ReviewBinding::new(
+            std::slice::from_ref(&candidate),
+            "POLICY.md",
+            Some(&policy),
+            "main",
+            &main,
+        );
+        let verdict = crate::model::Verdict {
+            decision: "accept".into(),
+            summary: "Safe.".into(),
+            reason: "The policy allows it.".into(),
+        };
+        let request = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "operation": "review",
+            "api": "openai",
+            "model": "feature-test",
+            "declared_revision": null,
+            "revision_verified": false,
+            "prompt_sha256": "prompt",
+            "schema_sha256": "schema",
+        }))?;
+        gate.remember_verdict(&binding, &candidate, &verdict, request)?;
+        gate.review(&Selection::default(), |_| {})?;
+        let latest = gate.ledger.latest()?;
+        assert_eq!(latest[&candidate].decision, "accept");
+        assert_eq!(latest[&candidate].by, "model");
+        assert!(latest[&candidate].reused);
+        assert_eq!(
+            latest[&candidate]
+                .provenance
+                .as_ref()
+                .context("Decision provenance is absent")?
+                .requests
+                .len(),
+            1
+        );
+        assert!(gate.pijul.hashes("main")?.contains(&candidate));
         Ok(())
     }
 }

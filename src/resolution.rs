@@ -57,6 +57,41 @@ pub struct Completed {
     pub imported: HashSet<String>,
 }
 
+#[derive(Serialize)]
+pub struct VerificationReport {
+    pub schema_version: u8,
+    pub authorizes_acceptance: bool,
+    pub prepared: Prepared,
+    pub validated_hashes: Vec<String>,
+    pub validation: ValidationEvidence,
+    pub verification: Option<std::rc::Rc<crate::verify::Verification>>,
+}
+
+#[derive(Serialize)]
+pub struct ValidationEvidence {
+    pub source_authority: bool,
+    pub current_bindings: bool,
+    pub permitted_dependencies: bool,
+    pub native_expected_state: bool,
+    pub credential_scan: bool,
+    pub conflicts_absent: bool,
+}
+
+pub fn show_verification(report: &VerificationReport) {
+    println!("Workspace verification passed.");
+    println!("Prepared identity: {}", report.prepared.id);
+    println!("Validated changes: {}", report.validated_hashes.len());
+    if let Some(verification) = &report.verification {
+        if let Some(version) = verification.observed_nix_version() {
+            println!("Observed Nix version: {}", version.escape_debug());
+        }
+        println!("Trusted Nix checks and fresh isolation passed.");
+    } else {
+        println!("Trusted main defines no Nix checks.");
+    }
+    println!("This report does not authorize acceptance. Acceptance repeats all live guards.");
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pointer {
@@ -965,9 +1000,43 @@ pub fn record(prepared: &Prepared, signer: &Signer, reason: &str) -> Result<Comp
         identity(prepared)? == identity(&trusted)? && prepared.id == trusted.id,
         "The supplied resolution record differs from source authority"
     );
-    let pijul = Pijul::new(trusted.workspace.clone());
+    record_workspace(
+        &trusted,
+        Pijul::new(trusted.workspace.clone()),
+        signer,
+        reason,
+    )
+}
+
+pub(crate) fn record_private(
+    prepared: &Prepared,
+    private: &Pijul,
+    signer: &Signer,
+    reason: &str,
+) -> Result<Completed> {
+    let trusted = load(&prepared.source, &prepared.workspace)?;
+    ensure!(
+        identity(prepared)? == identity(&trusted)? && prepared.id == trusted.id,
+        "The supplied resolution record differs from source authority"
+    );
+    record_workspace(&trusted, Pijul::new(private.repo.clone()), signer, reason)
+}
+
+fn record_workspace(
+    trusted: &Prepared,
+    pijul: Pijul,
+    signer: &Signer,
+    reason: &str,
+) -> Result<Completed> {
     validate_native_metadata(&pijul.repo.join(".pijul"))?;
     refuse_native_configuration(&pijul.repo)?;
+    let mut files = trusted.clone();
+    files.review_file = pijul.repo.join(PRIVATE).join("review.txt");
+    files.policy_file = trusted
+        .policy_file
+        .as_ref()
+        .map(|_| pijul.repo.join(PRIVATE).join("policy.txt"));
+    validate_prepared_files(&pijul, &files)?;
     let (current, _) = pijul.channels()?;
     ensure!(
         current.as_deref() == Some(trusted.main.as_str()),
@@ -1016,6 +1085,113 @@ pub fn record(prepared: &Prepared, signer: &Signer, reason: &str) -> Result<Comp
         hashes,
         imported,
     })
+}
+
+/// Copy native state and tracked work files without source writes or shared inodes.
+pub(crate) fn copy_workspace(prepared: &Prepared) -> Result<crate::isolation::Isolated> {
+    refuse_native_configuration(&prepared.workspace)?;
+    validate_native_metadata(&prepared.workspace.join(".pijul"))?;
+    let isolated = crate::isolation::copy_repository(&prepared.workspace)?;
+    detach_files(&isolated.pijul.repo.join(".pijul"))?;
+    refuse_native_configuration(&isolated.pijul.repo)?;
+    let paths = workspace_paths(&isolated.pijul, prepared)?;
+    for relative in paths {
+        ensure!(
+            !relative.as_os_str().is_empty() && !relative.starts_with(".pijul"),
+            "A tracked path cannot replace native metadata"
+        );
+        let source = crate::pijul::safe_path(&prepared.workspace, &relative)?;
+        let target = crate::pijul::safe_path(&isolated.pijul.repo, &relative)?;
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if metadata.is_dir() {
+            fs::create_dir_all(&target)?;
+        } else {
+            ensure!(
+                metadata.is_file(),
+                "Tracked work data must use regular files"
+            );
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&source, &target)?;
+            let after = fs::symlink_metadata(&source)?;
+            ensure!(
+                after.is_file()
+                    && metadata.dev() == after.dev()
+                    && metadata.ino() == after.ino()
+                    && metadata.len() == after.len()
+                    && metadata.modified()? == after.modified()?,
+                "The workspace changed during its private copy"
+            );
+        }
+    }
+    refuse_native_configuration(&isolated.pijul.repo)?;
+    Ok(isolated)
+}
+
+// Native list output is ambiguous. Use it only to select empty path placeholders.
+// Structured native diff paths and archive members select the actual work bytes.
+fn workspace_paths(pijul: &Pijul, prepared: &Prepared) -> Result<HashSet<PathBuf>> {
+    let listing = format!("\n{}", pijul.run(["list"])?);
+    let mut pending = vec![PathBuf::new()];
+    let mut placeholders = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(prepared.workspace.join(&directory))? {
+            let entry = entry?;
+            let relative = directory.join(entry.file_name());
+            if relative.starts_with(".pijul") {
+                continue;
+            }
+            let Some(path) = relative.to_str() else {
+                continue;
+            };
+            if !listing.contains(&format!("\n{path}\n")) && !listing.contains(&format!("\n{path}/"))
+            {
+                continue;
+            }
+            let target = pijul.repo.join(&relative);
+            if entry.file_type()?.is_dir() {
+                fs::create_dir(&target)?;
+                pending.push(relative);
+            } else {
+                File::create(&target)?;
+                placeholders.push(relative);
+            }
+        }
+    }
+    let diff = pijul.run(["diff", "--output-format", "json"])?;
+    let mut paths: HashSet<PathBuf> = if diff.trim().is_empty() {
+        HashSet::new()
+    } else {
+        serde_json::from_str::<std::collections::BTreeMap<PathBuf, serde_json::Value>>(&diff)?
+            .into_keys()
+            .collect()
+    };
+    // Empty recorded files can match the placeholders and have no diff.
+    let directory = tempfile::tempdir()?;
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+    let archive = directory.path().join("recorded.tar.gz");
+    pijul.call([
+        OsStr::new("archive"),
+        OsStr::new("--channel"),
+        OsStr::new(&prepared.main),
+        OsStr::new("-o"),
+        archive.as_os_str(),
+    ])?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(File::open(archive)?));
+    for entry in archive.entries()? {
+        paths.insert(crate::pijul::normalize_path(&entry?.path()?)?);
+    }
+    for path in placeholders {
+        fs::remove_file(pijul.repo.join(path))?;
+    }
+    // Empty placeholder directories do not affect a native record.
+    paths.remove(Path::new(""));
+    Ok(paths)
 }
 
 fn native_order(pijul: &Pijul, prepared: &Prepared) -> Result<Vec<String>> {
@@ -1197,8 +1373,8 @@ fn private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// Native clones can share immutable files. The human copy must not share source inodes.
-fn detach_files(path: &Path) -> Result<()> {
+// Detach shared native files before private operations need owner-write access.
+pub(crate) fn detach_files(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     ensure!(
         !metadata.file_type().is_symlink(),
@@ -1217,9 +1393,12 @@ fn detach_files(path: &Path) -> Result<()> {
             let mut copy =
                 tempfile::NamedTempFile::new_in(path.parent().context("Metadata has no parent")?)?;
             std::io::copy(&mut File::open(path)?, &mut copy)?;
-            copy.as_file().set_permissions(metadata.permissions())?;
+            copy.as_file()
+                .set_permissions(fs::Permissions::from_mode(metadata.mode() | 0o200))?;
             copy.as_file().sync_all()?;
             copy.persist(path).map_err(|error| error.error)?;
+        } else if metadata.mode() & 0o200 == 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(metadata.mode() | 0o200))?;
         }
     }
     Ok(())
@@ -1447,6 +1626,145 @@ mod tests {
             configuration,
         )?;
         Ok((directory, prepared, signer))
+    }
+
+    #[test]
+    fn private_record_preserves_tracked_edits_and_native_add_remove_state() -> Result<()> {
+        let (_directory, prepared, _signer) = native_fixture(false)?;
+        let workspace = Pijul::new(prepared.workspace.clone());
+        fs::write(workspace.repo.join("value.txt"), "pending human edit\n")?;
+        fs::write(
+            workspace.repo.join("added.txt"),
+            "explicit native addition\n",
+        )?;
+        workspace.run(["add", "added.txt"])?;
+        workspace.run(["remove", "POLICY.md"])?;
+        fs::write(workspace.repo.join("untracked.txt"), "excluded work file\n")?;
+        let pointer = fs::read(workspace.repo.join(POINTER))?;
+        let authority = fs::read(
+            prepared
+                .source
+                .join(RECORDS)
+                .join(format!("{}.json", prepared.id)),
+        )?;
+        let private = copy_workspace(&prepared)?;
+        let signer = Signer::new(private.pijul.repo.join(".pijul/patchgate"));
+        let completed = record_private(&prepared, &private.pijul, &signer, "Verify private work")?;
+        assert_eq!(
+            completed.pijul.read_file("main", "value.txt")?.as_deref(),
+            Some("pending human edit\n")
+        );
+        assert_eq!(
+            completed.pijul.read_file("main", "added.txt")?.as_deref(),
+            Some("explicit native addition\n")
+        );
+        assert_eq!(completed.pijul.read_file("main", "POLICY.md")?, None);
+        assert_eq!(completed.pijul.read_file("main", "untracked.txt")?, None);
+        assert_eq!(fs::read(workspace.repo.join(POINTER))?, pointer);
+        assert_eq!(
+            fs::read(
+                prepared
+                    .source
+                    .join(RECORDS)
+                    .join(format!("{}.json", prepared.id))
+            )?,
+            authority
+        );
+        assert_eq!(
+            workspace.log("main")?.len(),
+            prepared.base.len() + prepared.candidates.len()
+        );
+        assert_eq!(
+            fs::read(workspace.repo.join("value.txt"))?,
+            b"pending human edit\n"
+        );
+        assert_eq!(
+            fs::read(workspace.repo.join("untracked.txt"))?,
+            b"excluded work file\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn private_record_preserves_newline_paths_without_untracked_alias_bytes() -> Result<()> {
+        fn snapshot(root: &Path) -> Result<std::collections::BTreeMap<PathBuf, (Vec<u8>, u32)>> {
+            let mut files = std::collections::BTreeMap::new();
+            let mut pending = vec![root.to_path_buf()];
+            while let Some(directory) = pending.pop() {
+                for entry in fs::read_dir(directory)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        pending.push(entry.path());
+                    } else {
+                        files.insert(
+                            entry.path().strip_prefix(root)?.to_path_buf(),
+                            (fs::read(entry.path())?, entry.metadata()?.mode()),
+                        );
+                    }
+                }
+            }
+            Ok(files)
+        }
+        let (_directory, prepared, signer) = native_fixture(false)?;
+        let workspace = Pijul::new(prepared.workspace.clone());
+        fs::write(workspace.repo.join("tracked\nname"), "recorded work\n")?;
+        fs::write(workspace.repo.join("removed\nname"), "removed work\n")?;
+        fs::write(workspace.repo.join("empty\nname"), "")?;
+        workspace.run(["add", "tracked\nname", "removed\nname", "empty\nname"])?;
+        native_record(&workspace, &signer, "Record unusual native paths")?;
+        fs::write(
+            workspace.repo.join("tracked\nname"),
+            "pending tracked work\n",
+        )?;
+        fs::write(workspace.repo.join("added\nname"), "new tracked work\n")?;
+        workspace.run(["add", "added\nname"])?;
+        workspace.run(["remove", "removed\nname"])?;
+        for alias in ["tracked", "name", "added", "removed"] {
+            fs::write(workspace.repo.join(alias), "private untracked alias\n")?;
+        }
+        let source_before = snapshot(&prepared.source)?;
+        let workspace_before = snapshot(&prepared.workspace)?;
+        let private = copy_workspace(&prepared)?;
+        for alias in ["tracked", "name", "added", "removed"] {
+            assert!(!private.pijul.repo.join(alias).exists());
+        }
+        let private_signer = Signer::new(private.pijul.repo.join(".pijul/patchgate"));
+        let completed = record_private(
+            &prepared,
+            &private.pijul,
+            &private_signer,
+            "Verify exact native paths",
+        )?;
+        for (path, expected) in [
+            ("tracked\nname", Some("pending tracked work\n")),
+            ("added\nname", Some("new tracked work\n")),
+            ("removed\nname", None),
+            ("empty\nname", Some("")),
+            ("tracked", None),
+            ("name", None),
+            ("added", None),
+            ("removed", None),
+        ] {
+            assert_eq!(
+                completed.pijul.read_file("main", path)?.as_deref(),
+                expected
+            );
+        }
+        assert_eq!(snapshot(&prepared.source)?, source_before);
+        assert_eq!(snapshot(&prepared.workspace)?, workspace_before);
+        let accepted = record(&prepared, &signer, "Accept exact native paths")?;
+        for path in [
+            "tracked\nname",
+            "added\nname",
+            "removed\nname",
+            "empty\nname",
+        ] {
+            assert_eq!(
+                completed.pijul.read_file_bytes("main", path)?,
+                accepted.pijul.read_file_bytes("main", path)?,
+            );
+        }
+        Ok(())
     }
 
     #[test]

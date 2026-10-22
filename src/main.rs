@@ -1,16 +1,20 @@
 pub mod artifact;
 mod budget;
 pub mod bundle;
+mod case_view;
 mod cases;
 mod change;
 mod configuration;
+mod decision;
 mod doctor;
 mod gate;
 mod isolation;
 mod model;
+mod models;
 mod pijul;
 mod protected;
 pub mod provenance;
+pub mod release_policy;
 mod resolution;
 mod review;
 mod secrets;
@@ -89,6 +93,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Verify a human workspace in isolation without acceptance.
+    Verify {
+        #[arg(long)]
+        resolution: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Sign or verify replay artifacts with an explicit reviewer identity.
     Artifact {
         #[command(subcommand)]
@@ -126,6 +137,11 @@ enum Command {
         /// Include pending native prerequisites for the explicit selection.
         #[arg(long, requires = "review_selection")]
         include_dependencies: bool,
+    },
+    /// Show the effective model profile without a model request.
+    Model {
+        #[arg(long)]
+        json: bool,
     },
     /// Diagnose setup without repository changes.
     Doctor {
@@ -181,6 +197,12 @@ enum CaseCommand {
     },
     /// Show captured snapshots and human label state.
     List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show captured historical context without model verdicts.
+    Show {
+        case: String,
         #[arg(long)]
         json: bool,
     },
@@ -253,6 +275,8 @@ enum ArtifactCommand {
         signature: PathBuf,
         #[arg(long)]
         allowed_signers: PathBuf,
+        #[arg(long)]
+        revoked_keys: Option<PathBuf>,
         #[arg(long)]
         identity: String,
         #[arg(long)]
@@ -401,6 +425,14 @@ fn run_cases(settings: Settings, command: CaseCommand) -> Result<()> {
         CaseCommand::Capture { change, json } => {
             show_case(&Gate::capture_case(settings, &change)?, json)?;
         }
+        CaseCommand::Show { case, json } => {
+            let report = case_view::inspect(&settings.repo, &case)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                case_view::show(&report);
+            }
+        }
         CaseCommand::List { json } => {
             let records = cases::Store::new(&settings.repo).list()?;
             if json {
@@ -510,12 +542,14 @@ fn run_artifact(source: &std::path::Path, command: ArtifactCommand) -> Result<()
             kind,
             signature,
             allowed_signers,
+            revoked_keys,
             identity,
             json,
         } => {
             let trust = artifact::Trust {
                 signature,
                 allowed_signers,
+                revoked_keys,
                 identity,
             };
             let report = artifact::verify(&artifact, kind, &trust)?;
@@ -523,6 +557,7 @@ fn run_artifact(source: &std::path::Path, command: ArtifactCommand) -> Result<()
                 print_json(&report)?;
             } else {
                 println!("Verified reviewer: {}", report.identity);
+                println!("Verified key: {}", report.signer_fingerprint);
                 println!("Artifact SHA-256: {}", report.sha256);
                 println!("The signature grants no acceptance authority.");
             }
@@ -538,6 +573,14 @@ fn quote_path(path: &std::path::Path) -> String {
 fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result<()> {
     match command {
         Command::Artifact { command } => run_artifact(&settings.repo, command)?,
+        Command::Verify { resolution, json } => {
+            let report = Gate::verify_resolution(settings, &resolution)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                resolution::show_verification(&report);
+            }
+        }
         Command::WorkspaceStatus { workspace, json } => {
             let report = Gate::workspace_status(settings, &workspace)?;
             if json {
@@ -707,6 +750,53 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
             show_review(&report, json)?;
         }
         Command::Cases { command } => run_cases(settings, command)?,
+        Command::Model { json } => {
+            let selection = models::select()?;
+            if json {
+                #[derive(serde::Serialize)]
+                struct ModelReport<'a> {
+                    schema_version: u8,
+                    profile: Option<&'a str>,
+                    url: &'a str,
+                    model: &'a str,
+                    api: &'a str,
+                    revision: Option<&'a str>,
+                    key_file: Option<&'a std::path::Path>,
+                    profiles_file: Option<&'a std::path::Path>,
+                    profiles: &'a [String],
+                }
+                print_json(&ModelReport {
+                    schema_version: 1,
+                    profile: selection.profile.as_deref(),
+                    url: &selection.url,
+                    model: &selection.model,
+                    api: selection.api.as_str(),
+                    revision: selection.revision.as_deref(),
+                    key_file: selection.key_file.as_deref(),
+                    profiles_file: selection.source.as_deref(),
+                    profiles: &selection.available,
+                })?;
+            } else {
+                println!("Profile: {}", selection.profile_name());
+                println!("Endpoint: {}", selection.url);
+                println!("Model: {}", selection.model);
+                println!("API: {}", selection.api.as_str());
+                if let Some(revision) = &selection.revision {
+                    println!("Revision: {revision}");
+                }
+                if let Some(key_file) = &selection.key_file {
+                    println!("Key file: {}", key_file.display());
+                }
+                match &selection.source {
+                    Some(path) => println!("Profiles file: {}", path.display()),
+                    None => println!("Profiles file: none"),
+                }
+                if !selection.available.is_empty() {
+                    println!("Profiles: {}", selection.available.join(", "));
+                }
+                println!("This reports configuration only. It makes no model request.");
+            }
+        }
         Command::Doctor { json, runtime } => {
             let report = if runtime {
                 doctor::inspect_runtime(&settings)?
@@ -771,7 +861,12 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 s.main,
                 s.repo.display()
             );
-            println!("Model: {} at {}", s.model, s.model_url);
+            println!(
+                "Model: {} at {} (profile {})",
+                s.model,
+                s.model_url,
+                s.model_profile.as_deref().unwrap_or("environment")
+            );
             let mut last_error = None;
             while !interrupted.load(Ordering::Relaxed) {
                 match gate.review(&Selection::default(), show) {

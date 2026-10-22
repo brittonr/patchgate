@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -17,6 +18,7 @@ pub fn copy_repository(source: &Path) -> Result<Isolated> {
     let directory = tempfile::Builder::new()
         .prefix("patchgate-isolated-")
         .tempdir()?;
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
     let root = directory.path().join("repo");
     fs::create_dir(&root)?;
     copy_metadata(&metadata, &root.join(".pijul"), false, true)?;

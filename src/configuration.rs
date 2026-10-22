@@ -14,6 +14,8 @@ pub const PATH: &str = "patchgate.json";
 pub struct Values {
     pub policy_path: String,
     pub protected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documentation_paths: Vec<String>,
     pub max_change_chars: usize,
     pub timeout_seconds: f64,
     pub check_timeout_seconds: f64,
@@ -24,6 +26,7 @@ impl Default for Values {
         Self {
             policy_path: "POLICY.md".into(),
             protected: Vec::new(),
+            documentation_paths: Vec::new(),
             max_change_chars: 8000,
             timeout_seconds: 300.0,
             check_timeout_seconds: 900.0,
@@ -84,7 +87,10 @@ fn evidence(text: Option<&str>, fallback: &Values) -> Result<Evidence> {
 }
 
 fn validate(values: &Values) -> Result<()> {
-    for value in std::iter::once(&values.policy_path).chain(&values.protected) {
+    for value in std::iter::once(&values.policy_path)
+        .chain(&values.protected)
+        .chain(&values.documentation_paths)
+    {
         ensure!(
             crate::secrets::scan_text(PATH, value.as_bytes()).is_empty(),
             "Trusted configuration contains supported credential data"
@@ -101,6 +107,14 @@ fn validate(values: &Values) -> Result<()> {
         );
         regex::Regex::new(&crate::protected::pattern_regex(pattern))
             .map_err(|_| anyhow!("Trusted configuration has an invalid protected pattern"))?;
+    }
+    for pattern in &values.documentation_paths {
+        ensure!(
+            relative_path(pattern) && !pattern.contains(','),
+            "Trusted configuration has an unsafe documentation pattern"
+        );
+        regex::Regex::new(&crate::protected::pattern_regex(pattern))
+            .map_err(|_| anyhow!("Trusted configuration has an invalid documentation pattern"))?;
     }
     for seconds in [values.timeout_seconds, values.check_timeout_seconds] {
         ensure!(
@@ -143,6 +157,7 @@ mod tests {
         let fallback = Values {
             policy_path: "../legacy-policy".into(),
             protected: vec!["".into()],
+            documentation_paths: Vec::new(),
             max_change_chars: 0,
             timeout_seconds: 0.0,
             check_timeout_seconds: 0.0,
@@ -160,6 +175,7 @@ mod tests {
         let fallback = Values {
             policy_path: "OTHER.md".into(),
             protected: vec!["*".into()],
+            documentation_paths: Vec::new(),
             max_change_chars: 1,
             timeout_seconds: 1.0,
             check_timeout_seconds: 1.0,
@@ -194,6 +210,23 @@ mod tests {
         assert_eq!(loaded.values.max_change_chars, 0);
         assert_eq!(loaded.values.timeout_seconds, 0.125);
         assert_eq!(loaded.values.check_timeout_seconds, 1.75);
+        Ok(())
+    }
+
+    #[test]
+    fn documentation_patterns_use_the_same_safe_syntax_as_protected_patterns() -> Result<()> {
+        let loaded = parse(json!({
+            "documentation_paths": ["docs/*", "*.md"],
+        }))?;
+        assert_eq!(loaded.values.documentation_paths, ["docs/*", "*.md"]);
+        for pattern in ["", "/absolute", "../docs", "docs/../a", "a,b", "a\nb"] {
+            assert!(
+                parse(json!({"documentation_paths": [pattern]})).is_err(),
+                "{pattern:?}"
+            );
+        }
+        let credential = ["-----BEGIN OPENSSH ", "PRIVATE KEY-----"].concat();
+        assert!(parse(json!({"documentation_paths": [credential]})).is_err());
         Ok(())
     }
 

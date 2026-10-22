@@ -60,7 +60,7 @@ impl<T> Response<T> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Api {
     OpenAi,
     SystemOne,
@@ -74,6 +74,15 @@ impl std::str::FromStr for Api {
             "openai" => Ok(Self::OpenAi),
             "systemone" => Ok(Self::SystemOne),
             _ => bail!("PATCHGATE_MODEL_API must be openai or systemone, not {value:?}"),
+        }
+    }
+}
+
+impl Api {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::SystemOne => "systemone",
         }
     }
 }
@@ -103,6 +112,7 @@ pub struct Model {
     agent: ureq::Agent,
     api: Api,
     declared_revision: Option<String>,
+    key: Option<String>,
 }
 
 impl Model {
@@ -112,6 +122,7 @@ impl Model {
         timeout: Duration,
         api: Api,
         declared_revision: Option<&str>,
+        key: Option<&str>,
     ) -> Result<Self> {
         ensure!(
             !name.trim().is_empty()
@@ -129,6 +140,12 @@ impl Model {
                 "The declared model revision contains supported credential data"
             );
         }
+        if let Some(key) = key {
+            ensure!(
+                !key.trim().is_empty() && !key.chars().any(char::is_control),
+                "The model key is empty or contains control characters"
+            );
+        }
         let agent = ureq::Agent::config_builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
@@ -144,6 +161,7 @@ impl Model {
             agent,
             api,
             declared_revision: declared_revision.map(str::to_owned),
+            key: key.map(str::to_owned),
         })
     }
 
@@ -314,11 +332,11 @@ impl Model {
     }
 
     fn post(&self, body: &impl Serialize) -> Result<Option<Value>> {
-        let mut response = self
-            .agent
-            .post(&self.url)
-            .send_json(body)
-            .context("Model request failed")?;
+        let mut request = self.agent.post(&self.url);
+        if let Some(key) = &self.key {
+            request = request.header("Authorization", format!("Bearer {key}"));
+        }
+        let mut response = request.send_json(body).context("Model request failed")?;
         let status = response.status().as_u16();
         if status >= 400 {
             bail!("Model server answered HTTP {status}");
@@ -455,6 +473,20 @@ pub(crate) mod tests {
         status: u16,
         reply: &str,
     ) -> Result<(String, JoinHandle<Result<Value>>)> {
+        let (url, worker) = reply_server_with_headers(status, reply)?;
+        Ok((
+            url,
+            thread::spawn(move || {
+                let (body, _) = worker.join().expect("The model fixture panicked")?;
+                Ok(body)
+            }),
+        ))
+    }
+
+    pub(crate) fn reply_server_with_headers(
+        status: u16,
+        reply: &str,
+    ) -> Result<(String, JoinHandle<Result<(Value, Option<String>)>>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let url = format!("http://{}/v1", listener.local_addr()?);
@@ -476,6 +508,7 @@ pub(crate) mod tests {
             let mut stream = BufReader::new(stream);
             let mut line = String::new();
             let mut length = None;
+            let mut authorization = None;
             loop {
                 line.clear();
                 ensure!(
@@ -489,6 +522,9 @@ pub(crate) mod tests {
                     if name.eq_ignore_ascii_case("content-length") {
                         length = Some(value.trim().parse::<usize>()?);
                     }
+                    if name.eq_ignore_ascii_case("authorization") {
+                        authorization = Some(value.trim().to_owned());
+                    }
                 }
             }
             let mut bytes = vec![0; length.context("The request has no length")?];
@@ -501,13 +537,40 @@ pub(crate) mod tests {
                     reply.len()
                 )?;
             }
-            Ok(body)
+            Ok((body, authorization))
         });
         Ok((url, worker))
     }
 
     fn sha256(value: &Value) -> String {
         format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
+    }
+
+    #[test]
+    fn bearer_key_stays_in_the_header_and_out_of_the_body() -> Result<()> {
+        let answer = json!({"choices": [{"message": {
+            "content": "{\"decision\":\"accept\",\"summary\":\"Safe.\",\"reason\":\"Rule.\"}"
+        }}]});
+        for key in [Some("sk-private"), None] {
+            let (url, worker) = reply_server_with_headers(200, &answer.to_string())?;
+            let model = Model::new(
+                &url,
+                "model",
+                Duration::from_secs(5),
+                Api::OpenAi,
+                None,
+                key,
+            )?;
+            let state = RawValue::from_string("{}".into())?;
+            model.review("Accept safe changes.", &state)?;
+            let (body, authorization) = worker.join().expect("The model fixture panicked")?;
+            assert_eq!(
+                authorization.as_deref(),
+                key.map(|key| format!("Bearer {key}")).as_deref()
+            );
+            assert!(!body.to_string().contains("sk-private"));
+        }
+        Ok(())
     }
 
     #[test]
@@ -534,6 +597,7 @@ pub(crate) mod tests {
                     Duration::from_secs(5),
                     api,
                     Some("revision-7"),
+                    None,
                 )?;
                 let evidence = if operation == "review" {
                     let state = RawValue::from_string("{\"candidate\":\"PRIVATE_STATE\"}".into())?;
@@ -591,7 +655,7 @@ pub(crate) mod tests {
                     r#"{"choices":[{"message":{"content":"PRIVATE_INVALID_PAYLOAD"}}],"answers":{"review":{"type":"choice","choice":"unknown","confidence":1},"merge":{"type":"choice","choice":"unknown","confidence":1}}}"#,
                 ] {
                     let (url, worker) = reply_server(200, reply)?;
-                    let model = Model::new(&url, "model", Duration::from_secs(5), api, None)?;
+                    let model = Model::new(&url, "model", Duration::from_secs(5), api, None, None)?;
                     let evidence = if operation == "review" {
                         let state = RawValue::from_string("{}".into())?;
                         let response = model.review("Accept safe changes.", &state)?;
@@ -619,7 +683,7 @@ pub(crate) mod tests {
             for status in [0, 503] {
                 for operation in ["review", "merge"] {
                     let (url, worker) = reply_server(status, "PRIVATE_SERVER_PAYLOAD")?;
-                    let model = Model::new(&url, "model", Duration::from_secs(5), api, None)?;
+                    let model = Model::new(&url, "model", Duration::from_secs(5), api, None, None)?;
                     let error = if operation == "review" {
                         let state = RawValue::from_string("{}".into())?;
                         model.review("Accept safe changes.", &state).unwrap_err()
@@ -644,6 +708,7 @@ pub(crate) mod tests {
                 Duration::from_secs(1),
                 Api::OpenAi,
                 Some(revision),
+                None,
             )
             .err()
             .expect("An unsafe revision must fail");

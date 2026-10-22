@@ -46,6 +46,7 @@ impl Kind {
 pub struct Trust {
     pub signature: PathBuf,
     pub allowed_signers: PathBuf,
+    pub revoked_keys: Option<PathBuf>,
     pub identity: String,
 }
 
@@ -68,6 +69,8 @@ pub struct Verified {
     pub sha256: String,
     pub identity: String,
     pub allowed_signers_sha256: String,
+    pub signer_fingerprint: String,
+    pub revoked_keys_sha256: Option<String>,
     pub namespace: String,
 }
 
@@ -75,12 +78,31 @@ pub struct VerifiedSnapshot {
     pub verified: Verified,
     _directory: TempDir,
     artifact: PathBuf,
+    trust: TrustSnapshot,
 }
 
 impl VerifiedSnapshot {
     pub fn path(&self) -> &Path {
         &self.artifact
     }
+
+    pub fn signature(&self) -> &[u8] {
+        &self.trust.signature
+    }
+
+    pub fn allowed_signers(&self) -> &[u8] {
+        &self.trust.allowed_signers
+    }
+
+    pub fn revoked_keys(&self) -> Option<&[u8]> {
+        self.trust.revoked_keys.as_deref()
+    }
+}
+
+struct TrustSnapshot {
+    signature: Vec<u8>,
+    allowed_signers: Vec<u8>,
+    revoked_keys: Option<Vec<u8>>,
 }
 
 fn copy_digest(mut input: impl Read, mut output: impl Write) -> Result<String> {
@@ -373,11 +395,16 @@ impl Tools {
         let mut process = Process(
             command
                 .stdout(stdout.try_clone()?)
-                .stderr(stderr)
+                .stderr(stderr.try_clone()?)
                 .spawn()
                 .context("Cannot execute the artifact signature tool.")?,
         );
         let status = loop {
+            ensure!(
+                stdout.metadata()?.len() <= MAX_TOOL_BYTES
+                    && stderr.metadata()?.len() <= MAX_TOOL_BYTES,
+                "The artifact signature tool output is too large."
+            );
             if let Some(status) = process.0.try_wait()? {
                 break status;
             }
@@ -387,6 +414,11 @@ impl Tools {
             );
             thread::sleep(Duration::from_millis(10));
         };
+        ensure!(
+            stdout.metadata()?.len() <= MAX_TOOL_BYTES
+                && stderr.metadata()?.len() <= MAX_TOOL_BYTES,
+            "The artifact signature tool output is too large."
+        );
         ensure!(
             status.success(),
             "The artifact signature tool refused the operation."
@@ -413,12 +445,102 @@ impl Tools {
             .split_whitespace()
             .nth(1)
             .context("The SSH fingerprint is absent.")?;
-        ensure!(
-            fingerprint.starts_with("SHA256:"),
-            "The SSH fingerprint is invalid."
-        );
+        validate_fingerprint(fingerprint)?;
         Ok(fingerprint.to_owned())
     }
+}
+
+fn validate_fingerprint(fingerprint: &str) -> Result<()> {
+    let hash = fingerprint
+        .strip_prefix("SHA256:")
+        .context("The SSH fingerprint is invalid.")?;
+    ensure!(
+        hash.len() == 43
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"+/".contains(&byte)),
+        "The SSH fingerprint is invalid."
+    );
+    Ok(())
+}
+
+fn verified_fingerprint(output: &[u8], kind: Kind, identity: &str) -> Result<String> {
+    let text =
+        std::str::from_utf8(output).context("The verified SSH signer evidence is invalid.")?;
+    let prefix = format!(
+        "Good \"{}\" signature for {identity} with ",
+        kind.namespace()
+    );
+    let evidence = text
+        .strip_suffix('\n')
+        .and_then(|line| line.strip_prefix(&prefix))
+        .context("The verified SSH signer evidence is invalid.")?;
+    let (algorithm, fingerprint) = evidence
+        .split_once(" key ")
+        .context("The verified SSH signer evidence is invalid.")?;
+    ensure!(
+        !algorithm.is_empty()
+            && algorithm
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'-'),
+        "The verified SSH signer evidence is invalid."
+    );
+    validate_fingerprint(fingerprint)?;
+    Ok(fingerprint.to_owned())
+}
+
+fn validate_revocations(tools: &Tools, path: &Path, bytes: &[u8]) -> Result<()> {
+    // OpenSSH validates the complete KRL when it checks the verified key.
+    if bytes.starts_with(b"SSHKRL\n\0") {
+        return Ok(());
+    }
+    let text = std::str::from_utf8(bytes).context("The SSH revocation input is invalid.")?;
+    let mut count = 0;
+    for line in text.lines() {
+        ensure!(
+            line.bytes()
+                .all(|byte| !byte.is_ascii_control() || byte == b'\t'),
+            "The SSH revocation input is invalid."
+        );
+        let line = line.trim_matches([' ', '\t']);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_ascii_whitespace();
+        let kind = words
+            .next()
+            .context("The revoked SSH key type is absent.")?;
+        let key = words
+            .next()
+            .context("The revoked SSH key data is absent.")?;
+        ensure!(
+            (kind.starts_with("ssh-") || kind.starts_with("ecdsa-") || kind.starts_with("sk-"))
+                && !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"+/=".contains(&byte)),
+            "The SSH revocation input is invalid."
+        );
+        count += 1;
+    }
+    if count > 0 {
+        // The list parser can skip bad keys. Each input key needs fingerprint evidence.
+        let output = tools.execute(tools.command().args(["-l", "-E", "sha256", "-f"]).arg(path))?;
+        let output =
+            std::str::from_utf8(&output).context("The SSH revocation input is invalid.")?;
+        ensure!(
+            output.lines().count() == count,
+            "The SSH revocation input is invalid."
+        );
+        for line in output.lines() {
+            validate_fingerprint(
+                line.split_whitespace()
+                    .nth(1)
+                    .context("The revoked SSH key fingerprint is absent.")?,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn public_identity(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -657,52 +779,96 @@ pub fn snapshot(artifact: &Path, kind: Kind, trust: &Trust) -> Result<VerifiedSn
         .open(&artifact)?;
     let sha256 = copy_digest(input, &mut output)?;
     drop(output);
-    let verified = verify_digest(kind, &sha256, trust)?;
+    let (verified, trust) = authenticate(kind, &sha256, trust)?;
     Ok(VerifiedSnapshot {
         verified,
         _directory: directory,
         artifact,
+        trust,
     })
 }
 
 pub fn verify_digest(kind: Kind, sha256: &str, trust: &Trust) -> Result<Verified> {
+    Ok(authenticate(kind, sha256, trust)?.0)
+}
+
+pub fn verify_digest_bytes(
+    kind: Kind,
+    sha256: &str,
+    identity: &str,
+    signature: &[u8],
+    allowed_signers: &[u8],
+    revoked_keys: Option<&[u8]>,
+) -> Result<Verified> {
     let envelope = envelope(kind, sha256)?;
     ensure!(
-        !trust.identity.is_empty()
-            && trust
-                .identity
+        !identity.is_empty()
+            && identity
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || b"_.@+-".contains(&byte))
-            && trust.identity.as_bytes()[0].is_ascii_alphanumeric(),
+            && identity.as_bytes()[0].is_ascii_alphanumeric(),
         "The trusted signer identity must be explicit."
     );
-    let signature = control_bytes(&absolute(&trust.signature)?)?;
-    let allowed_signers = control_bytes(&absolute(&trust.allowed_signers)?)?;
-    let allowed_signers_sha256 = digest(allowed_signers.as_slice())?;
+    for bytes in [signature, allowed_signers].into_iter().chain(revoked_keys) {
+        ensure!(
+            bytes.len() as u64 <= MAX_CONTROL_BYTES,
+            "The signature control data is too large."
+        );
+    }
+    let allowed_signers_sha256 = digest(allowed_signers)?;
+    let revoked_keys_sha256 = revoked_keys.map(digest).transpose()?;
     let tools = Tools::new()?;
-    let signature = tools.write("signature", &signature)?;
-    let allowed_signers = tools.write("allowed-signers", &allowed_signers)?;
+    let signature = tools.write("signature", signature)?;
+    let allowed_signers = tools.write("allowed-signers", allowed_signers)?;
     let envelope = tools.write("envelope", envelope.as_bytes())?;
-    tools.execute(
-        tools
-            .command()
-            .args(["-Y", "verify", "-f"])
-            .arg(allowed_signers)
-            .arg("-I")
-            .arg(&trust.identity)
-            .args(["-n", kind.namespace(), "-s"])
-            .arg(signature)
-            .stdin(File::open(envelope)?),
-    )?;
+    let mut command = tools.command();
+    command
+        .args(["-Y", "verify", "-f"])
+        .arg(allowed_signers)
+        .arg("-I")
+        .arg(identity)
+        .args(["-n", kind.namespace(), "-s"])
+        .arg(signature)
+        .stdin(File::open(envelope)?);
+    if let Some(bytes) = revoked_keys {
+        let path = tools.write("revoked-keys", bytes)?;
+        validate_revocations(&tools, &path, bytes)?;
+        command.arg("-r").arg(path);
+    }
+    let output = tools.execute(&mut command)?;
+    let signer_fingerprint = verified_fingerprint(&output, kind, identity)?;
     Ok(Verified {
         schema_version: 1,
         authorizes_acceptance: false,
         kind,
         sha256: sha256.to_owned(),
-        identity: trust.identity.clone(),
+        identity: identity.to_owned(),
         allowed_signers_sha256,
+        signer_fingerprint,
+        revoked_keys_sha256,
         namespace: kind.namespace().to_owned(),
     })
+}
+
+fn authenticate(kind: Kind, sha256: &str, trust: &Trust) -> Result<(Verified, TrustSnapshot)> {
+    let inputs = TrustSnapshot {
+        signature: control_bytes(&absolute(&trust.signature)?)?,
+        allowed_signers: control_bytes(&absolute(&trust.allowed_signers)?)?,
+        revoked_keys: trust
+            .revoked_keys
+            .as_deref()
+            .map(|path| control_bytes(&absolute(path)?))
+            .transpose()?,
+    };
+    let verified = verify_digest_bytes(
+        kind,
+        sha256,
+        &trust.identity,
+        &inputs.signature,
+        &inputs.allowed_signers,
+        inputs.revoked_keys.as_deref(),
+    )?;
+    Ok((verified, inputs))
 }
 
 #[cfg(test)]
@@ -765,6 +931,7 @@ mod tests {
             Ok(Trust {
                 signature: signature.to_owned(),
                 allowed_signers,
+                revoked_keys: None,
                 identity: "reviewer@example.test".to_owned(),
             })
         }
@@ -780,6 +947,8 @@ mod tests {
             assert_eq!(verified.sha256, report.sha256);
             assert_eq!(verified.identity, trust.identity);
             assert_eq!(verified.namespace, report.namespace);
+            assert_eq!(verified.signer_fingerprint, report.signer_fingerprint);
+            assert_eq!(verified.revoked_keys_sha256, None);
             assert!(!verified.authorizes_acceptance);
             assert!(!report.authorizes_acceptance);
             assert_eq!(
@@ -811,6 +980,107 @@ mod tests {
             fs::write(&report.signature, signature)?;
             assert!(verify(&fixture.artifact, kind, &trust).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn revocation_selects_keys_not_allowed_identities() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let reviewer = fixture.sign(Kind::Bundle)?;
+        let other = sign(
+            &fixture.source,
+            &fixture.artifact,
+            Kind::Bundle,
+            &fixture.other,
+            &fixture.root.join("other.sig"),
+        )?;
+        let mut trust = fixture.trust(&reviewer.signature, &fixture.reviewer)?;
+        let reviewer_public = fs::read_to_string(fixture.reviewer.with_extension("pub"))?;
+        let other_public = fs::read_to_string(fixture.other.with_extension("pub"))?;
+        fs::write(
+            &trust.allowed_signers,
+            format!("reviewer@example.test {other_public}reviewer@example.test {reviewer_public}"),
+        )?;
+        assert_eq!(
+            verify(&fixture.artifact, Kind::Bundle, &trust)?.signer_fingerprint,
+            reviewer.signer_fingerprint
+        );
+        for krl in [false, true] {
+            let revoked = fixture
+                .root
+                .join(if krl { "revoked.krl" } else { "revoked.pub" });
+            if krl {
+                let tools = Tools::new()?;
+                tools.execute(
+                    tools
+                        .command()
+                        .args(["-q", "-k", "-f"])
+                        .arg(&revoked)
+                        .arg(fixture.reviewer.with_extension("pub")),
+                )?;
+            } else {
+                fs::write(&revoked, format!("# revoked reviewer\n{reviewer_public}"))?;
+            }
+            trust.revoked_keys = Some(revoked.clone());
+            trust.signature = reviewer.signature.clone();
+            assert!(verify(&fixture.artifact, Kind::Bundle, &trust).is_err());
+            trust.signature = other.signature.clone();
+            let authenticated = snapshot(&fixture.artifact, Kind::Bundle, &trust)?;
+            let revoked_bytes = fs::read(&revoked)?;
+            assert_eq!(
+                authenticated.verified.signer_fingerprint,
+                other.signer_fingerprint
+            );
+            assert_eq!(
+                authenticated.verified.revoked_keys_sha256,
+                Some(digest(revoked_bytes.as_slice())?)
+            );
+            assert_eq!(authenticated.signature(), fs::read(&other.signature)?);
+            assert_eq!(
+                authenticated.allowed_signers(),
+                fs::read(&trust.allowed_signers)?
+            );
+            fs::write(&revoked, b"changed revocation input\n")?;
+            assert_eq!(authenticated.revoked_keys(), Some(revoked_bytes.as_slice()));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_revocation_inputs_cannot_be_invalid_or_unsafe() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let report = fixture.sign(Kind::Baseline)?;
+        let mut trust = fixture.trust(&report.signature, &fixture.reviewer)?;
+        let revoked = fixture.root.join("revoked");
+        trust.revoked_keys = Some(revoked.clone());
+        let other = fs::read(fixture.other.with_extension("pub"))?;
+        for invalid in [
+            b"not a public key\n".as_slice(),
+            b"ssh-ed25519 AAAA\n".as_slice(),
+            b"SSHKRL\n\0invalid".as_slice(),
+            b"# comment\0hidden input\n".as_slice(),
+        ] {
+            fs::write(&revoked, invalid)?;
+            assert!(verify(&fixture.artifact, Kind::Baseline, &trust).is_err());
+        }
+        let mut mixed = other;
+        mixed.extend_from_slice(b"ssh-ed25519 AAAA\n");
+        fs::write(&revoked, mixed)?;
+        assert!(verify(&fixture.artifact, Kind::Baseline, &trust).is_err());
+        fs::write(&revoked, b"")?;
+        assert_eq!(
+            verify(&fixture.artifact, Kind::Baseline, &trust)?.revoked_keys_sha256,
+            Some(digest(b"".as_slice())?)
+        );
+        File::create(&revoked)?.set_len(MAX_CONTROL_BYTES + 1)?;
+        assert!(verify(&fixture.artifact, Kind::Baseline, &trust).is_err());
+        fs::remove_file(&revoked)?;
+        assert!(verify(&fixture.artifact, Kind::Baseline, &trust).is_err());
+        symlink(fixture.other.with_extension("pub"), &revoked)?;
+        assert!(verify(&fixture.artifact, Kind::Baseline, &trust).is_err());
+        fs::remove_file(&revoked)?;
+        fs::create_dir(&revoked)?;
+        assert!(verify(&fixture.artifact, Kind::Baseline, &trust).is_err());
         Ok(())
     }
 

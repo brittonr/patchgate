@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
+use fs2::FileExt;
 use serde::{Deserialize, Deserializer, Serialize};
 use tempfile::TempDir;
 
@@ -309,7 +310,7 @@ impl Pijul {
         paths: &BTreeSet<String>,
     ) -> Result<ReviewChange> {
         self.check_paths(paths)?;
-        let directory = tempfile::tempdir()?;
+        let directory = private_source_directory()?;
         let destination = directory.path().join("candidate");
         self.run([
             OsStr::new("init"),
@@ -501,7 +502,7 @@ impl Pijul {
         let mut paths = crate::change::touched_paths(log_paths, text);
         let targets = crate::change::rename_targets(text);
         if !targets.is_empty() {
-            let directory = tempfile::tempdir()?;
+            let directory = private_source_directory()?;
             let archive = directory.path().join("channel.tar.gz");
             self.run([
                 OsStr::new("archive"),
@@ -574,7 +575,7 @@ impl Pijul {
     }
 
     fn export_archive(&self, channel: &str, destination: &Path, conflicts: bool) -> Result<()> {
-        let directory = tempfile::tempdir()?;
+        let directory = private_source_directory()?;
         let archive = directory.path().join("channel.tar.gz");
         let (_, stderr) = self.call([
             OsStr::new("archive"),
@@ -607,7 +608,7 @@ impl Pijul {
         path: &str,
         reader: impl FnOnce(&Path, &str) -> Result<T>,
     ) -> Result<T> {
-        let directory = tempfile::tempdir()?;
+        let directory = private_source_directory()?;
         let archive = directory.path().join("channel.tar.gz");
         self.run([
             OsStr::new("archive"),
@@ -620,12 +621,18 @@ impl Pijul {
     }
 
     pub fn conflicts(&self) -> Result<Vec<crate::change::Conflict>> {
-        let directory = tempfile::tempdir()?;
+        let directory = private_source_directory()?;
         let archive = directory.path().join("channel.tar.gz");
         let (_, stderr) =
             self.call([OsStr::new("archive"), OsStr::new("-o"), archive.as_os_str()])?;
         Ok(crate::change::conflict_report(&stderr))
     }
+}
+
+fn private_source_directory() -> Result<TempDir> {
+    let directory = tempfile::tempdir()?;
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))?;
+    Ok(directory)
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
@@ -1137,6 +1144,20 @@ impl Signer {
                 .parent()
                 .context("Gate key has no parent directory")?,
         )?;
+        // Concurrent processes can merge at the same time. Create the key once.
+        let lock = safe_path(
+            &self.repo,
+            self.key.with_extension("lock").strip_prefix(&self.repo)?,
+        )?;
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&lock)?;
+        lock.lock_exclusive()?;
+        let _key_lock = lock;
         if !self.key.exists() {
             let executable = find_executable("ssh-keygen")
                 .context("ssh-keygen is not in an absolute PATH directory")?;
@@ -1244,6 +1265,21 @@ mod safety_tests {
     use super::*;
     use flate2::{Compression, write::GzEncoder};
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn source_helper_directory_blocks_group_and_other_access() -> Result<()> {
+        let directory = private_source_directory()?;
+        assert_eq!(
+            fs::metadata(directory.path())?.permissions().mode() & 0o777,
+            0o700
+        );
+        fs::write(directory.path().join("captured-source"), b"private source")?;
+        assert_eq!(
+            fs::read(directory.path().join("captured-source"))?,
+            b"private source"
+        );
+        Ok(())
+    }
 
     fn source_fixture(
         tar: &mut tar::Builder<GzEncoder<File>>,
@@ -1478,6 +1514,17 @@ mod safety_tests {
             ],
             &environment.vars,
         )?;
+        let captured = pijul.read_channel_file("main", "source.bin", |archive, path| {
+            assert_eq!(
+                fs::metadata(archive.parent().context("Archive has no parent")?)?
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            read_archive_bytes(archive, path)
+        })?;
+        assert_eq!(captured.as_deref(), Some(b"\0\xffrecorded\r\n".as_slice()));
         fs::write(repo.join("source.bin"), b"unrecorded")?;
         fs::write(repo.join("host-secret"), b"secret")?;
         fs::create_dir(repo.join("target"))?;

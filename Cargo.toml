@@ -29,4 +29,5 @@ serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
 tar = "0.4"
 tempfile = "3"
+toml = "0.8"
 ureq = { version = "3", features = ["json"] }

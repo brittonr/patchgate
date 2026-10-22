@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::configuration::{self, Evidence};
 use crate::gate::Settings;
-use crate::model::{Api, Model};
+use crate::model::Model;
 use crate::pijul::{Pijul, safe_path};
 use crate::verify;
 
@@ -822,12 +822,14 @@ fn supports_expected_state(help: &str) -> bool {
 }
 
 fn inspect_model(report: &mut Report, settings: &Settings, timeout: Duration) {
-    let api = match settings.model_api {
-        Api::OpenAi => "openai",
-        Api::SystemOne => "systemone",
+    let api = settings.model_api.as_str();
+    let selected = match &settings.model_profile {
+        Some(name) => format!("model profile {name:?}"),
+        None => "the environment model settings".into(),
     };
     let repair = Some(format!(
-        "Start the configured model server. Set PATCHGATE_MODEL_URL, PATCHGATE_MODEL, and PATCHGATE_MODEL_API={api}, then run patchgate doctor."
+        "Start the server for {selected}. Or select another profile with PATCHGATE_MODEL_PROFILE and run patchgate doctor. \
+         The variables PATCHGATE_MODEL_URL, PATCHGATE_MODEL, and PATCHGATE_MODEL_API={api} override a profile."
     ));
     if timeout.is_zero() || settings.model.trim().is_empty() {
         report.add(
@@ -838,6 +840,19 @@ fn inspect_model(report: &mut Report, settings: &Settings, timeout: Duration) {
         );
         return;
     }
+    // Key-file problems are local configuration, so their detail is safe.
+    let model_key = match settings.model_key() {
+        Ok(key) => key,
+        Err(error) => {
+            report.add(
+                "model.readiness",
+                Status::Error,
+                format!("The selected model profile has no usable key file: {error:#}"),
+                repair,
+            );
+            return;
+        }
+    };
     // Only fixed public data enters this request. Do not add repository data here.
     let result = (|| -> Result<bool> {
         let state = serde_json::value::RawValue::from_string(
@@ -849,6 +864,7 @@ fn inspect_model(report: &mut Report, settings: &Settings, timeout: Duration) {
             timeout,
             settings.model_api,
             settings.model_revision.as_deref(),
+            model_key.as_deref(),
         )?;
         Ok(model
             .review(
@@ -903,12 +919,16 @@ fn inspect_nix(report: &mut Report, timeout: Duration) {
 
 fn sandbox_repair() -> String {
     let restart = if cfg!(target_os = "macos") {
-        "sudo launchctl kickstart -k system/org.nixos.nix-daemon"
+        "sudo launchctl kickstart -k system/systems.determinate.nix-daemon (Determinate Nix) \
+         or system/org.nixos.nix-daemon (Nix)"
     } else {
         "sudo systemctl restart nix-daemon"
     };
     format!(
-        "On the daemon host, run: sudoedit /etc/nix/nix.conf. Set sandbox = true. Remove broad host-directory entries from sandbox-paths. Restart the daemon with: {restart}"
+        "On the daemon host, set sandbox = true in the Nix configuration. \
+         On Determinate Nix, edit /etc/nix/nix.custom.conf. \
+         Remove broad host-directory entries from sandbox-paths. \
+         Restart the host daemon with: {restart}"
     )
 }
 
@@ -1034,6 +1054,7 @@ pub fn show(report: &Report) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Api;
     use serde_json::json;
     use std::os::unix::fs::symlink;
 
@@ -1091,6 +1112,37 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn unusable_key_files_report_their_own_error_without_the_key() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let directory = tempfile::tempdir()?;
+        let key = directory.path().join("key");
+        std::fs::write(&key, "sk-private\n")?;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644))?;
+        let mut settings = Settings::from_env(
+            directory.path().to_path_buf(),
+            "inbox".into(),
+            "main".into(),
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        settings.model_key_file = Some(key.clone());
+        let mut report = Report {
+            schema_version: 1,
+            ok: true,
+            checks: Vec::new(),
+            configuration: None,
+        };
+        inspect_model(&mut report, &settings, Duration::from_secs(1));
+        assert_eq!(report.checks.len(), 1);
+        assert!(report.checks[0].status == Status::Error);
+        let detail = &report.checks[0].detail;
+        assert!(detail.contains("chmod 600"), "{detail}");
+        assert!(!detail.contains("sk-private"));
         Ok(())
     }
 
