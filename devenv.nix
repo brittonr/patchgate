@@ -37,12 +37,8 @@ in
   # <!-- ste-disable-next-line semicolon -->
   outputs.runtime-check = runtimeCheck;
 
-  # patchgate sends each change to a model server with an OpenAI-compatible API.
-  # LM Studio gives this API on port 1234. Ollama and llama.cpp also give it.
-  # <!-- ste-disable-next-line semicolon -->
-  env.PATCHGATE_MODEL_URL = "http://127.0.0.1:1234/v1";
-  # <!-- ste-disable-next-line semicolon -->
-  env.PATCHGATE_MODEL = "google/gemma-4-e4b";
+  # Model defaults come from the application.
+  # Profiles and environment values can override them.
   # These files control the gate. A human must accept each change to them.
   # patchgate always protects POLICY.md.
   # <!-- ste-disable-next-line semicolon -->

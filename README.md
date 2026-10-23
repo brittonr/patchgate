@@ -367,7 +367,7 @@ These measurements use the former Python implementation, not the Rust port. They
 
 | Model | Two greetings at one place | A deleted function that the other change edits | Two values for one port | Time |
 | --- | --- | --- | --- | --- |
-| `google/gemma-4-e4b` (the default) | both sides | the deletion wins | escalated by patchgate | 39 s |
+| `google/gemma-4-e4b` | both sides | the deletion wins | escalated by patchgate | 39 s |
 | `ternary-bonsai-27b-mlx` | both sides | restore the deleted lines with the edit | escalated by patchgate | 2 min 18 s |
 
 LM Studio estimates that `qwen/qwen3.6-27b` needs 21 GiB, so its guardrails refuse that model on this machine. A thinking model on LM Studio can put its answer in `reasoning_content`, and patchgate reads that field when `content` is empty.
@@ -397,25 +397,32 @@ Raw results remain in `.devenv/clef-tests/clef-flash-4bit.json` and `.devenv/cle
 
 ### SystemOne API
 
-CLEF uses typed decisions, not text generation. Use the bundled `clef_mlx.py` loader from the [MLX checkpoints](https://huggingface.co/mlx-community/clef-flash-4bit). The loader executes the backbone and the joint decision head. LM Studio text generation does not execute that decision head.
+CLEF uses typed decisions, not text generation.
+Use the bundled `clef_mlx.py` loader from the [full MLX checkpoint](https://huggingface.co/mlx-community/clef-4bit).
 
-Set `PATCHGATE_MODEL_API=systemone` for a server with a `/v1/systemone` endpoint. Keep the `/v1` suffix in `PATCHGATE_MODEL_URL`. patchgate submits typed choice questions, never generated text.
+The loader executes the backbone and the joint decision head.
+LM Studio text generation does not execute that decision head.
+
+`systemone` is the default API. It sends typed choices to `/v1/systemone`, never generated text.
+Keep the `/v1` suffix in `PATCHGATE_MODEL_URL`.
 
 SystemOne receives the structured review object in `state`.
 Chat receives the same object as JSON user content.
 Both APIs receive exact policy text as trusted instructions, outside that data.
 
 CLEF does not generate a summary or a written reason. The ledger keeps an empty summary and a reason that states the selected option and its probability. Do not treat that probability as proof of correctness.
-The shipped default profile uses chat generation, so the documented LM Studio setup works. Use a SystemOne profile for decisions. `patchgate model` reports the active decision path.
 
-For a local server on port 8123:
+The default uses `mlx-community/clef-4bit` at `http://127.0.0.1:8124/v1`.
+Chat profiles need `api = "openai"`. `patchgate model` reports the active decision path.
+
+From the pinned full-checkpoint directory, start the server:
 
 ```bash
-PATCHGATE_MODEL_API=systemone \
-PATCHGATE_MODEL=mlx-community/clef-flash-4bit \
-PATCHGATE_MODEL_URL=http://127.0.0.1:8123/v1 \
-patchgate review
+python clef_mlx.py serve --model . --name mlx-community/clef-4bit \
+  --host 127.0.0.1 --port 8124 --no-truncate
 ```
+
+Then run `patchgate review` in the repository.
 
 ### Typed policy rules
 
@@ -483,9 +490,34 @@ Requests exceeded the 300-second client timeout.
 An evaluation guard stopped the local model when free disk space fell below 2 GiB.
 A serial restart reached the same disk guard before server readiness.
 
-These results cannot establish a 51-case accuracy rate. The default API remains `openai`.
+This failed run could not establish a 51-case accuracy rate. It did not change the default.
 The failed live report remains in `.devenv/clef-tests/harbor-clef-full-4bit-20261023.json`.
 The probe, rule results, resource limits, and default decision remain in `.devenv/clef-tests/full-clef-local-20261023-summary.json`.
+
+### Serial full-CLEF Harbor result
+
+The next run used the same full checkpoint, with one Harbor trial at a time.
+Client and agent timeouts, verifiers, and the 2 GiB disk guard remained unchanged.
+
+| Task | Correct cases | Review seconds |
+| --- | ---: | ---: |
+| Base decisions | 3/3 | 232.0 |
+| Greeting merge | 2/2 | 305.4 |
+| Policy wording | 18/18 | 1868.0 |
+| Option order | 18/18 | 1675.8 |
+| Injection locations | 15/15 | 1292.4 |
+| Total | 56/56 | 5373.5 |
+
+Each verifier passed. The merge verifier compiled and ran the Rust result with both greetings.
+No unsafe acceptances, unnecessary escalations, or trial exceptions occurred.
+
+The Harbor job took 90 minutes and 53 seconds. Its minimum free disk space was 3.47 GiB.
+The disk guard did not activate.
+
+These results pass the live release gate for the checked revision. The application now uses the typed default.
+
+Raw results remain in `.devenv/clef-tests/harbor-clef-full-4bit-serial-20261023.json`.
+The summary and default-review smoke result remain in `.devenv/clef-tests/full-clef-serial-20261023-summary.json` and `.devenv/clef-tests/full-clef-serial-20261023-default-smoke.json`.
 
 ### Two typed tiers
 
@@ -502,9 +534,14 @@ The decision cache key includes the identity of the larger profile, so a changed
 
 - [devenv](https://devenv.sh) 2.4 or later for source development and Nix builds.
 - Nix 2.31.2 or later for Crane-based source builds.
-- A model server with an OpenAI-compatible API or the SystemOne API. The default is LM Studio at `http://127.0.0.1:1234/v1` with the model `google/gemma-4-e4b`. LM Studio loads the model when the first request comes.
+- A SystemOne server at `http://127.0.0.1:8124/v1` with `mlx-community/clef-4bit` and its typed decision head.
 - An SSH agent with an Ed25519 key. `pijul record` signs each change with a key from the agent.
 - SSH read access to `git@github.com:jeffreyksmithjr/dev-hell.git` for the locked Harbor backend input.
+
+Start the bundled `clef_mlx.py` loader separately.
+Full CLEF lists 32 GB RAM as the [minimum](https://huggingface.co/mlx-community/clef-4bit).
+The 24 GB test host needed heavy swap and free disk space.
+An explicit `openai` profile can use LM Studio or another chat server for replay comparison.
 
 ## Build
 
@@ -1292,11 +1329,23 @@ Select a profile with `PATCHGATE_MODEL_PROFILE=<name>`. Without that variable, t
 Without a profiles file, the environment settings below apply.
 
 ```toml
-default = "local"
+default = "clef"
 
-[profiles.local]
+[profiles.clef]
+url = "http://127.0.0.1:8124/v1"
+model = "mlx-community/clef-4bit"
+api = "systemone"
+revision = "b973b6f405d02f8e9b83208c7e82ddf43a742eb6"
+
+[profiles.flash]
+url = "http://127.0.0.1:8123/v1"
+model = "mlx-community/clef-flash-4bit"
+api = "systemone"
+
+[profiles.chat]
 url = "http://127.0.0.1:1234/v1"
 model = "google/gemma-4-e4b"
+api = "openai"
 
 [profiles.hosted]
 url = "https://api.example.com/v1"
@@ -1306,8 +1355,9 @@ revision = "2026-10-01"
 key_file = "~/.config/patchgate/hosted.key"
 ```
 
-Each profile supports `url`, `model`, `api`, `revision`, and `key_file`. Only `url` and `model` are required.
-The `api` value is `openai` or `systemone`.
+A profile needs `url` and `model`. It can also set `api`, `revision`, and `key_file`.
+
+The default `api` is `systemone`. Chat profiles need an explicit `api = "openai"` after this default change.
 `PATCHGATE_MODEL_URL`, `PATCHGATE_MODEL`, `PATCHGATE_MODEL_API`, and `PATCHGATE_MODEL_REVISION` override the selected profile.
 
 A `key_file` holds a bearer token for one line. patchgate sends it as `Authorization: Bearer <token>`. The file must not be readable by other users: `chmod 600`. patchgate never writes the token to a record, a report, or an error message.
@@ -1318,16 +1368,17 @@ A `key_file` holds a bearer token for one line. patchgate sends it as `Authoriza
 ### Environment settings
 
 
-`devenv.nix` sets these variables. To use a different model one time, set the variable on the command line, for example `PATCHGATE_MODEL=ternary-bonsai-27b-mlx patchgate review`.
+These variables override application defaults and selected profiles.
+Use `PATCHGATE_MODEL_PROFILE=chat patchgate review` to select the example chat profile.
 
 | Variable | Default | Use |
 | --- | --- | --- |
 | `PATCHGATE_MODELS` | `~/.config/patchgate/models.toml` | The model profiles file. |
 | `PATCHGATE_MODEL_PROFILE` | the `default` profile | The profile to select. |
 | `PATCHGATE_MODEL_KEY_FILE` | unset | A bearer key file for the model endpoint. |
-| `PATCHGATE_MODEL_URL` | `http://127.0.0.1:1234/v1` | The API base URL, including `/v1`. Ollama uses `http://127.0.0.1:11434/v1`. A profile supplies this value too. |
-| `PATCHGATE_MODEL` | `google/gemma-4-e4b` | The name of the model on the server. |
-| `PATCHGATE_MODEL_API` | `openai` | Use `openai` for chat completions or `systemone` for typed choices. |
+| `PATCHGATE_MODEL_URL` | `http://127.0.0.1:8124/v1` | The base URL for the selected API, with `/v1`. |
+| `PATCHGATE_MODEL` | `mlx-community/clef-4bit` | The name of the model on the server. |
+| `PATCHGATE_MODEL_API` | `systemone` | Use `systemone` for typed choices or `openai` for chat generation and replay comparison. |
 | `PATCHGATE_MODEL_REVISION` | unset | The declared checkpoint revision. The client does not verify server weights or identity. |
 | `PATCHGATE_PROTECTED` | the gate files | Glob patterns, with commas between them. A human must accept each change to a path that matches. |
 | `PATCHGATE_POLICY` | `POLICY.md` | The policy file in main. patchgate always protects it. |

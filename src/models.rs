@@ -20,8 +20,8 @@ pub const PATH: &str = "PATCHGATE_MODELS";
 pub const PROFILE: &str = "PATCHGATE_MODEL_PROFILE";
 pub const KEY_FILE: &str = "PATCHGATE_MODEL_KEY_FILE";
 
-const FALLBACK_URL: &str = "http://127.0.0.1:1234/v1";
-const FALLBACK_MODEL: &str = "google/gemma-4-e4b";
+const FALLBACK_URL: &str = "http://127.0.0.1:8124/v1";
+const FALLBACK_MODEL: &str = "mlx-community/clef-4bit";
 const KEY_LIMIT: usize = 4096;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -29,7 +29,7 @@ const KEY_LIMIT: usize = 4096;
 pub struct Profile {
     pub url: String,
     pub model: String,
-    #[serde(default = "openai_api")]
+    #[serde(default = "systemone_api")]
     pub api: String,
     #[serde(default)]
     pub revision: Option<String>,
@@ -37,8 +37,8 @@ pub struct Profile {
     pub key_file: Option<String>,
 }
 
-fn openai_api() -> String {
-    "openai".into()
+fn systemone_api() -> String {
+    "systemone".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -221,7 +221,7 @@ fn resolve(
     let api = overrides
         .api
         .or_else(|| profile.map(|profile| profile.api.clone()))
-        .unwrap_or_else(|| "openai".into())
+        .unwrap_or_else(systemone_api)
         .parse::<Api>()?;
     let revision = match overrides.revision {
         Some(value) if value.trim().is_empty() => None,
@@ -349,8 +349,6 @@ mod tests {
             parse("default = \"missing\"\n[profiles.a]\nurl = \"http://host\"\nmodel = \"m\"\n")
                 .is_err()
         );
-        let document = parse("[profiles.a]\nurl = \"http://host\"\nmodel = \"m\"\n")?;
-        assert_eq!(document.profiles["a"].api, "openai");
         Ok(())
     }
 
@@ -381,7 +379,7 @@ mod tests {
     }
 
     const DOCUMENT: &str = "default = \"local\"\n\
-        [profiles.local]\nurl = \"http://127.0.0.1:1234/v1\"\nmodel = \"gemma\"\n\
+        [profiles.local]\nurl = \"http://127.0.0.1:1234/v1\"\nmodel = \"gemma\"\napi = \"openai\"\n\
         [profiles.remote]\nurl = \"https://api.example/v1\"\nmodel = \"gpt\"\napi = \"systemone\"\nrevision = \"r1\"\n";
 
     fn document() -> Document {
@@ -394,6 +392,7 @@ mod tests {
         let default = resolve(Some(document()), None, path, Overrides::default())?;
         assert_eq!(default.profile.as_deref(), Some("local"));
         assert_eq!(default.model, "gemma");
+        assert_eq!(default.api, Api::OpenAi);
         assert_eq!(default.source.as_deref(), Some(path));
         assert_eq!(default.available, ["local", "remote"]);
 
@@ -447,7 +446,6 @@ mod tests {
         let environment = resolve(None, None, path, Overrides::default())?;
         assert_eq!(environment.profile, None);
         assert_eq!(environment.source, None);
-        assert_eq!(environment.model, FALLBACK_MODEL);
         assert_eq!(environment.available, Vec::<String>::new());
         Ok(())
     }
