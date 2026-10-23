@@ -453,17 +453,39 @@ The record keeps no source text in these answers.
 
 ### Measured rule decomposition
 
-A live CLEF Flash run on one benign note change measured the two paths on the Apple M4:
+These Apple M4 runs compare the single verdict with a nine-rule policy.
+The identified-rule fixtures contain benign notes and a change with the vague message `Changes`.
 
-| Path | Model requests | Review time | Global verdict | Decisive rule answers | Result |
-| --- | ---: | ---: | --- | --- | --- |
-| Single verdict | 1 | 5.9 seconds | `accept` 0.8624 | none | `accept` |
-| Nine identified rules | 2 | 39.4 seconds | `accept` 0.8839 | `[R4]` `rejects` 0.3934 | weak answer escalated |
+| Model path | Changes | HTTP requests | Total review seconds | Notes result | Vague-message result |
+| --- | ---: | ---: | ---: | --- | --- |
+| CLEF Flash, single verdict | 1 | 1 | 5.9 | `accept` | not tested |
+| CLEF Flash, nine rules | 2 | 2 | 78.8 | `escalate` | `escalate` |
+| Full CLEF, nine rules | 2 | 4 | 432.0 | `accept` | `escalate` |
 
-CLEF Flash does not answer nine joint rule questions with reliable probabilities.
-It named `[R4]` as rejecting a change that only adds notes.
-Rule decomposition needs a larger typed checkpoint. Keep the single verdict on Flash.
-`PATCHGATE_RULE_CONFIDENCE` stops a weak decisive rule answer from deciding. Such an answer escalates the change.
+In this bounded run, Flash selected a weak reject rule for benign notes.
+Full CLEF selected `accept` for the notes with probability 0.8720.
+Its path and span choices both matched the offered native evidence.
+The accept needed one joint rule request, one path request, and one span request.
+For the vague message, full CLEF selected `escalate` with probability 0.5129 and `[R4]` `rejects` with probability 0.8150.
+The global escalation remained the final decision.
+
+The full checkpoint revision is `b973b6f405d02f8e9b83208c7e82ddf43a742eb6`.
+Its two-question capability probe passed in 43.2 seconds.
+The 24 GB host used 19,197 MiB of swap after the rule run.
+This small result does not approve unattended rule decisions or a default API change.
+Keep the single verdict on Flash until a broader identified-rule evaluation passes.
+`PATCHGATE_RULE_CONFIDENCE` makes a weak decisive rule answer an escalation.
+
+Requests, replies, probabilities, native records, and timings remain in `.devenv/clef-tests/full-clef-local-20261023-rules.json`.
+
+The full-CLEF Harbor job then ran five live tasks. All five returned reward zero, with no trial exceptions.
+Requests exceeded the 300-second client timeout.
+An evaluation guard stopped the local model when free disk space fell below 2 GiB.
+A serial restart reached the same disk guard before server readiness.
+
+These results cannot establish a 51-case accuracy rate. The default API remains `openai`.
+The failed live report remains in `.devenv/clef-tests/harbor-clef-full-4bit-20261023.json`.
+The probe, rule results, resource limits, and default decision remain in `.devenv/clef-tests/full-clef-local-20261023-summary.json`.
 
 ### Two typed tiers
 
@@ -498,6 +520,7 @@ cargo test --locked
 
 `nix/package.nix` first builds shared Cargo dependency artifacts.
 Separate Crane derivations compile and test the application and evaluator from independent Rust source sets.
+The evaluator source set includes the native and replay modules that it shares with the application.
 A final derivation copies both binaries and creates their wrappers.
 The evaluator wrapper always binds to that assembly's application output.
 
@@ -513,6 +536,7 @@ Package tests remain enabled.
 Both outputs exclude build-only vendor directories and compiled artifact archives.
 Docker builds dependency artifacts before it copies Rust source.
 Separate Docker builder stages compile each binary from its own source tree.
+The evaluator Docker stage copies these shared modules before the build.
 `COPY --exclude=bin` needs Dockerfile frontend 1.19 or later.
 The Dockerfile selects the stable frontend.
 
@@ -1372,7 +1396,7 @@ The 22 earlier tasks retain their Python runner.
 | --- | --- |
 | `rust-merge-behavior` | Compile and execute a merged Rust program with both contributions, in either valid order. |
 | `rust-merge-build` | Escalate a nested conflict, accept a complete human resolution, and compile and test both channel snapshots. |
-| `concurrent-review-once` | Serialize two review processes and a human decision without duplicate or lost audit records. |
+| `concurrent-review-once` | Preserve exact decisions during concurrent commands, recover from stale-state refusals, and accept each patch once. |
 | `watch-push-recovery` | Preserve pending changes through a model outage and a real push, recover, and exit promptly on SIGINT. |
 | `crash-restart-acceptance` | Recover model and human acceptance records after process termination, without duplicate audit records. |
 | `crash-restart-merge` | Recover the applied candidate, signed merge, linked audit records, and inbox mirror after process termination. |

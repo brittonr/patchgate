@@ -98,7 +98,7 @@ impl Managed {
         Ok(())
     }
 
-    fn finish(&mut self, timeout: Duration, expected_code: i32) -> Result<ExitStatus> {
+    fn finish(&mut self, timeout: Duration, expected_codes: &[i32]) -> Result<ExitStatus> {
         let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = self.child.try_wait()? {
@@ -123,7 +123,7 @@ impl Managed {
             "stdout": String::from_utf8_lossy(&stdout), "stderr": String::from_utf8_lossy(&stderr)
         }));
         ensure!(
-            status.code() == Some(expected_code),
+            status.code().is_some_and(|code| expected_codes.contains(&code)),
             "{} failed: {}",
             self.name,
             String::from_utf8_lossy(&stderr)
@@ -301,22 +301,44 @@ fn solve_concurrent(dir: &Path, _options: &RunOptions) -> Result<()> {
         json!({"pids": [first.child.id(), second.child.id(), human.child.id()]}),
     );
     hold.release();
-    first.finish(WAIT, 0)?;
-    second.finish(WAIT, 0)?;
-    human.finish(WAIT, 0)?;
-    let after = repo.ledger()?;
+    first.finish(WAIT, &[0, 1])?;
+    second.finish(WAIT, &[0, 1])?;
+    let human_status = human.finish(WAIT, &[0, 1])?;
+    let overlap = repo.ledger()?;
     ensure!(
-        after.first() == before.first(),
+        overlap.first() == before.first(),
         "overlap changed the first decision record"
     );
-    trace.add("ledger-after-overlap", json!(after));
+    trace.add("ledger-after-overlap", json!(overlap));
+    if !human_status.success() {
+        let mut human_recovery = Managed::new(
+            repo.spawn_gate(None, &human_args, &[("USER", "harbor-owner")])?,
+            "human-recovery",
+            &trace,
+            &human_args,
+        );
+        human_recovery.finish(WAIT, &[0])?;
+    }
+    let mut recovery = Managed::new(
+        repo.spawn_gate(Some(&model), &["review"], &settings)?,
+        "recovery-review",
+        &trace,
+        &["review"],
+    );
+    recovery.finish(WAIT, &[0])?;
+    let after = repo.ledger()?;
+    ensure!(
+        after.starts_with(&overlap),
+        "recovery changed the overlap decision history"
+    );
+    trace.add("ledger-after-recovery", json!(after));
     let mut repeat = Managed::new(
         repo.spawn_gate(Some(&model), &["review"], &settings)?,
         "repeat-review",
         &trace,
         &["review"],
     );
-    repeat.finish(WAIT, 0)?;
+    repeat.finish(WAIT, &[0])?;
     ensure!(
         repo.ledger()? == after,
         "repeat review changed the exact decision history"
@@ -399,7 +421,7 @@ fn solve_watch(dir: &Path, _options: &RunOptions) -> Result<()> {
         &trace,
         &["push", "--to-channel", "inbox", "--no-notify", "-a"],
     );
-    push.finish(WAIT, 0)?;
+    push.finish(WAIT, &[0])?;
     watch.alive()?;
     let inbox = repo.hashes("inbox")?;
     ensure!(
@@ -437,7 +459,7 @@ fn solve_watch(dir: &Path, _options: &RunOptions) -> Result<()> {
         json!({"main": repo.hashes("main")?, "ledger": history}),
     );
     watch.interrupt()?;
-    watch.finish(Duration::from_secs(3), 130)?;
+    watch.finish(Duration::from_secs(3), &[130])?;
     ensure!(
         repo.ledger()? == history,
         "SIGINT changed the exact decision history"
@@ -561,8 +583,8 @@ fn process_exit<'a>(events: &'a [Value], name: &str) -> Result<&'a Value> {
         .with_context(|| format!("missing exit observation for {name}"))
 }
 
-fn check_processes(c: &mut Check, events: &[Value], commands: &[(&str, i32)]) -> Result<()> {
-    for &(name, expected_code) in commands {
+fn check_processes(c: &mut Check, events: &[Value], commands: &[(&str, &[i32])]) -> Result<()> {
+    for &(name, expected_codes) in commands {
         let spawned = events
             .iter()
             .find(|entry| entry["event"] == "spawn" && entry["data"]["name"] == name)
@@ -576,8 +598,9 @@ fn check_processes(c: &mut Check, events: &[Value], commands: &[(&str, i32)]) ->
         );
         let exited = process_exit(events, name)?;
         c.require(
-            exited["data"]["pid"] == pid && exited["data"]["code"] == expected_code,
-            format!("{name} must retain its process identity and return {expected_code}"),
+            exited["data"]["pid"] == pid
+                && expected_codes.iter().any(|code| exited["data"]["code"] == *code),
+            format!("{name} must retain its process identity and return one of {expected_codes:?}"),
         );
         c.require(
             !group_exists(pid as u32),
@@ -628,12 +651,16 @@ fn check_concurrent(c: &mut Check) -> Result<()> {
         c,
         &events,
         &[
-            ("reviewer-1", 0),
-            ("reviewer-2", 0),
-            ("human", 0),
-            ("repeat-review", 0),
+            ("reviewer-1", &[0, 1]),
+            ("reviewer-2", &[0, 1]),
+            ("human", &[0, 1]),
+            ("recovery-review", &[0]),
+            ("repeat-review", &[0]),
         ],
     )?;
+    if process_exit(&events, "human")?["data"]["code"] == 1 {
+        check_processes(c, &events, &[("human-recovery", &[0])])?;
+    }
     c.require(
         event_index(&events, "request-held")? < event_index(&events, "overlap")?
             && event_index(&events, "overlap")? < event_index(&events, "request-accepted")?,
@@ -649,9 +676,16 @@ fn check_concurrent(c: &mut Check) -> Result<()> {
     );
     let history = json!(c.repo.ledger()?);
     c.require(
-        event(&events, "ledger-after-overlap")?["data"] == history
+        event(&events, "ledger-after-recovery")?["data"] == history
             && event(&events, "ledger-after-repeat")?["data"] == history,
         "repeat review must preserve every ledger field",
+    );
+    let overlap = event(&events, "ledger-after-overlap")?["data"]
+        .as_array()
+        .context("missing overlap ledger")?;
+    c.require(
+        history.as_array().context("missing final ledger")?.starts_with(overlap),
+        "recovery must preserve the exact overlap decision history",
     );
     let before = event(&events, "ledger-before-overlap")?["data"]
         .as_array()
@@ -693,7 +727,7 @@ fn check_watch(c: &mut Check) -> Result<()> {
     let Some(events) = evidence(c)? else {
         return Ok(());
     };
-    check_processes(c, &events, &[("watch", 130), ("push", 0)])?;
+    check_processes(c, &events, &[("watch", &[130]), ("push", &[0])])?;
     let phases = [
         "request-held",
         "push-visible",

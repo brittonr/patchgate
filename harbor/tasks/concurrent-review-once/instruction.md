@@ -15,7 +15,11 @@ Both channels must retain all three patches and their exact content.
 Each patch must have one final acceptance.
 The protected patch must retain its initial gate escalation and later human acceptance.
 A repeat review must preserve every ledger field.
-All commands must exit cleanly and leave no fixture processes.
+A concurrent command can refuse a stale state with a nonzero exit.
+Repeat a refused human acceptance after the concurrent commands finish.
+Run a recovery review before the repeat review.
+Each recovery command and the repeat review must return zero.
+All commands must leave no fixture processes.
 
 The Rust driver supplies the HTTP barrier and process cleanup:
 

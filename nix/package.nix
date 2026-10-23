@@ -100,7 +100,16 @@ let
   );
 
   compiledEvaluator = compileBinary "patchgate-eval" (
-    pkgs.lib.fileset.fileFilter (file: file.hasExt "rs") (sourceRoot + "/src/bin/patchgate-eval")
+    pkgs.lib.fileset.unions [
+      (pkgs.lib.fileset.fileFilter (file: file.hasExt "rs") (sourceRoot + "/src/bin/patchgate-eval"))
+      (sourceRoot + "/src/artifact.rs")
+      (sourceRoot + "/src/bundle.rs")
+      (sourceRoot + "/src/change.rs")
+      (sourceRoot + "/src/isolation.rs")
+      (sourceRoot + "/src/pijul.rs")
+      (sourceRoot + "/src/release_policy.rs")
+      (sourceRoot + "/src/secrets.rs")
+    ]
   # <!-- ste-disable-next-line semicolon -->
   );
 in

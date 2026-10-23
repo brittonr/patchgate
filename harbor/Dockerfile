@@ -47,6 +47,7 @@ RUN nix-build /build/harbor/environment.nix -A compiledApplication --option sand
 FROM dependencies AS evaluator-builder
 
 COPY src/bin/patchgate-eval /build/src/bin/patchgate-eval
+COPY src/artifact.rs src/bundle.rs src/change.rs src/isolation.rs src/pijul.rs src/release_policy.rs src/secrets.rs /build/src/
 
 RUN nix-build /build/harbor/environment.nix -A compiledEvaluator --option sandbox false --out-link /compiled-evaluator
 
