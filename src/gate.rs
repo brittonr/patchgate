@@ -49,6 +49,8 @@ pub struct Settings {
     pub(crate) escalation_profile: Option<String>,
     /// A typed answer below this probability goes to the larger typed profile.
     pub(crate) escalation_confidence: Option<f64>,
+    /// A decisive rule answer below this probability escalates instead of deciding.
+    pub(crate) rule_confidence: f64,
     max_change_chars: usize,
     pub(crate) timeout: Duration,
     pub(crate) check_timeout: Duration,
@@ -96,6 +98,7 @@ impl Settings {
                 Err(error) => return Err(error.into()),
             },
             escalation_confidence: None,
+            rule_confidence: number("PATCHGATE_RULE_CONFIDENCE", 0.6)?,
             min_confidence: match env::var("PATCHGATE_MIN_CONFIDENCE") {
                 Ok(value) => {
                     let threshold: f64 = value.parse().map_err(|_| {
@@ -134,6 +137,9 @@ impl Settings {
             if !(0.0..=1.0).contains(&value) {
                 bail!("PATCHGATE_ESCALATE_CONFIDENCE must be between 0 and 1");
             }
+        }
+        if !(0.0..=1.0).contains(&self.rule_confidence) {
+            bail!("PATCHGATE_RULE_CONFIDENCE must be between 0 and 1");
         }
         self.escalation_confidence = threshold.or_else(|| {
             self.escalation_profile
@@ -3074,7 +3080,7 @@ impl Gate {
             );
             return Ok(record);
         }
-        let Some(mut verdict) = aggregate_answers(&batch.answers, rules) else {
+        let Some(mut verdict) = aggregate_answers(&batch.answers, rules, self.settings.rule_confidence) else {
             record.execution_error = Some("invalid-model-reply".into());
             record.reason = format!(
                 "The reply of {} has no verdict for every policy rule.",
@@ -4239,6 +4245,7 @@ pub(crate) struct RuleVerdict {
 pub(crate) fn aggregate_answers(
     answers: &BTreeMap<String, crate::model::MergeChoice>,
     rules: &[change::PolicyRule],
+    rule_confidence: f64,
 ) -> Option<RuleVerdict> {
     let verdict = answers.get("review")?;
     let mut any_reject = false;
@@ -4249,6 +4256,7 @@ pub(crate) fn aggregate_answers(
         verdict.confidence.unwrap_or_default()
     )];
     let mut confidence = verdict.confidence;
+    let mut weak = None;
     for rule in rules {
         let answer = answers.get(&format!("rule-{}", rule.id))?;
         parts.push(format!(
@@ -4257,15 +4265,39 @@ pub(crate) fn aggregate_answers(
             answer.choice,
             answer.confidence.unwrap_or_default()
         ));
-        confidence = match (confidence, answer.confidence) {
-            (Some(first), Some(second)) => Some(first.min(second)),
-            _ => None,
-        };
         match answer.choice.as_str() {
-            "rejects" => any_reject = true,
-            "needs-human" => any_human = true,
-            _ => {}
+            "rejects" | "needs-human" => {
+                confidence = match (confidence, answer.confidence) {
+                    (Some(first), Some(second)) => Some(first.min(second)),
+                    _ => None,
+                };
+                if answer.confidence.is_some_and(|value| value >= rule_confidence) {
+                    if answer.choice == "rejects" {
+                        any_reject = true;
+                    } else {
+                        any_human = true;
+                    }
+                } else {
+                    weak = Some((rule, answer));
+                }
+            }
+            "allows" | "not-covered" => {}
+            _ => return None,
         }
+    }
+    if let Some((rule, answer)) = weak {
+        return Some(RuleVerdict {
+            decision: "escalate".into(),
+            reason: format!(
+                "{} Rule [{}] answers {:?} with probability {:.4}, below {:.4}, so a human must decide.",
+                parts.join(" "),
+                rule.id,
+                answer.choice,
+                answer.confidence.unwrap_or_default(),
+                rule_confidence
+            ),
+            confidence,
+        });
     }
     let decision = match verdict.choice.as_str() {
         "reject" => "reject",
@@ -4568,6 +4600,7 @@ mod feature_tests {
             min_confidence: None,
             escalation_profile: None,
             escalation_confidence: None,
+            rule_confidence: 0.6,
             max_change_chars: 100_000,
             timeout: Duration::from_secs(10),
             check_timeout: Duration::from_secs(10),
@@ -5230,6 +5263,7 @@ mod feature_tests {
                 min_confidence: None,
                 escalation_profile: None,
                 escalation_confidence: None,
+                rule_confidence: 0.6,
                 max_change_chars: 100_000,
                 timeout: Duration::from_secs(10),
                 check_timeout: Duration::from_secs(10),
@@ -5545,23 +5579,29 @@ mod feature_tests {
         answers.insert("review".into(), answer("accept", 0.91));
         answers.insert("rule-R1".into(), answer("allows", 0.81));
         answers.insert("rule-R2".into(), answer("not-covered", 0.71));
-        let verdict = aggregate_answers(&answers, &rules).expect("every answer is present");
+        let verdict = aggregate_answers(&answers, &rules, 0.5).expect("every answer is present");
         assert_eq!(verdict.decision, "accept");
-        assert_eq!(verdict.confidence, Some(0.71));
+        assert_eq!(verdict.confidence, Some(0.91));
         answers.insert("rule-R1".into(), answer("rejects", 0.99));
-        let verdict = aggregate_answers(&answers, &rules).expect("every answer is present");
+        let verdict = aggregate_answers(&answers, &rules, 0.5).expect("every answer is present");
         assert_eq!(verdict.decision, "reject");
         answers.insert("rule-R1".into(), answer("allows", 0.99));
         answers.insert("rule-R2".into(), answer("needs-human", 0.60));
-        let verdict = aggregate_answers(&answers, &rules).expect("every answer is present");
+        let verdict = aggregate_answers(&answers, &rules, 0.5).expect("every answer is present");
         assert_eq!(verdict.decision, "escalate");
         assert_eq!(verdict.confidence, Some(0.60));
         answers.insert("review".into(), answer("escalate", 0.95));
         answers.insert("rule-R2".into(), answer("allows", 0.95));
-        let verdict = aggregate_answers(&answers, &rules).expect("every answer is present");
+        let verdict = aggregate_answers(&answers, &rules, 0.5).expect("every answer is present");
         assert_eq!(verdict.decision, "escalate");
+        answers.insert("review".into(), answer("accept", 0.88));
+        answers.insert("rule-R1".into(), answer("rejects", 0.40));
+        answers.insert("rule-R2".into(), answer("not-covered", 0.30));
+        let verdict = aggregate_answers(&answers, &rules, 0.60).expect("every answer is present");
+        assert_eq!(verdict.decision, "escalate");
+        assert!(verdict.reason.contains("below 0.6000"));
         answers.remove("rule-R2");
-        assert!(aggregate_answers(&answers, &rules).is_none());
+        assert!(aggregate_answers(&answers, &rules, 0.5).is_none());
         Ok(())
     }
 

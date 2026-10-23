@@ -451,6 +451,20 @@ A different path or span escalates the change.
 The record keeps every typed answer under `answers`. Each answer holds the operation, the question, the label, the probability, the option count, and the option digest.
 The record keeps no source text in these answers.
 
+### Measured rule decomposition
+
+A live CLEF Flash run on one benign note change measured the two paths on the Apple M4:
+
+| Path | Model requests | Review time | Global verdict | Decisive rule answers | Result |
+| --- | ---: | ---: | --- | --- | --- |
+| Single verdict | 1 | 5.9 seconds | `accept` 0.8624 | none | `accept` |
+| Nine identified rules | 2 | 39.4 seconds | `accept` 0.8839 | `[R4]` `rejects` 0.3934 | weak answer escalated |
+
+CLEF Flash does not answer nine joint rule questions with reliable probabilities.
+It named `[R4]` as rejecting a change that only adds notes.
+Rule decomposition needs a larger typed checkpoint. Keep the single verdict on Flash.
+`PATCHGATE_RULE_CONFIDENCE` stops a weak decisive rule answer from deciding. Such an answer escalates the change.
+
 ### Two typed tiers
 
 Set `PATCHGATE_ESCALATE_PROFILE` to a larger typed profile. That profile must use the SystemOne API.
@@ -1301,6 +1315,7 @@ A `key_file` holds a bearer token for one line. patchgate sends it as `Authoriza
 | `PATCHGATE_MIN_CONFIDENCE` | unset | A typed answer below this selected-label probability becomes `escalate`. Use a value between 0 and 1. |
 | `PATCHGATE_ESCALATE_PROFILE` | unset | A larger typed profile that answers a weak review or conflict again. It must use the SystemOne API. |
 | `PATCHGATE_ESCALATE_CONFIDENCE` | `0.9` | A typed answer below this probability goes to the larger typed profile. It needs `PATCHGATE_ESCALATE_PROFILE`. |
+| `PATCHGATE_RULE_CONFIDENCE` | `0.6` | A `rejects` or `needs-human` rule answer below this probability escalates the change. Use a value between 0 and 1. |
 
 ## Limits
 
