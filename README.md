@@ -1347,7 +1347,7 @@ The 22 earlier tasks retain their Python runner.
 | `human-dependency-override` | Refuse dependent acceptance until a human accepts its rejected prerequisite. |
 | `removed-acceptance-blocks` | Keep a removed acceptance and its dependent out of main, without a decision on the dependent. |
 | `custom-channels-policy` | Use custom channels and policy, protect the policy update, and accept it only through a human decision. |
-| `systemone-review-decisions` | Accept, reject, and escalate independent changes through typed SystemOne answers. |
+| `systemone-review-decisions` | Accept, reject, and escalate independent changes through typed SystemOne answers, one question for each identified policy rule, and two typed citations. A foreign citation escalates. |
 | `systemone-merge-conflict` | Review and merge through SystemOne, with a recorded resolution in both channels. |
 | `systemone-response-recovery` | Preserve state after invalid envelopes or probabilities, recover with a valid answer, and escalate an unknown choice. |
 

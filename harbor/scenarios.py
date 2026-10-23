@@ -915,67 +915,146 @@ def _systemone_snapshot(repo: Path) -> tuple:
 
 
 class SystemOneReviewDecisions:
-    """Independent changes receive the three typed review decisions."""
+    """Identified policy rules receive typed answers, and a wrong citation escalates."""
 
     def setup(self, directory: Path, signer: Signer) -> dict:
-        policy = POLICY + "Escalate a change that adds a request for human review.\n"
+        policy = (
+            "# Review policy\n\n"
+            "1. [R1] Reject a change that adds a TODO.\n"
+            "2. [R2] Escalate a change that adds a request for human review.\n"
+            "3. [R3] Accept other changes.\n"
+        )
         repo = start(directory, signer, {"POLICY.md": policy})
         base = repo.pijul("log", "--channel", "main", "--hash-only").split()
         approved, rejected = concurrent(
             repo,
             ("notes.txt", "public-note-content\n", "Add public notes"),
-            ("secret.txt", "TEST_SECRET=private-secret-content\n", "Add credentials"),
+            ("todo.txt", "TODO: write the report\n", "Add a TODO"),
         )
         with tempfile.TemporaryDirectory() as temporary:
             author = Repo(Path(temporary) / "author", signer.env)
             run("pijul", "clone", "--channel", "main", repo.path, author.path, env=signer.env)
             escalated = author.change({"request.txt": "Request human review: manual-review-content\n"}, "Request a decision")
             author.pijul("push", repo.path, "--to-channel", "inbox", "--no-notify", "-a")
-        return {"approved": approved, "rejected": rejected, "escalated": escalated, "base": base, "policy": policy}
+            misquote = author.change({"misquote.txt": "ordinary-content\n"}, "Add ordinary text")
+            author.pijul("push", repo.path, "--to-channel", "inbox", "--no-notify", "-a")
+        return {
+            "approved": approved,
+            "rejected": rejected,
+            "escalated": escalated,
+            "misquote": misquote,
+            "base": base,
+            "policy": policy,
+        }
 
     def solve(self, directory: Path) -> None:
         def response(body: dict) -> dict:
             state = review_input(body)
+            questions = set(body["questions"])
             if review_contains(state, "notes.txt", "public-note-content"):
-                decision = "accept"
-            elif review_contains(state, "secret.txt", "private-secret-content"):
-                decision = "reject"
+                labels = {"review": "accept", "rule-R1": "not-covered", "rule-R2": "not-covered", "rule-R3": "allows"}
+                path = "notes.txt"
+                attacker = False
+            elif review_contains(state, "todo.txt", "TODO: write the report"):
+                labels = {"review": "reject", "rule-R1": "rejects", "rule-R2": "not-covered", "rule-R3": "not-covered"}
+                path = "todo.txt"
+                attacker = False
             elif review_contains(state, "request.txt", "manual-review-content"):
-                decision = "escalate"
+                labels = {"review": "escalate", "rule-R1": "not-covered", "rule-R2": "needs-human", "rule-R3": "not-covered"}
+                path = "request.txt"
+                attacker = False
+            elif review_contains(state, "misquote.txt", "ordinary-content"):
+                labels = {"review": "accept", "rule-R1": "not-covered", "rule-R2": "not-covered", "rule-R3": "allows"}
+                path = "misquote.txt"
+                attacker = True
             else:
                 raise AssertionError("The review must contain a known change.")
-            return _systemone_answer("review", decision)
+            answers = {}
+            for name in questions:
+                if name in labels:
+                    choice = labels[name]
+                elif name == "path":
+                    criteria = body["questions"][name]["criteria"]
+                    if path not in criteria:
+                        raise AssertionError(f"The path question must offer {path}. It offers {sorted(criteria)}.")
+                    choice = path
+                elif name == "span":
+                    criteria = body["questions"][name]["criteria"]
+                    if not criteria:
+                        raise AssertionError("The span question must offer one native span.")
+                    choice = "ATTACKER 0-999" if attacker else next(iter(criteria))
+                else:
+                    raise AssertionError(f"The scripted model has no answer for {name}.")
+                answers[name] = {"type": "choice", "choice": choice, "confidence": 0.93}
+            return {"answers": answers}
 
         with Model(api="systemone", response=response) as model:
             result = patchgate(directory / "repo", model, "review")
-            assert result.returncode == 0, "The three reviews must succeed."
+            assert result.returncode == 0, "The four reviews must succeed."
 
     def check(self, c: Check) -> None:
         c.within("main", "approved")
-        c.outside("main", "rejected", "escalated")
-        c.within("inbox", "approved", "rejected", "escalated")
+        c.outside("main", "rejected", "escalated", "misquote")
+        c.within("inbox", "approved", "rejected", "escalated", "misquote")
         c.expect(c.hashes("main") == set(c.facts["base"]) | {c.facts["approved"]}, "Main must contain only the approved change and its base.")
         c.expect(
-            c.hashes("inbox") == set(c.facts["base"]) | {c.facts[name] for name in ("approved", "rejected", "escalated")},
-            "Inbox must retain all three independent changes.",
+            c.hashes("inbox") == set(c.facts["base"]) | {c.facts[name] for name in ("approved", "rejected", "escalated", "misquote")},
+            "Inbox must retain all four independent changes.",
         )
         c.expect(c.archive("main")[0] == {"POLICY.md": c.facts["policy"], "notes.txt": "public-note-content\n"}, "Main must contain the policy and exact approved notes only.")
         c.expect(
             c.archive("inbox")[0] == {
                 "POLICY.md": c.facts["policy"],
                 "notes.txt": "public-note-content\n",
-                "secret.txt": "TEST_SECRET=private-secret-content\n",
+                "todo.txt": "TODO: write the report\n",
                 "request.txt": "Request human review: manual-review-content\n",
+                "misquote.txt": "ordinary-content\n",
             },
-            "Inbox must retain the exact contents of all three changes.",
+            "Inbox must retain the exact contents of all four changes.",
         )
-        for name, decision in (("approved", "accept"), ("rejected", "reject"), ("escalated", "escalate")):
+        for name, decision in (
+            ("approved", "accept"),
+            ("rejected", "reject"),
+            ("escalated", "escalate"),
+            ("misquote", "escalate"),
+        ):
             c.last(name, decision, "model")
             records = c.records(name)
             c.expect([(record.get("decision"), record.get("by")) for record in records] == [(decision, "model")], f"{name} must have exactly one model decision.")
-        c.expect(len(_systemone_ledger(c.repo)) == 3, "The ledger must contain exactly the three model decisions.")
+        c.expect(len(_systemone_ledger(c.repo)) == 4, "The ledger must contain exactly the four model decisions.")
+        self._check_answers(c, "approved", ("accept", "not-covered", "not-covered", "allows"), 2)
+        self._check_answers(c, "rejected", ("reject", "rejects", "not-covered", "not-covered"), 0)
+        self._check_answers(c, "escalated", ("escalate", "not-covered", "needs-human", "not-covered"), 0)
+        self._check_answers(c, "misquote", ("accept", "not-covered", "not-covered", "allows"), 1)
+        records = c.records("misquote")
+        if records:
+            misquote = records[-1]
+            operations = [answer.get("operation") for answer in misquote.get("answers", [])]
+            c.expect("evidence" in operations, "The misquoted change must keep its chosen path.")
+            c.expect("ATTACKER 0-999" not in json.dumps(misquote), "A foreign span must not enter the ledger.")
+            c.expect("span" in misquote.get("reason", ""), "A foreign span must escalate with its own reason.")
         c.no_conflict("main")
         c.no_conflict("inbox")
+
+    def _check_answers(self, c: Check, name: str, labels: tuple, citations: int) -> None:
+        records = c.records(name)
+        c.expect(bool(records), f"{name} must have a ledger record.")
+        if not records:
+            return
+        record = records[-1]
+        answers = record.get("answers", [])
+        c.expect(record.get("decision") is not None, f"{name} must keep its decision.")
+        by_question = {answer.get("question"): answer for answer in answers}
+        for question, choice in zip(("review", "rule-R1", "rule-R2", "rule-R3"), labels):
+            answer = by_question.get(question)
+            c.expect(answer is not None, f"{name} must record the answer {question}.")
+            if answer is None:
+                continue
+            c.expect(answer.get("operation") == "review", f"{name} must record {question} in the review operation.")
+            c.expect(answer.get("choice") == choice, f"{name} must answer {question} with {choice}.")
+            c.expect(answer.get("confidence") == 0.93, f"{name} must keep the probability of {question}.")
+        evidence = [answer.get("operation") for answer in answers].count("evidence")
+        c.expect(evidence == citations, f"{name} must record {citations} typed citations, not {evidence}.")
 
 
 class SystemOneMergeConflict:
