@@ -440,6 +440,11 @@ pub fn model_harbor(args: LiveArgs) -> Result<()> {
     let names: Vec<_> = SCENARIOS
         .iter()
         .chain(super::generalization::SCENARIOS)
+        .chain(if args.api == "systemone" {
+            super::typed_rules::SCENARIOS
+        } else {
+            &[]
+        })
         .map(|scenario| scenario.name)
         .collect();
     super::controls::clone_tasks(&args.tasks, &inputs, &names, &env)?;

@@ -102,7 +102,7 @@ pub fn key(
     min_confidence: Option<f64>,
     escalation: Option<&str>,
 ) -> Result<String> {
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "schema_version": SCHEMA_VERSION,
         "candidate": candidate,
         "policy": binding.policy.as_ref().map(|policy| (&policy.path, &policy.sha256)),
@@ -113,6 +113,9 @@ pub fn key(
         "min_confidence": min_confidence,
         "escalation": escalation,
     });
+    if api == "systemone" {
+        value["typed_evidence_version"] = serde_json::json!(1);
+    }
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&value)?)))
 }
 

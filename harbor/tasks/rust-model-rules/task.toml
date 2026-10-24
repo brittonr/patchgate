@@ -1,0 +1,22 @@
+schema_version = "1.4"
+artifacts = [{ source = "/scenarios/rust-model-rules/model-metrics.json", destination = "model-metrics.json" }]
+
+[metadata]
+coverage = "rust-model"
+
+[verifier]
+timeout_sec = 180.0
+
+[agent]
+timeout_sec = 7200.0
+
+[environment]
+docker_image = "patchgate-harbor:dev"
+workdir = "/scenarios/rust-model-rules"
+build_timeout_sec = 900.0
+
+[environment.healthcheck]
+command = "patchgate-eval setup rust-model-rules /scenarios/rust-model-rules"
+timeout_sec = 900.0
+start_period_sec = 0.0
+retries = 1

@@ -29,6 +29,7 @@ mod storage;
 mod structured;
 mod support;
 mod trusted_nix;
+mod typed_rules;
 
 use std::ffi::OsString;
 
@@ -113,6 +114,7 @@ fn scenarios() -> impl Iterator<Item = &'static Scenario> {
         hostile::SCENARIOS,
         real_model::SCENARIOS,
         generalization::SCENARIOS,
+        typed_rules::SCENARIOS,
         stale::SCENARIOS,
         apply_race::SCENARIOS,
         storage::SCENARIOS,
