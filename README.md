@@ -58,7 +58,7 @@ Exact model verdicts also go into `.pijul/patchgate/decisions/`, keyed by the ca
 Typed conflict choices go into `.pijul/patchgate/merges/`, keyed by the conflict prompt, the exact options, and the model identity.
 The gate refuses a cache entry whose key, binding, size, or file type differs.
 An invalid entry causes a model request, not an acceptance.
-The typed review key also includes the evidence protocol version.
+The typed review key also includes the typed review protocol version.
 
 ### Structured review data
 
@@ -431,6 +431,10 @@ Give each rule in the policy a stable identifier, for example `[R1]`. patchgate 
 It also asks the global verdict question, `review`.
 A policy without identifiers keeps the single-verdict path.
 
+Each rule question covers the complete candidate, not one permitted file or edit.
+A rule whose condition does not apply must answer `not-covered`.
+An acceptance rule for other changes applies only when no reject or human-review rule applies.
+
 The labels of a rule question are `allows`, `rejects`, `needs-human`, and `not-covered`.
 patchgate combines the answers in a fixed order:
 
@@ -551,6 +555,35 @@ Minimum free disk space was 12.09 GiB. The disk guard did not activate.
 
 Raw requests, responses, and audit records remain in `.devenv/clef-tests/typed-rules-20261024-live.json`.
 The summary and memory report remain in `.devenv/clef-tests/typed-rules-20261024-summary.json` and `.devenv/clef-tests/typed-rules-20261024-memory.json`.
+
+### Whole-candidate rule result
+
+The next revision adds whole-candidate rule conditions to the typed question instructions.
+It changes no labels, expected answers, fixtures, verifiers, thresholds, or timeouts.
+The typed review cache protocol version is now `2`.
+
+The same full checkpoint passed the strict Harbor verifier with one concurrent trial.
+Both scripted Harbor controls met their expected rewards.
+
+| Run | Complete cases | Exact typed answers | Requests | Review seconds | Peak physical GiB |
+| --- | --- | --- | ---: | ---: | ---: |
+| Three-rule Harbor task | 4/4 | 20/20 | 8 | 440.9 | 16.50 |
+| Nine-rule policy smoke | 1/1 | 12/12 | 3 | 255.8 | 17.27 |
+
+The memory values use macOS `phys_footprint_peak`, which includes graphics memory.
+The GPU limits and disk guard remained unchanged.
+
+`POLICY.md` now uses rule IDs `R1` to `R9`.
+A fresh Pijul repository accepted a benign note change with that exact policy.
+All nine rule answers selected `not-covered`.
+This one-case smoke does not establish a wider accuracy rate.
+
+`rule-R9` selected `not-covered` with probability `0.4480`.
+The existing aggregation uses the global verdict and decisive rule answers for its confidence.
+
+The earlier failed trial remains intact.
+Raw results remain in `.devenv/clef-tests/typed-applicability-20261024-live.json` and `.devenv/clef-tests/typed-applicability-20261024-nine-rule-policy.json`.
+The summary is `.devenv/clef-tests/typed-applicability-20261024-summary.json`.
 
 ### Two typed tiers
 

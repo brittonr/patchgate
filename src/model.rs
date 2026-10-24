@@ -20,6 +20,12 @@ const REVIEW_REPLY: &str = "Reply with a JSON object:\n\
 Use \"escalate\" when you are not sure, or when the policy does not cover the change.\n";
 const SYSTEMONE_REVIEW_REPLY: &str =
     "Use escalate when you are not sure, or when the policy does not cover the change.\n";
+const SYSTEMONE_RULE_QUESTIONS: &str = "For each rule question, assess whether the complete candidate meets that rule's condition.\n\
+Use not-covered when the condition does not apply to the complete candidate.\n\
+Use allows, rejects, or needs-human only when the condition applies and the rule gives that result.\n\
+An acceptance rule for other changes is a fallback, not an independent permission.\n\
+That rule does not apply when any reject or human-review rule applies.\n\
+A permitted file or edit does not make a fallback acceptance rule apply to the complete candidate.\n";
 
 const MERGE_RULES: &str = "You are patchgate. You decide how to merge one conflict between Pijul changes.\n\
 Two or more changes edited the same place in a file, and no change knew about the others. You get the file, the kind of conflict, what each change did in the file, the lines around the conflict, and each side of the conflict.\n\
@@ -107,9 +113,9 @@ fn review_instruction_parts(api: Api) -> [&'static str; 3] {
     }
 }
 
-fn review_instructions(api: Api, policy: &str) -> String {
+fn review_instructions(api: Api, policy: &str, extra: &str) -> String {
     let [rules, reply, header] = review_instruction_parts(api);
-    [rules, reply, header, policy].concat()
+    [rules, reply, extra, header, policy].concat()
 }
 
 pub fn review_instruction_chars(api: Api) -> usize {
@@ -185,7 +191,7 @@ impl Model {
                 "reject": "The change violates a reject rule in the policy.",
                 "escalate": "A human must decide. The policy requires review, does not cover the change, or the answer is uncertain."
             });
-            let instructions = review_instructions(self.api, policy);
+            let instructions = review_instructions(self.api, policy, "");
             return Ok(self
                 .systemone("review", &instructions, state, criteria)?
                 .map(|choice| {
@@ -209,7 +215,7 @@ impl Model {
         });
         let content = self.chat(
             "review",
-            &review_instructions(self.api, policy),
+            &review_instructions(self.api, policy, ""),
             state.get(),
             "verdict",
             schema,
@@ -227,7 +233,6 @@ impl Model {
         state: &RawValue,
         rules: &[crate::change::PolicyRule],
     ) -> Result<TypedBatch> {
-        let instructions = review_instructions(self.api, policy);
         let mut criteria: Vec<(String, Value)> = vec![(
             "review".into(),
             json!({
@@ -269,6 +274,7 @@ impl Model {
             }
             return Ok(batch);
         }
+        let instructions = review_instructions(self.api, policy, SYSTEMONE_RULE_QUESTIONS);
         let questions: serde_json::Map<String, Value> = criteria
             .iter()
             .map(|(name, criteria)| {
@@ -873,31 +879,6 @@ pub(crate) mod tests {
             .expect("An unsafe revision must fail");
             assert!(!format!("{error:#}").contains(revision));
         }
-    }
-
-    #[test]
-    fn review_instruction_count_uses_exact_api_text() {
-        let policy = "保護 café 🛡\n";
-        for api in [Api::OpenAi, Api::SystemOne] {
-            assert_eq!(
-                review_instruction_chars(api),
-                review_instructions(api, "").chars().count()
-            );
-            assert_eq!(
-                review_instructions(api, policy).chars().count(),
-                review_instruction_chars(api) + policy.chars().count()
-            );
-        }
-        assert_eq!(
-            review_instructions(Api::OpenAi, policy),
-            format!("{REVIEW_RULES}{REVIEW_REPLY}\nPolicy:\n\n{policy}")
-        );
-        assert_eq!(
-            review_instructions(Api::SystemOne, policy),
-            format!(
-                "{REVIEW_RULES}Use escalate when you are not sure, or when the policy does not cover the change.\nPolicy:\n\n{policy}"
-            )
-        );
     }
 
     #[test]

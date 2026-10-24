@@ -114,7 +114,7 @@ pub fn key(
         "escalation": escalation,
     });
     if api == "systemone" {
-        value["typed_evidence_version"] = serde_json::json!(1);
+        value["typed_evidence_version"] = serde_json::json!(2);
     }
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&value)?)))
 }
