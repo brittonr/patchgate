@@ -1577,6 +1577,10 @@ Trial-local garbage-collection roots retain input and result paths until the tri
 `cargo test --locked --all-targets` checks parser boundaries, path safety, journal recovery, safe merge choices, and model replies.
 `patchgate-eval smoke` exercises all 41 Rust scenarios with oracle and nop controls.
 
+Native conflict fixtures use replacements with different byte lengths.
+This prevents a native `(mtime, size)` cache hit on the independent edit.
+The fixture checks that each edit creates a distinct native change before it tests conflict refusal.
+
 The storage fault cases need Linux, procfs, Rust, a C linker, and a gate binary with dynamic libc.
 They use a Rust `LD_PRELOAD` library against real file descriptors.
 They do not use production fault flags.

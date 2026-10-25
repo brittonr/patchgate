@@ -1592,15 +1592,18 @@ mod tests {
         fs::write(source.join("value.txt"), "base\n")?;
         fs::write(source.join("POLICY.md"), "Use the recorded policy.\n")?;
         pijul.run(["add", "value.txt", "POLICY.md"])?;
-        native_record(&pijul, &signer, "Define the base")?;
+        let base = native_record(&pijul, &signer, "Define the base")?;
         pijul.run(["fork", "--channel", "main", "inbox"])?;
         pijul.run(["channel", "switch", "inbox"])?;
         fs::write(source.join("value.txt"), "candidate\n")?;
         let candidate = native_record(&pijul, &signer, "Change the value")?;
+        ensure!(candidate != base, "The fixture candidate was not recorded");
         if conflict {
             pijul.run(["channel", "switch", "main"])?;
-            fs::write(source.join("value.txt"), "main\n")?;
-            native_record(&pijul, &signer, "Change main independently")?;
+            // Change the byte length so the native stat cache cannot hide this edit.
+            fs::write(source.join("value.txt"), "independent main\n")?;
+            let independent = native_record(&pijul, &signer, "Change main independently")?;
+            ensure!(independent != base, "The fixture main edit was not recorded");
             pijul.run(["channel", "switch", "inbox"])?;
         }
         fs::write(source.join("value.txt"), "dirty source\n")?;
