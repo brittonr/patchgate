@@ -18,6 +18,7 @@ pub mod provenance;
 pub mod release_policy;
 mod resolution;
 mod review;
+mod review_plan;
 mod secrets;
 mod verify;
 

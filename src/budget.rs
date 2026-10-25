@@ -21,6 +21,20 @@ pub struct FileCost {
     pub total: usize,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum BoundedReview {
+    Planned {
+        planned_pages: usize,
+        core_chars: usize,
+        max_input_chars: usize,
+        unchanged_bytes: usize,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
 /// All costs use Unicode characters, not tokens or model capacity.
 /// Policy and fixed instructions do not use the structured input limit.
 #[derive(Debug, Serialize)]
@@ -38,6 +52,8 @@ pub struct Report {
     /// This excludes policy, transport schemas, and choice criteria.
     pub fixed_instructions: usize,
     pub findings: Vec<Finding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounded_review: Option<BoundedReview>,
 }
 
 #[derive(Default)]
@@ -142,6 +158,32 @@ pub fn report(
         .collect();
     let file_total: usize = files.iter().map(|file| file.total).sum();
     let limit = configuration.values.max_change_chars;
+    let bounded_review = (total > limit).then(|| {
+        if redacted {
+            return BoundedReview::Unavailable {
+                reason: "Credential checks must pass before bounded context review.".into(),
+            };
+        }
+        if api != model::Api::SystemOne {
+            return BoundedReview::Unavailable {
+                reason: "Bounded context review needs the systemone API.".into(),
+            };
+        }
+        match crate::review_plan::Plan::new(candidate, binding, input.get(), limit) {
+            Ok(plan) => BoundedReview::Planned {
+                planned_pages: plan.len(),
+                core_chars: plan.core_chars(),
+                max_input_chars: plan.max_page_chars(),
+                unchanged_bytes: plan.unchanged_bytes(),
+            },
+            Err(reason) => BoundedReview::Unavailable { reason },
+        }
+    });
+    let fixed_instructions = if matches!(&bounded_review, Some(BoundedReview::Planned { .. })) {
+        model::window_instruction_chars()
+    } else {
+        model::review_instruction_chars(api)
+    };
     Ok(Report {
         schema_version: 1,
         limit,
@@ -152,8 +194,9 @@ pub fn report(
         files,
         metadata_framing: total - file_total,
         policy: policy.chars().count(),
-        fixed_instructions: model::review_instruction_chars(api),
+        fixed_instructions,
         findings,
+        bounded_review,
     })
 }
 
@@ -172,6 +215,23 @@ impl fmt::Display for Report {
             "Fixed instructions outside limit: {}",
             self.fixed_instructions
         )?;
+        match &self.bounded_review {
+            Some(BoundedReview::Planned {
+                planned_pages,
+                core_chars,
+                max_input_chars,
+                unchanged_bytes,
+            }) => {
+                writeln!(output, "Bounded typed review: {planned_pages} context windows")?;
+                writeln!(output, "Repeated changed core: {core_chars}")?;
+                writeln!(output, "Largest window input: {max_input_chars}")?;
+                writeln!(output, "Unchanged native bytes: {unchanged_bytes}")?;
+            }
+            Some(BoundedReview::Unavailable { reason }) => {
+                writeln!(output, "Bounded typed review unavailable: {reason}")?;
+            }
+            None => {}
+        }
         writeln!(
             output,
             "File costs include encoded context and metadata context."

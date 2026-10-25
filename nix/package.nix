@@ -61,12 +61,31 @@ let
   # <!-- ste-disable-next-line semicolon -->
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+  # <!-- ste-disable-next-line semicolon sentence-length -->
+  cargoManifest = builtins.fromTOML (builtins.readFile (sourceRoot + "/Cargo.toml"));
+
   # Each target receives only its own Rust source files.
   compileBinary = name: files: craneLib.buildPackage (commonArgs // {
     # <!-- ste-disable-next-line semicolon -->
     pname = "${name}-unwrapped";
     # <!-- ste-disable-next-line semicolon -->
     cargoExtraArgs = "--locked --bin ${name}";
+    # <!-- ste-disable-next-line semicolon sentence-length -->
+    cargoTestExtraArgs = "--tests";
+
+    # Cargo integration tests build every declared binary. Select one target.
+    postPatch = let
+      manifest = cargoManifest // {
+        # <!-- ste-disable-next-line semicolon sentence-length -->
+        package = cargoManifest.package // { default-run = name; };
+        # <!-- ste-disable-next-line semicolon sentence-length -->
+        bin = builtins.filter (binary: binary.name == name) cargoManifest.bin;
+      # <!-- ste-disable-next-line semicolon -->
+      };
+    in ''
+      cp ${craneLib.writeTOML "${name}-Cargo.toml" manifest} Cargo.toml
+    # <!-- ste-disable-next-line semicolon -->
+    '';
 
     src = toString (pkgs.lib.fileset.toSource {
       # <!-- ste-disable-next-line semicolon -->
@@ -95,7 +114,10 @@ let
   rustSources = pkgs.lib.fileset.fileFilter (file: file.hasExt "rs") (sourceRoot + "/src");
 
   compiledApplication = compileBinary "patchgate" (
-    pkgs.lib.fileset.difference rustSources (pkgs.lib.fileset.maybeMissing (sourceRoot + "/src/bin"))
+    pkgs.lib.fileset.unions [
+      (pkgs.lib.fileset.difference rustSources (pkgs.lib.fileset.maybeMissing (sourceRoot + "/src/bin")))
+      (pkgs.lib.fileset.fileFilter (file: file.hasExt "rs") (sourceRoot + "/tests"))
+    ]
   # <!-- ste-disable-next-line semicolon -->
   );
 

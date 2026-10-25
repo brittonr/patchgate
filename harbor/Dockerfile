@@ -41,6 +41,7 @@ SH
 FROM dependencies AS application-builder
 
 COPY --exclude=bin src /build/src
+COPY tests /build/tests
 
 RUN nix-build /build/harbor/environment.nix -A compiledApplication --option sandbox false --out-link /compiled-application
 

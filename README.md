@@ -29,12 +29,15 @@ patchgate examines the inbox changes that are not in main, in the order of the i
 4. If the complete reviewed file set matches `documentation_paths`, patchgate accepts the change without a model request.
    The deterministic checks in step 3 and the trusted Nix checks in step 8 still apply.
 
-5. If the structured review data exceeds `PATCHGATE_MAX_CHANGE_CHARS`, patchgate escalates the change.
-   It never truncates review data.
+5. If complete review data exceeds `PATCHGATE_MAX_CHANGE_CHARS`, patchgate uses bounded SystemOne context windows.
+   Each window must fit that limit.
+   An oversized changed core still escalates without a model request.
+   Chat reviews and conflict prompts also escalate when they exceed the limit.
+   No review data is truncated.
 
-6. Else, patchgate sends structured native context and the trusted policy from main to the model.
+6. patchgate sends structured native context and the trusted policy from main to the model.
    The model accepts, rejects, or escalates the candidate.
-   patchgate reuses an exact earlier verdict when the candidate, the policy bytes, the reviewed main state, and the model identity match.
+   For ordinary reviews, patchgate reuses an earlier verdict when the candidate, policy bytes, reviewed main state, and model identity match.
    A reused record has `reused: true`, and it makes no model request.
 
 7. patchgate applies the accepted changes that are ready together to one scratch clone of main.
@@ -54,7 +57,8 @@ patchgate examines the inbox changes that are not in main, in the order of the i
 patchgate reads the policy from main, not from the working copy. Thus a pending change cannot change the rules for its own review. A change to `POLICY.md` always goes to a human.
 
 The decisions and the merges go into `.pijul/patchgate/ledger.jsonl`.
-Exact model verdicts also go into `.pijul/patchgate/decisions/`, keyed by the candidate, policy bytes, reviewed main state, model identity, and confidence threshold.
+Ordinary model verdicts also go into `.pijul/patchgate/decisions/`.
+The key includes the candidate, policy bytes, reviewed main state, model identity, and confidence threshold.
 Typed conflict choices go into `.pijul/patchgate/merges/`, keyed by the conflict prompt, the exact options, and the model identity.
 The gate refuses a cache entry whose key, binding, size, or file type differs.
 An invalid entry causes a model request, not an acceptance.
@@ -62,7 +66,7 @@ The typed review key also includes the typed review protocol version.
 
 ### Structured review data
 
-Review data uses schema version 1 with `candidate` and `binding` objects.
+Ordinary review data uses schema version 1 with `candidate` and `binding` objects.
 The candidate contains its hash, message, authors, timestamp, actual dependencies, and full repository paths.
 `pijul change --context` supplies native vertices with exact text, origin hashes, byte ranges, and `add`, `del`, or `keep` kinds.
 Context references do not become prerequisites.
@@ -467,6 +471,43 @@ The live rule verifier also checks the expected path and span.
 The record keeps every typed answer under `answers`. Each answer holds the operation, the question, the label, the probability, the option count, and the option digest.
 The record keeps no source text in these answers.
 
+### Bounded complete-context review
+
+SystemOne uses bounded context windows when complete review data exceeds `PATCHGATE_MAX_CHANGE_CHARS`.
+Requests that already fit keep schema version 1 and the existing verdict cache.
+Bounded requests use schema version 2 with `candidate`, `binding`, `coverage`, and `context_window`.
+The candidate marks its native context `full: false`.
+
+Each request includes all added and deleted spans, candidate metadata, metadata context, and the trusted policy.
+The planner divides unchanged native text between windows without truncation.
+Every unchanged native byte occurs in exactly one window.
+Fragments retain original paths, hashes, and byte coordinates, with complete UTF-8 characters.
+
+Each window asks `review`, every identified rule, and a `context` choice: `sufficient` or `needs-context`.
+Acceptance needs valid answers, accepted policy decisions, and a strong `sufficient` answer from every planned window.
+`PATCHGATE_RULE_CONFIDENCE` sets the minimum probability for `sufficient`.
+Existing confidence thresholds and the optional larger typed model also apply.
+
+One rejecting window rejects the candidate.
+One escalation or `needs-context` stops review without acceptance.
+An invalid or absent answer returns an explicit error.
+Capacity refusals stop the command without acceptance.
+The final native citation checks run only after every window passes.
+
+The gate checks main before each window and after every reply.
+A state change or interruption prevents acceptance.
+Bounded reviews do not reuse verdict cache entries.
+
+The record's `coverage` identifies the complete input digest, planned page count, and completion status.
+Each page records native ranges, its input digest, decision, and offsets into `answers` and `provenance.requests`.
+Answer operations identify `review-window` and `review-window-escalation`.
+Coverage metadata contains no source text.
+
+`coverage.complete` means all windows passed.
+It does not prove a correct policy decision or authorize acceptance alone.
+An oversized changed core, chat review, or conflict prompt still needs a human when it exceeds the whole-input limit.
+
+
 ### Measured rule decomposition
 
 These Apple M4 runs compare the single verdict with a nine-rule policy.
@@ -631,6 +672,10 @@ Crane v0.23.3 provides `buildDepsOnly` and `buildPackage`.
 `nix/checks.json` pins its revision and NAR hash for standalone builds and trusted checks.
 
 `Cargo.toml` declares both binary targets.
+Each binary build uses a generated manifest that declares only its target.
+The application source set also includes the Rust files in `tests/`.
+Both package checks run all test targets from their own source sets.
+
 The dependency build receives only materialized `Cargo.toml` and `Cargo.lock` files.
 Rust source changes reuse compiled dependencies.
 Dependency feature changes select new artifacts.
@@ -984,10 +1029,21 @@ It never truncates review data.
 | `policy` | Policy character count outside the structured input limit. |
 | `fixed_instructions` | API review instructions without policy, transport schemas, or typed-choice criteria. |
 | `findings` | Safe locations and rule IDs for supported credential formats. |
+| `bounded_review` | Bounded review plan, or its refusal reason, when the complete input exceeds the limit. |
 
 File costs plus `metadata_framing` equal `total`.
 Equality with the limit does not cause escalation.
 These counts do not measure tokens or the server context capacity.
+
+`bounded_review.status` is `planned` when the complete changed core and each context window fit.
+The plan reports `planned_pages`, `core_chars`, `max_input_chars`, and `unchanged_bytes`.
+`core_chars` counts the repeated changed core with an empty context window and one-digit page fields.
+`max_input_chars` is the largest encoded window.
+`unchanged_bytes` counts native unchanged UTF-8 bytes, not Unicode characters.
+
+An unavailable plan reports `status: "unavailable"` and `reason`.
+`exceeds_limit` still describes the complete input.
+It does not mean bounded review is unavailable.
 
 Reports omit source text, messages, authors, and policy bytes.
 Credential findings cause redaction of all reported file names without changes to cost counts.
@@ -1448,7 +1504,7 @@ Use `PATCHGATE_MODEL_PROFILE=chat patchgate review` to select the example chat p
 | `PATCHGATE_MODEL_REVISION` | unset | The declared checkpoint revision. The client does not verify server weights or identity. |
 | `PATCHGATE_PROTECTED` | the gate files | Glob patterns, with commas between them. A human must accept each change to a path that matches. |
 | `PATCHGATE_POLICY` | `POLICY.md` | The policy file in main. patchgate always protects it. |
-| `PATCHGATE_MAX_CHANGE_CHARS` | `8000` | Escalate a longer serialized review object or conflict prompt without the model. |
+| `PATCHGATE_MAX_CHANGE_CHARS` | `8000` | Structured input limit per review request or conflict prompt. SystemOne can divide unchanged context between bounded requests. |
 | `PATCHGATE_TIMEOUT` | `300` | The seconds to wait for one reply. The first reply includes the time to load the model. |
 | `PATCHGATE_CHECK_TIMEOUT` | `900` | The positive seconds allowed for Nix verification of one candidate. |
 | `PATCHGATE_INBOX`, `PATCHGATE_MAIN` | `inbox`, `main` | The channel names. The `--inbox` and `--main` options also set them. |
@@ -1458,12 +1514,19 @@ Use `PATCHGATE_MODEL_PROFILE=chat patchgate review` to select the example chat p
 | `PATCHGATE_ESCALATE_CONFIDENCE` | `0.9` | A typed answer below this probability goes to the larger typed profile. It needs `PATCHGATE_ESCALATE_PROFILE`. |
 | `PATCHGATE_RULE_CONFIDENCE` | `0.6` | A `rejects` or `needs-human` rule answer below this probability escalates the change. Use a value between 0 and 1. |
 
+`PATCHGATE_CHECK_TIMEOUT` must produce a finite, positive duration.
+Zero and values that round to zero nanoseconds stop the command.
+
 ## Limits
 
 - The working copy is on `inbox`, so it contains changes that main does not have. patchgate controls main. It does not isolate the code in the inbox.
-- The character limit applies to the complete serialized review object, not only patch text.
-  A small edit in a large file can exceed it.
-  Policy instructions and replies also need space in the model context.
+- The character limit applies to each complete serialized review request, not only patch text.
+  SystemOne can divide unchanged native context between bounded windows.
+  Every window repeats the complete changed core, which must fit the limit.
+  Chat reviews and conflict prompts keep the whole-input limit.
+  Policy, typed-choice criteria, and transport framing also consume model context.
+  Character counts do not measure tokens or server capacity.
+
   Set the model context and `PATCHGATE_MAX_CHANGE_CHARS` together.
 - patchgate merges only the conflicts in the table above. A merge that needs a new line, for example a line that combines both sides, goes to a human.
 - Two gate processes can review at the same time. Each acceptance still needs the exact reviewed main state. A moved state stops that command without acceptance.

@@ -65,7 +65,12 @@ impl Settings {
         interrupted: Arc<AtomicBool>,
     ) -> Result<Self> {
         let timeout: f64 = number("PATCHGATE_TIMEOUT", 300.0)?;
-        let check_timeout: f64 = number("PATCHGATE_CHECK_TIMEOUT", 900.0)?;
+        let check_timeout =
+            Duration::try_from_secs_f64(number("PATCHGATE_CHECK_TIMEOUT", 900.0)?)
+                .context("PATCHGATE_CHECK_TIMEOUT must be a finite, positive number")?;
+        if check_timeout.is_zero() {
+            bail!("PATCHGATE_CHECK_TIMEOUT must be a finite, positive number");
+        }
         let model = crate::models::select()?;
         Ok(Self {
             repo,
@@ -115,8 +120,7 @@ impl Settings {
             max_change_chars: number("PATCHGATE_MAX_CHANGE_CHARS", 8000)?,
             timeout: Duration::try_from_secs_f64(timeout)
                 .context("PATCHGATE_TIMEOUT must be a finite, nonnegative number")?,
-            check_timeout: Duration::try_from_secs_f64(check_timeout)
-                .context("PATCHGATE_CHECK_TIMEOUT must be a finite, positive number")?,
+            check_timeout,
             interrupted,
         }
         .with_escalation_confidence()?)
@@ -290,6 +294,27 @@ pub struct TypedAnswer {
     pub abstained: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ContextPage {
+    pub index: usize,
+    pub input_sha256: String,
+    pub ranges: Vec<crate::review_plan::ContextRange>,
+    pub answer_start: usize,
+    pub answer_count: usize,
+    pub request_start: usize,
+    pub request_count: usize,
+    pub decision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ContextCoverage {
+    pub schema_version: u8,
+    pub source_sha256: String,
+    pub planned_pages: usize,
+    pub complete: bool,
+    pub pages: Vec<ContextPage>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct Record {
     pub hash: String,
@@ -338,6 +363,8 @@ pub struct Record {
     files: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answers: Vec<TypedAnswer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<ContextCoverage>,
 }
 
 impl Record {
@@ -367,6 +394,7 @@ impl Record {
             for_hashes: Vec::new(),
             files: Vec::new(),
             answers: Vec::new(),
+            coverage: None,
         }
     }
 
@@ -2932,7 +2960,7 @@ impl Gate {
         );
         let input = review::input(&candidate, &binding)?;
         let length = input.get().chars().count();
-        if length > self.settings.max_change_chars {
+        if length > self.settings.max_change_chars && self.settings.model_api != Api::SystemOne {
             record.reason = format!(
                 "The structured change context has {length} characters. The model limit is {}. A human must review it.",
                 self.settings.max_change_chars
@@ -2950,6 +2978,23 @@ impl Gate {
                 return Ok(record);
             }
         };
+        if length > self.settings.max_change_chars {
+            let plan = match crate::review_plan::Plan::new(
+                &candidate,
+                &binding,
+                input.get(),
+                self.settings.max_change_chars,
+            ) {
+                Ok(plan) => plan,
+                Err(problem) => {
+                    record.reason = format!(
+                        "The structured change context has {length} characters. {problem}. A human must review it."
+                    );
+                    return Ok(record);
+                }
+            };
+            return self.decide_windows(record, &candidate, &policy, &rules, &binding, &plan, main);
+        }
         if let Some(cached) = self.cached_verdict(&binding, &item.hash)? {
             let answers = cached.answers.clone();
             record.decision = cached.decision;
@@ -3151,6 +3196,8 @@ impl Gate {
         for (question, answer) in &batch.answers {
             let labels: &[&str] = if question == "review" {
                 &["accept", "reject", "escalate"]
+            } else if question == "context" {
+                &["sufficient", "needs-context"]
             } else if rules
                 .iter()
                 .any(|rule| question == &format!("rule-{}", rule.id))
@@ -4522,6 +4569,11 @@ mod durability_tests {
     }
 }
 
+mod window_review;
+
+#[cfg(test)]
+mod bounded_tests;
+
 #[cfg(test)]
 mod feature_tests {
     use super::*;
@@ -4549,7 +4601,7 @@ mod feature_tests {
         Ok(files)
     }
 
-    fn pending_fixture(files: &[(&str, &[u8])]) -> Result<(tempfile::TempDir, Settings, String)> {
+    pub(super) fn pending_fixture(files: &[(&str, &[u8])]) -> Result<(tempfile::TempDir, Settings, String)> {
         let directory = tempfile::tempdir()?;
         let root = fs::canonicalize(directory.path())?.join("repo");
         fs::create_dir(&root)?;
@@ -4618,7 +4670,7 @@ mod feature_tests {
         Ok((directory, settings, candidate))
     }
 
-    fn fixture_edit(settings: &Settings, file: &str, text: &str, author: &str) -> Result<String> {
+    pub(super) fn fixture_edit(settings: &Settings, file: &str, text: &str, author: &str) -> Result<String> {
         let pijul = Pijul::new(settings.repo.clone());
         fs::write(settings.repo.join(file), text)?;
         pijul.run(["add", file])?;
