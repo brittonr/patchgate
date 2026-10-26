@@ -1,10 +1,12 @@
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json, value::RawValue};
 
 use crate::provenance::RequestEvidence;
+use crate::review_control::ReviewControl;
 
 const REVIEW_RULES: &str = "You are patchgate. You guard the main channel of a Pijul repository.\n\
 You review one structured JSON object with schema_version 1, candidate, and binding fields. The candidate contains native metadata, paths, context files, and metadata_context.\n\
@@ -58,7 +60,8 @@ pub struct Verdict {
     pub confidence: Option<f64>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MergeChoice {
     pub choice: String,
     pub reason: String,
@@ -67,7 +70,8 @@ pub struct MergeChoice {
 }
 
 /// One typed review question per policy rule, with the global verdict.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TypedBatch {
     pub answers: std::collections::BTreeMap<String, MergeChoice>,
     pub evidence: Vec<RequestEvidence>,
@@ -82,10 +86,10 @@ pub struct Response<T> {
 }
 
 #[derive(Serialize)]
-struct SystemOneRequest<'a, S> {
+struct SystemOneRequest<'a, S, Q = Value> {
     model: &'a str,
     state: S,
-    questions: Value,
+    questions: Q,
     truncate: bool,
 }
 
@@ -93,6 +97,85 @@ struct SystemOneRequest<'a, S> {
 struct SystemOnePrompt<'a, S> {
     instructions: &'a str,
     state: &'a S,
+}
+
+#[derive(Serialize)]
+struct SystemOneQuestion<'a> {
+    criteria: &'a Value,
+    instructions: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct SystemOneChoiceSchema<'a> {
+    criteria: &'a Value,
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+pub struct PreparedWindow<'a> {
+    model: &'a Model,
+    state: &'a RawValue,
+    instructions: String,
+    criteria: Vec<(String, Value)>,
+    request: reqwest::Request,
+    evidence: RequestEvidence,
+}
+
+impl PreparedWindow<'_> {
+    pub fn evidence(&self) -> &RequestEvidence {
+        &self.evidence
+    }
+
+    pub fn valid_batch(&self, batch: &TypedBatch) -> bool {
+        if !batch.invalid.is_empty()
+            || batch.answers.len() != self.criteria.len()
+            || batch.evidence.first() != Some(&self.evidence)
+        {
+            return false;
+        }
+        for (name, criteria) in &self.criteria {
+            let Some(answer) = batch.answers.get(name) else {
+                return false;
+            };
+            if !criteria.as_object().expect("choice criteria").contains_key(&answer.choice)
+                || !answer.confidence.is_some_and(valid_probability)
+            {
+                return false;
+            }
+        }
+        let mut recovered = std::collections::BTreeSet::new();
+        batch.evidence.iter().skip(1).all(|evidence| {
+            let Some((_, criteria)) = self.criteria.iter()
+                .find(|(name, _)| name == &evidence.operation)
+            else {
+                return false;
+            };
+            evidence.schema_version == self.evidence.schema_version
+                && evidence.api == self.evidence.api
+                && evidence.model == self.evidence.model
+                && evidence.declared_revision == self.evidence.declared_revision
+                && evidence.revision_verified == self.evidence.revision_verified
+                && evidence.prompt_sha256 == self.evidence.prompt_sha256
+                && crate::provenance::digest(&SystemOneChoiceSchema {
+                    criteria,
+                    kind: "choice",
+                }).is_ok_and(|digest| digest == evidence.schema_sha256)
+                && recovered.insert(evidence.operation.as_str())
+        })
+    }
+
+    pub fn execute(self) -> Result<TypedBatch> {
+        let reply = self.model.post_request(self.request)?;
+        self.model.finish_batch(
+            self.state,
+            &self.instructions,
+            self.criteria,
+            self.evidence,
+            reply,
+        )
+    }
 }
 
 impl<T> Response<T> {
@@ -169,10 +252,14 @@ pub fn window_instruction_chars() -> usize {
 pub struct Model {
     url: String,
     name: String,
-    agent: ureq::Agent,
+    client: reqwest::Client,
+    executor: &'static tokio::runtime::Runtime,
+    review_control: Option<Arc<ReviewControl>>,
+    timeout: Duration,
     api: Api,
     declared_revision: Option<String>,
     key: Option<String>,
+    identity_sha256: String,
 }
 
 impl Model {
@@ -206,23 +293,64 @@ impl Model {
                 "The model key is empty or contains control characters"
             );
         }
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .http_status_as_error(false)
+        static EXECUTOR: LazyLock<std::io::Result<tokio::runtime::Runtime>> = LazyLock::new(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+        });
+        let executor = EXECUTOR
+            .as_ref()
+            .map_err(|_| anyhow::anyhow!("The model HTTP executor could not start"))?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
-            .into();
+            .map_err(|_| anyhow::anyhow!("The model HTTP client could not start"))?;
         let endpoint = match api {
             Api::OpenAi => "chat/completions",
             Api::SystemOne => "systemone",
         };
+        let url = format!("{}/{endpoint}", url.trim_end_matches('/'));
+        let normalized = reqwest::Url::parse(&url)
+            .map_err(|_| anyhow::anyhow!("The model endpoint is invalid"))?;
+        #[derive(Serialize)]
+        struct Identity<'a> {
+            endpoint: &'a str,
+            api: &'a str,
+            model: &'a str,
+            declared_revision: Option<&'a str>,
+        }
+        let identity_sha256 = crate::provenance::digest(&Identity {
+            endpoint: normalized.as_str(),
+            api: api.as_str(),
+            model: name,
+            declared_revision,
+        })?;
         Ok(Self {
-            url: format!("{}/{endpoint}", url.trim_end_matches('/')),
+            url,
             name: name.to_owned(),
-            agent,
+            client,
+            executor,
+            review_control: None,
+            timeout,
             api,
             declared_revision: declared_revision.map(str::to_owned),
             key: key.map(str::to_owned),
+            identity_sha256,
         })
+    }
+
+    pub fn identity_sha256(&self) -> &str {
+        &self.identity_sha256
+    }
+
+    pub fn set_review_control(&mut self, control: Option<Arc<ReviewControl>>) {
+        self.review_control = control;
+    }
+
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
     }
 
     pub fn review(&self, policy: &str, state: &RawValue) -> Result<Response<Verdict>> {
@@ -274,30 +402,51 @@ impl Model {
         state: &RawValue,
         rules: &[crate::change::PolicyRule],
     ) -> Result<TypedBatch> {
-        self.review_batch(policy, state, rules, false)
+        if let Api::OpenAi = self.api {
+            let response = self.review(policy, state)?;
+            let mut batch = TypedBatch {
+                evidence: vec![response.evidence],
+                ..TypedBatch::default()
+            };
+            match response.value {
+                Some(verdict) => {
+                    batch.answers.insert(
+                        "review".into(),
+                        MergeChoice {
+                            choice: verdict.decision,
+                            reason: verdict.reason,
+                            confidence: verdict.confidence,
+                        },
+                    );
+                }
+                None => batch.invalid.push("review".into()),
+            }
+            return Ok(batch);
+        }
+        self.prepare_batch(policy, state, rules, false)?.execute()
     }
 
-    /// Review a complete changed core with one exact unchanged context window.
-    pub fn review_window(
-        &self,
+    /// Prepare one exact context window before any HTTP request.
+    pub fn prepare_window<'a>(
+        &'a self,
         policy: &str,
-        state: &RawValue,
+        state: &'a RawValue,
         rules: &[crate::change::PolicyRule],
-    ) -> Result<TypedBatch> {
+    ) -> Result<PreparedWindow<'a>> {
         ensure!(
             self.api == Api::SystemOne,
             "Bounded context review needs the systemone API"
         );
-        self.review_batch(policy, state, rules, true)
+        self.prepare_batch(policy, state, rules, true)
     }
 
-    fn review_batch(
-        &self,
+    fn prepare_batch<'a>(
+        &'a self,
         policy: &str,
-        state: &RawValue,
+        state: &'a RawValue,
         rules: &[crate::change::PolicyRule],
         window: bool,
-    ) -> Result<TypedBatch> {
+    ) -> Result<PreparedWindow<'a>> {
         let mut criteria: Vec<(String, Value)> = vec![(
             "review".into(),
             json!({
@@ -327,47 +476,26 @@ impl Model {
                 }),
             ));
         }
-        if let Api::OpenAi = self.api {
-            let response = self.review(policy, state)?;
-            let mut batch = TypedBatch {
-                evidence: vec![response.evidence],
-                ..TypedBatch::default()
-            };
-            match response.value {
-                Some(verdict) => {
-                    batch.answers.insert(
-                        "review".into(),
-                        MergeChoice {
-                            choice: verdict.decision,
-                            reason: verdict.reason,
-                            confidence: verdict.confidence,
-                        },
-                    );
-                }
-                None => batch.invalid.push("review".into()),
-            }
-            return Ok(batch);
-        }
         let instructions = if window {
             let [rules, reply, questions, header] = window_instruction_parts();
             [rules, reply, questions, header, policy].concat()
         } else {
             review_instructions(self.api, policy, SYSTEMONE_RULE_QUESTIONS)
         };
-        let questions: serde_json::Map<String, Value> = criteria
+        let questions: std::collections::BTreeMap<&str, SystemOneQuestion<'_>> = criteria
             .iter()
             .map(|(name, criteria)| {
                 (
-                    name.clone(),
-                    json!({
-                        "type": "choice",
-                        "instructions": instructions,
-                        "criteria": criteria
-                    }),
+                    name.as_str(),
+                    SystemOneQuestion {
+                        criteria,
+                        instructions: &instructions,
+                        kind: "choice",
+                    },
                 )
             })
             .collect();
-        let (evidence, reply) = if window {
+        let (evidence, request) = if window {
             let evidence = RequestEvidence::new(
                 "review-window",
                 "systemone",
@@ -382,10 +510,10 @@ impl Model {
             let body = SystemOneRequest {
                 model: &self.name,
                 state,
-                questions: Value::Object(questions),
+                questions,
                 truncate: false,
             };
-            (evidence, self.post(&body)?)
+            (evidence, self.prepare_request(&body)?)
         } else {
             let evidence = RequestEvidence::new(
                 "review",
@@ -401,35 +529,50 @@ impl Model {
                 "questions": questions,
                 "truncate": false
             });
-            (evidence, self.post(&body)?)
+            (evidence, self.prepare_request(&body)?)
         };
+        Ok(PreparedWindow {
+            model: self,
+            state,
+            instructions,
+            criteria,
+            request,
+            evidence,
+        })
+    }
+
+    fn finish_batch(
+        &self,
+        state: &RawValue,
+        instructions: &str,
+        criteria: Vec<(String, Value)>,
+        evidence: RequestEvidence,
+        reply: Option<Value>,
+    ) -> Result<TypedBatch> {
         let mut batch = TypedBatch {
             evidence: vec![evidence],
             ..TypedBatch::default()
         };
         let mut missing = Vec::new();
-        for (name, question) in &criteria {
-            let Some(value) = &reply else {
-                missing.push(name.clone());
-                continue;
-            };
-            let criteria = question
-                .as_object()
-                .expect("choice criteria is an object");
-            match systemone_choice(value, name, criteria) {
-                Ok(Some(choice)) => {
-                    batch.answers.insert(name.clone(), choice);
+        for (name, question) in criteria {
+            let choice = reply.as_ref().and_then(|value| {
+                systemone_choice(
+                    value,
+                    &name,
+                    question.as_object().expect("choice criteria is an object"),
+                )
+                .ok()
+                .flatten()
+            });
+            match choice {
+                Some(choice) => {
+                    batch.answers.insert(name, choice);
                 }
-                Ok(None) | Err(_) => missing.push(name.clone()),
+                None => missing.push((name, question)),
             }
         }
-        for name in missing {
-            let criteria = criteria
-                .iter()
-                .find(|(question, _)| question == &name)
-                .map(|(_, criteria)| criteria.clone())
-                .expect("a missing question has criteria");
-            let response = self.systemone(&name, &instructions, state, criteria)?;
+        for (name, criteria) in missing {
+            let response = self.systemone(&name, instructions, state, criteria)?;
             batch.evidence.push(response.evidence);
             match response.value {
                 Some(choice) => {
@@ -545,15 +688,9 @@ impl Model {
             questions,
             truncate: false,
         };
-        #[derive(Serialize)]
-        struct Schema<'a> {
-            criteria: &'a Value,
-            #[serde(rename = "type")]
-            kind: &'a Value,
-        }
-        let schema = Schema {
+        let schema = SystemOneChoiceSchema {
             criteria: &body.questions[question]["criteria"],
-            kind: &body.questions[question]["type"],
+            kind: "choice",
         };
         let evidence = RequestEvidence::new(
             question,
@@ -581,21 +718,64 @@ impl Model {
     }
 
     fn post(&self, body: &impl Serialize) -> Result<Option<Value>> {
-        let mut request = self.agent.post(&self.url);
-        if let Some(key) = &self.key {
-            request = request.header("Authorization", format!("Bearer {key}"));
-        }
-        let mut response = request.send_json(body).context("Model request failed")?;
-        let status = response.status().as_u16();
-        if status >= 400 {
-            bail!("Model server answered HTTP {status}");
-        }
-        match serde_json::from_reader(response.body_mut().as_reader()) {
-            Ok(reply) => Ok(Some(reply)),
-            Err(error) if error.is_io() => Err(error).context("Model response could not be read"),
-            Err(_) => Ok(None),
-        }
+        self.post_request(self.prepare_request(body)?)
     }
+
+    fn prepare_request(&self, body: &impl Serialize) -> Result<reqwest::Request> {
+        let mut request = self.client.post(&self.url).timeout(self.timeout);
+        if let Some(key) = &self.key {
+            request = request.bearer_auth(key);
+        }
+        request
+            .json(body)
+            .build()
+            .map_err(|_| anyhow::anyhow!("The model request could not be prepared"))
+    }
+
+    fn post_request(&self, request: reqwest::Request) -> Result<Option<Value>> {
+        if let Some(control) = &self.review_control {
+            control.begin_request()?;
+        }
+        // The selected future owns the request through the complete body read.
+        // Its drop closes an unfinished HTTP exchange without a request worker.
+        let result = self.executor.block_on(async {
+            let exchange = async {
+                let response = self
+                    .client
+                    .execute(request)
+                    .await
+                    .map_err(reqwest::Error::without_url)
+                    .context("Model request failed")?;
+                let status = response.status().as_u16();
+                if status >= 400 {
+                    bail!("Model server answered HTTP {status}");
+                }
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(reqwest::Error::without_url)
+                    .context("Model response could not be read")?;
+                Ok(serde_json::from_slice(&bytes).ok())
+            };
+            if let Some(control) = &self.review_control {
+                tokio::select! {
+                    biased;
+                    error = control.wait_for_stop() => Err(error),
+                    result = exchange => result,
+                }
+            } else {
+                exchange.await
+            }
+        });
+        if let Some(control) = &self.review_control {
+            control.check()?;
+        }
+        result
+    }
+}
+
+fn valid_probability(value: f64) -> bool {
+    value.is_finite() && (0.0..=1.0).contains(&value)
 }
 
 fn systemone_choice(
@@ -620,7 +800,7 @@ fn systemone_choice(
     let probability = answer
         .get("confidence")
         .and_then(Value::as_f64)
-        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .filter(|value| valid_probability(*value))
         .context("SystemOne response has no valid option probability")?;
     Ok(Some(MergeChoice {
         choice: choice.to_owned(),
@@ -716,6 +896,8 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
     use std::time::Instant;
 
@@ -792,6 +974,564 @@ pub(crate) mod tests {
             Ok((body, authorization))
         });
         Ok((url, worker))
+    }
+
+    fn read_local_request(stream: std::net::TcpStream) -> Result<BufReader<std::net::TcpStream>> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        let mut stream = BufReader::new(stream);
+        let mut line = String::new();
+        let mut length = None;
+        loop {
+            line.clear();
+            ensure!(stream.read_line(&mut line)? > 0, "The request is incomplete");
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("content-length") {
+                    length = Some(value.trim().parse::<u64>()?);
+                }
+            }
+        }
+        let length = length.context("The request has no length")?;
+        let copied = std::io::copy(&mut stream.by_ref().take(length), &mut std::io::sink())?;
+        ensure!(copied == length, "The request body is incomplete");
+        Ok(stream)
+    }
+
+    fn accept_local_request(listener: &TcpListener) -> Result<BufReader<std::net::TcpStream>> {
+        listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return read_local_request(stream),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    ensure!(Instant::now() < deadline, "No model request arrived");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn scripted_server(replies: Vec<String>) -> Result<(String, JoinHandle<Result<usize>>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/v1", listener.local_addr()?);
+        let worker = thread::spawn(move || {
+            let mut requests = 0;
+            for reply in replies {
+                let mut stream = accept_local_request(&listener)?;
+                write!(
+                    stream.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                )?;
+                requests += 1;
+            }
+            Ok(requests)
+        });
+        Ok((url, worker))
+    }
+
+    fn stopped_http_wait_closes_the_connection(body_wait: bool, interrupt: bool) -> Result<()> {
+        use crate::review_control::ReviewStop;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/v1", listener.local_addr()?);
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let timeout = if interrupt {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(1)
+        };
+        let mut model = Model::new(
+            &url, "model", Duration::from_secs(10), Api::SystemOne, None, None,
+        )?;
+        let control = Arc::new(ReviewControl::new(4, timeout, interrupted.clone())?);
+        model.set_review_control(Some(control.clone()));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_local_request(&listener)?;
+            if body_wait {
+                let reply = r#"{"answers":{"review":{"type":"choice","choice":"accept","confidence":1}}}"#;
+                write!(
+                    stream.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    reply.len(), &reply[..reply.len() / 2]
+                )?;
+                stream.get_mut().flush()?;
+            }
+            ready_tx.send(())?;
+            let mut byte = [0];
+            match stream.read(&mut byte) {
+                Ok(0) => Ok(()),
+                Err(error) if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => Ok(()),
+                _ => bail!("The stopped model request did not close its connection"),
+            }
+        });
+        let request = thread::spawn(move || {
+            let state = RawValue::from_string("{}".into()).unwrap();
+            let result = model.review("Accept safe changes.", &state);
+            (model, result)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3))?;
+        let stopped_at = Instant::now();
+        if interrupt {
+            interrupted.store(true, Ordering::Release);
+        }
+        let (model, result) = request.join().expect("The model request panicked");
+        let stop = if interrupt { ReviewStop::Interrupted } else { ReviewStop::Timeout };
+        assert_eq!(result.unwrap_err().downcast_ref::<ReviewStop>(), Some(&stop));
+        assert!(stopped_at.elapsed() < Duration::from_secs(2));
+        server.join().expect("The model fixture panicked")?;
+        interrupted.store(false, Ordering::Release);
+        let state = RawValue::from_string("{}".into())?;
+        let later = model.review("Accept safe changes.", &state).unwrap_err();
+        assert_eq!(later.downcast_ref::<ReviewStop>(), Some(&stop));
+        assert_eq!(control.usage().requests, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn interruption_closes_header_and_body_waits() -> Result<()> {
+        for body_wait in [false, true] {
+            stopped_http_wait_closes_the_connection(body_wait, true)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn review_deadline_closes_header_and_body_waits() -> Result<()> {
+        for body_wait in [false, true] {
+            stopped_http_wait_closes_the_connection(body_wait, false)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tiers_and_citation_requests_share_the_exact_limit() -> Result<()> {
+        use crate::review_control::ReviewStop;
+
+        let reply = json!({"answers": {
+            "review": {"type": "choice", "choice": "accept", "confidence": 1},
+            "citation": {"type": "choice", "choice": "valid", "confidence": 1}
+        }}).to_string();
+        let (url, server) = scripted_server(vec![reply.clone(), reply])?;
+        let control = Arc::new(ReviewControl::new(
+            2, Duration::from_secs(5), Arc::new(AtomicBool::new(false)),
+        )?);
+        let mut primary = Model::new(
+            &url, "primary", Duration::from_secs(5), Api::SystemOne, None, None,
+        )?;
+        let mut larger = Model::new(
+            &url, "larger", Duration::from_secs(5), Api::SystemOne, None, None,
+        )?;
+        primary.set_review_control(Some(control.clone()));
+        larger.set_review_control(Some(control.clone()));
+        let state = RawValue::from_string("{}".into())?;
+        assert_eq!(primary.review("Accept safe changes.", &state)?.value.unwrap().decision, "accept");
+        assert_eq!(larger.choose(
+            "citation", "citation", "Assess the citation.", &state, json!({"valid": "Valid."}),
+        )?.value.unwrap().choice, "valid");
+        control.check()?;
+        assert_eq!(control.stop(), None);
+        assert_eq!(server.join().expect("The model fixture panicked")?, 2);
+        let error = primary.merge("Conflict.", &["escalate"]).unwrap_err();
+        assert_eq!(error.downcast_ref::<ReviewStop>(), Some(&ReviewStop::RequestLimit));
+        assert_eq!(control.usage().requests, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_answer_recovery_uses_the_request_limit() -> Result<()> {
+        use crate::review_control::ReviewStop;
+
+        for limit in [1, 2] {
+            let mut replies = vec!["{}".to_owned()];
+            if limit == 2 {
+                replies.push(json!({"answers": {"review": {
+                    "type": "choice", "choice": "accept", "confidence": 1
+                }}}).to_string());
+            }
+            let (url, server) = scripted_server(replies)?;
+            let control = Arc::new(ReviewControl::new(
+                limit, Duration::from_secs(5), Arc::new(AtomicBool::new(false)),
+            )?);
+            let mut model = Model::new(
+                &url, "model", Duration::from_secs(5), Api::SystemOne, None, None,
+            )?;
+            model.set_review_control(Some(control.clone()));
+            let state = RawValue::from_string("{}".into())?;
+            let result = model.review_questions("Accept safe changes.", &state, &[]);
+            if limit == 1 {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<ReviewStop>(), Some(&ReviewStop::RequestLimit),
+                );
+            } else {
+                let batch = result?;
+                assert_eq!(batch.answers["review"].choice, "accept");
+                assert_eq!(batch.evidence.len(), 2);
+                assert!(batch.invalid.is_empty());
+                control.check()?;
+            }
+            assert_eq!(control.usage().requests, limit);
+            assert_eq!(server.join().expect("The model fixture panicked")?, limit);
+        }
+        Ok(())
+    }
+
+    fn complete_window_batch(evidence: RequestEvidence) -> TypedBatch {
+        TypedBatch {
+            answers: [
+                ("review", "accept"),
+                ("rule-R1", "allows"),
+                ("context", "sufficient"),
+            ]
+            .into_iter()
+            .map(|(name, choice)| {
+                (
+                    name.to_owned(),
+                    MergeChoice {
+                        choice: choice.to_owned(),
+                        reason: "The rule permits the change.".into(),
+                        confidence: Some(1.0),
+                    },
+                )
+            })
+            .collect(),
+            evidence: vec![evidence],
+            invalid: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn prepared_window_requires_exact_complete_answers() -> Result<()> {
+        let model = Model::new(
+            "http://127.0.0.1:1/v1", "model", Duration::from_secs(5),
+            Api::SystemOne, Some("revision-7"), None,
+        )?;
+        let state = RawValue::from_string("{}".into())?;
+        let rules = [crate::change::PolicyRule {
+            id: "R1".into(),
+            text: "Accept safe changes.".into(),
+        }];
+        let prepared = model.prepare_window("Accept safe changes.", &state, &rules)?;
+        let complete = || complete_window_batch(prepared.evidence().clone());
+        assert!(prepared.valid_batch(&complete()));
+        for name in ["review", "rule-R1", "context"] {
+            let mut batch = complete();
+            batch.answers.remove(name);
+            assert!(!prepared.valid_batch(&batch));
+            let mut batch = complete();
+            batch.answers.get_mut(name).unwrap().choice = "unknown".into();
+            assert!(!prepared.valid_batch(&batch));
+            for confidence in [
+                None, Some(-0.01), Some(1.01), Some(f64::NAN),
+                Some(f64::INFINITY), Some(f64::NEG_INFINITY),
+            ] {
+                let mut batch = complete();
+                batch.answers.get_mut(name).unwrap().confidence = confidence;
+                assert!(!prepared.valid_batch(&batch));
+            }
+            let mut batch = complete();
+            batch.answers.get_mut(name).unwrap().confidence = Some(0.0);
+            assert!(prepared.valid_batch(&batch));
+        }
+        let mut batch = complete();
+        let answer = batch.answers.remove("rule-R1").unwrap();
+        batch.answers.insert("rule-R2".into(), answer);
+        assert!(!prepared.valid_batch(&batch));
+        let mut batch = complete();
+        batch.invalid.push("review".into());
+        assert!(!prepared.valid_batch(&batch));
+        let mut batch = complete();
+        batch.evidence.clear();
+        assert!(!prepared.valid_batch(&batch));
+        let mut batch = complete();
+        batch.evidence[0].revision_verified = true;
+        assert!(!prepared.valid_batch(&batch));
+        let other_state = RawValue::from_string(r#"{"changed":true}"#.into())?;
+        assert!(!model.prepare_window("Accept safe changes.", &other_state, &rules)?
+            .valid_batch(&complete()));
+        assert!(!model.prepare_window("Reject all changes.", &state, &rules)?
+            .valid_batch(&complete()));
+        let changed_rules = [crate::change::PolicyRule {
+            id: "R1".into(),
+            text: "Reject all changes.".into(),
+        }];
+        assert!(!model.prepare_window("Accept safe changes.", &state, &changed_rules)?
+            .valid_batch(&complete()));
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_window_defers_http_and_counts_only_execution() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let url = format!("http://{}/v1", listener.local_addr()?);
+        let control = Arc::new(ReviewControl::new(
+            1, Duration::from_secs(5), Arc::new(AtomicBool::new(false)),
+        )?);
+        let mut model = Model::new(
+            &url, "model", Duration::from_secs(5), Api::SystemOne, None, None,
+        )?;
+        model.set_review_control(Some(control.clone()));
+        let state = RawValue::from_string("{}".into())?;
+        let prepared = model.prepare_window("Accept safe changes.", &state, &[])?;
+        let initial_evidence = prepared.evidence().clone();
+        assert_eq!(control.usage().requests, 0);
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_local_request(&listener)?;
+            let reply = json!({"answers": {
+                "review": {"type": "choice", "choice": "accept", "confidence": 1},
+                "context": {"type": "choice", "choice": "sufficient", "confidence": 1},
+            }}).to_string();
+            write!(
+                stream.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len(),
+            )?;
+            Ok(())
+        });
+        let batch = prepared.execute()?;
+        server.join().expect("The model fixture panicked")?;
+        assert_eq!(batch.evidence, vec![initial_evidence]);
+        assert_eq!(batch.answers["review"].choice, "accept");
+        assert_eq!(batch.answers["context"].choice, "sufficient");
+        assert!(batch.invalid.is_empty());
+        assert_eq!(control.usage().requests, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_window_recovery_obeys_limits_and_evidence_bindings() -> Result<()> {
+        use crate::review_control::ReviewStop;
+
+        for limit in [1, 2] {
+            let mut replies = vec![json!({"answers": {"review": {
+                "type": "choice", "choice": "accept", "confidence": 1,
+            }}}).to_string()];
+            if limit == 2 {
+                replies.push(json!({"answers": {"context": {
+                    "type": "choice", "choice": "sufficient", "confidence": 0.75,
+                }}}).to_string());
+            }
+            let (url, server) = scripted_server(replies)?;
+            let control = Arc::new(ReviewControl::new(
+                limit, Duration::from_secs(5), Arc::new(AtomicBool::new(false)),
+            )?);
+            let mut model = Model::new(
+                &url, "model", Duration::from_secs(5), Api::SystemOne, Some("revision-7"), None,
+            )?;
+            model.set_review_control(Some(control.clone()));
+            let state = RawValue::from_string("{}".into())?;
+            let result = model.prepare_window("Accept safe changes.", &state, &[])?.execute();
+            if limit == 1 {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<ReviewStop>(), Some(&ReviewStop::RequestLimit),
+                );
+            } else {
+                let batch = result?;
+                let prepared = model.prepare_window("Accept safe changes.", &state, &[])?;
+                assert!(prepared.valid_batch(&batch));
+                assert_eq!(batch.evidence.len(), 2);
+                for field in [
+                    "operation", "api", "model", "declared_revision",
+                    "prompt_sha256", "schema_sha256",
+                ] {
+                    let mut encoded = serde_json::to_value(&batch)?;
+                    encoded["evidence"][1][field] = json!("different");
+                    let invalid = serde_json::from_value(encoded)?;
+                    assert!(!prepared.valid_batch(&invalid), "{field}");
+                }
+                let mut encoded = serde_json::to_value(&batch)?;
+                encoded["evidence"][1]["revision_verified"] = json!(true);
+                assert!(!prepared.valid_batch(&serde_json::from_value(encoded)?));
+                let mut encoded = serde_json::to_value(&batch)?;
+                encoded["evidence"][1]["schema_sha256"] = json!("0".repeat(64));
+                assert!(!prepared.valid_batch(&serde_json::from_value(encoded)?));
+                let mut duplicate = serde_json::from_value::<TypedBatch>(
+                    serde_json::to_value(&batch)?,
+                )?;
+                duplicate.evidence.push(duplicate.evidence[1].clone());
+                assert!(!prepared.valid_batch(&duplicate));
+                let mut incomplete = batch;
+                incomplete.answers.remove("context");
+                assert!(!prepared.valid_batch(&incomplete));
+            }
+            assert_eq!(control.usage().requests, limit);
+            assert_eq!(server.join().expect("The model fixture panicked")?, limit);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prepared_window_cancellation_prevents_http() -> Result<()> {
+        use crate::review_control::ReviewStop;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let control = Arc::new(ReviewControl::new(
+            1, Duration::from_secs(5), interrupted.clone(),
+        )?);
+        let mut model = Model::new(
+            &format!("http://{}/v1", listener.local_addr()?),
+            "model", Duration::from_secs(5), Api::SystemOne, None, None,
+        )?;
+        model.set_review_control(Some(control.clone()));
+        let state = RawValue::from_string("{}".into())?;
+        let prepared = model.prepare_window("Accept safe changes.", &state, &[])?;
+        interrupted.store(true, Ordering::SeqCst);
+        let error = prepared.execute().unwrap_err();
+        assert_eq!(error.downcast_ref::<ReviewStop>(), Some(&ReviewStop::Interrupted));
+        assert_eq!(control.usage().requests, 0);
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        Ok(())
+    }
+
+    #[test]
+    fn model_identity_binds_endpoint_api_name_and_revision_without_credentials() -> Result<()> {
+        let identity = |url, name, api, revision, key| -> Result<String> {
+            Ok(Model::new(url, name, Duration::from_secs(5), api, revision, key)?
+                .identity_sha256().to_owned())
+        };
+        let original = identity("http://localhost:80/v1", "model", Api::SystemOne, Some("r1"), None)?;
+        assert_eq!(
+            original,
+            identity("http://LOCALHOST/v1/", "model", Api::SystemOne, Some("r1"), Some("private-key"))?,
+        );
+        for different in [
+            identity("http://localhost/v2", "model", Api::SystemOne, Some("r1"), None)?,
+            identity("http://localhost/v1", "model", Api::OpenAi, Some("r1"), None)?,
+            identity("http://localhost/v1", "other", Api::SystemOne, Some("r1"), None)?,
+            identity("http://localhost/v1", "model", Api::SystemOne, Some("r2"), None)?,
+            identity("http://localhost/v1", "model", Api::SystemOne, None, None)?,
+        ] {
+            assert_ne!(original, different);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn private_typed_batch_rejects_unknown_fields() -> Result<()> {
+        let model = Model::new(
+            "http://127.0.0.1:1/v1", "model", Duration::from_secs(5),
+            Api::SystemOne, None, None,
+        )?;
+        let state = RawValue::from_string("{}".into())?;
+        let rules = [crate::change::PolicyRule {
+            id: "R1".into(),
+            text: "Accept safe changes.".into(),
+        }];
+        let prepared = model.prepare_window("Accept safe changes.", &state, &rules)?;
+        let encoded = serde_json::to_value(complete_window_batch(prepared.evidence().clone()))?;
+        assert!(prepared.valid_batch(&serde_json::from_value(encoded.clone())?));
+        let mut extra_batch_field = encoded.clone();
+        extra_batch_field["accepted"] = json!(true);
+        assert!(serde_json::from_value::<TypedBatch>(extra_batch_field).is_err());
+        let mut extra_answer_field = encoded;
+        extra_answer_field["answers"]["review"]["accepted"] = json!(true);
+        assert!(serde_json::from_value::<TypedBatch>(extra_answer_field).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_http_calls_use_the_request_limit() -> Result<()> {
+        use crate::review_control::ReviewStop;
+
+        let (url, server) = reply_server(503, "PRIVATE_SERVER_PAYLOAD")?;
+        let control = Arc::new(ReviewControl::new(
+            1, Duration::from_secs(5), Arc::new(AtomicBool::new(false)),
+        )?);
+        let mut model = Model::new(
+            &url, "model", Duration::from_secs(5), Api::SystemOne, None, None,
+        )?;
+        model.set_review_control(Some(control.clone()));
+        let state = RawValue::from_string("{}".into())?;
+        let error = model.review("Accept safe changes.", &state).unwrap_err();
+        assert!(error.to_string().contains("HTTP 503"));
+        assert!(!format!("{error:#}").contains("PRIVATE_SERVER_PAYLOAD"));
+        server.join().expect("The model fixture panicked")?;
+        control.check()?;
+        let next = model.review("Accept safe changes.", &state).unwrap_err();
+        assert_eq!(next.downcast_ref::<ReviewStop>(), Some(&ReviewStop::RequestLimit));
+        assert_eq!(control.usage().requests, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn redirects_do_not_dispatch_an_extra_request() -> Result<()> {
+        let destination = TcpListener::bind("127.0.0.1:0")?;
+        destination.set_nonblocking(true)?;
+        let location = format!("http://{}/redirected", destination.local_addr()?);
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/v1", listener.local_addr()?);
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_local_request(&listener)?;
+            write!(
+                stream.get_mut(),
+                "HTTP/1.1 307 Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )?;
+            Ok(())
+        });
+        let control = Arc::new(ReviewControl::new(
+            1, Duration::from_secs(5), Arc::new(AtomicBool::new(false)),
+        )?);
+        let mut model = Model::new(
+            &url, "model", Duration::from_secs(2), Api::SystemOne, None, None,
+        )?;
+        model.set_review_control(Some(control.clone()));
+        let state = RawValue::from_string("{}".into())?;
+        assert!(model.review("Accept safe changes.", &state)?.value.is_none());
+        server.join().expect("The model fixture panicked")?;
+        assert_eq!(
+            destination.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
+        );
+        assert_eq!(control.usage().requests, 1);
+        control.check()?;
+        Ok(())
+    }
+
+    #[test]
+    fn timeout_refresh_applies_to_the_existing_client() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("http://{}/v1", listener.local_addr()?);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_local_request(&listener)?;
+            ready_tx.send(())?;
+            let mut byte = [0];
+            match stream.read(&mut byte) {
+                Ok(0) => Ok(()),
+                Err(error) if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => Ok(()),
+                _ => bail!("The timed model request did not close its connection"),
+            }
+        });
+        let mut model = Model::new(
+            &url, "model", Duration::from_secs(10), Api::SystemOne, None, None,
+        )?;
+        model.set_timeout(Duration::from_millis(250));
+        let request = thread::spawn(move || {
+            let state = RawValue::from_string("{}".into()).unwrap();
+            model.review("Accept safe changes.", &state)
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3))?;
+        let started = Instant::now();
+        let error = request.join().expect("The model request panicked").unwrap_err();
+        assert_eq!(error.to_string(), "Model request failed");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.join().expect("The model fixture panicked")?;
+        Ok(())
     }
 
     fn sha256(value: &Value) -> String {

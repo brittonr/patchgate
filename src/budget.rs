@@ -330,6 +330,7 @@ mod tests {
                 max_change_chars: limit,
                 timeout_seconds: 300.0,
                 check_timeout_seconds: 900.0,
+                ..configuration::Values::default()
             },
         }
     }

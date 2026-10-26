@@ -78,12 +78,13 @@ struct Request {
     state: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Script {
     Accept,
     RejectLater,
     NeedsContext,
     WeakContext,
+    Interrupt(Arc<AtomicBool>),
 }
 
 struct Server {
@@ -131,6 +132,17 @@ impl Server {
                     state: Box<RawValue>,
                 }
                 let raw: State = serde_json::from_slice(&bytes)?;
+                if let Script::Interrupt(interrupted) = &script {
+                    requests.push(Request { body, state: raw.state.get().to_owned() });
+                    interrupted.store(true, Ordering::Release);
+                    let mut byte = [0];
+                    match stream.read(&mut byte) {
+                        Ok(0) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                        result => bail!("The cancelled model request must close its socket: {result:?}"),
+                    }
+                    continue;
+                }
                 let questions = body["questions"].as_object().context("The questions are absent")?;
                 let answer = if questions.contains_key("review") {
                     anyhow::ensure!(questions.len() == 3, "The window must ask three questions");
@@ -489,5 +501,227 @@ fn a_weak_context_answer_cannot_authorize_acceptance() -> Result<()> {
     assert_eq!(context.choice, "sufficient");
     assert_eq!(context.confidence, Some(0.59));
     assert!(context.abstained);
+    Ok(())
+}
+
+#[test]
+fn a_request_limit_preserves_partial_coverage_and_reconsideration_gets_a_fresh_scope() -> Result<()> {
+    let fixture = fixture(false)?;
+    let server = Server::start(Script::Accept, fixture.span.clone(), None)?;
+    let mut settings = fixture.settings.clone();
+    settings.model_url = server.url();
+    settings.max_review_requests = 1;
+    let mut gate = Gate::new(settings)?;
+    let main = gate.pijul.snapshot("main")?;
+    let inbox = gate.pijul.snapshot("inbox")?;
+    let stopped = gate.review_report(false, &Selection::default())?;
+    let usage = stopped.review_usage.as_ref().context("Review usage is absent")?;
+    assert_eq!(usage.stop, Some(ReviewStop::RequestLimit));
+    assert_eq!(usage.requests, 1);
+    let record = stopped.records.iter().find(|record| record.hash == fixture.candidate)
+        .context("The stopped candidate record is absent")?;
+    assert_eq!(record.decision, "escalate");
+    assert_eq!(record.execution_error.as_deref(), Some("review-request-limit"));
+    let coverage = record.coverage.as_ref().context("The partial coverage is absent")?;
+    assert!(!coverage.complete);
+    assert_eq!(coverage.pages.len(), 1);
+    assert_eq!(gate.pijul.snapshot("main")?, main);
+    assert_eq!(gate.pijul.snapshot("inbox")?, inbox);
+    assert!(gate.ledger.pending()?.is_none());
+
+    let planned = coverage.planned_pages;
+    gate.settings.max_review_requests = planned + 2;
+    let accepted = gate.reconsider(&fixture.candidate, "Review with a larger request limit")?;
+    let usage = accepted.review_usage.as_ref().context("The new review usage is absent")?;
+    assert_eq!(usage.stop, None);
+    assert_eq!(usage.requests, planned + 1);
+    assert!(gate.pijul.hashes("main")?.contains(&fixture.candidate));
+    assert_eq!(gate.pijul.snapshot("inbox")?, inbox);
+    let record = accepted.records.iter().find(|record| record.hash == fixture.candidate)
+        .context("The accepted candidate record is absent")?;
+    assert_eq!(record.decision, "accept");
+    let coverage = record.coverage.as_ref().context("The complete coverage is absent")?;
+    assert!(coverage.complete);
+    assert_eq!(coverage.pages[0].cache_hits.len(), 1);
+    assert!(coverage.pages[1..].iter().all(|page| page.cache_hits.is_empty()));
+    assert_eq!(record.answers.len(), planned * 3 + 2);
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), planned + 2);
+    Ok(())
+}
+
+#[test]
+fn complete_window_coverage_cannot_bypass_the_citation_request_limit() -> Result<()> {
+    let fixture = fixture(false)?;
+    let budget = Gate::budget(fixture.settings.clone(), &fixture.candidate)?;
+    let planned = match budget.bounded_review {
+        Some(crate::budget::BoundedReview::Planned { planned_pages, .. }) => planned_pages,
+        _ => bail!("The fixture needs a bounded review plan"),
+    };
+    let server = Server::start(Script::Accept, fixture.span.clone(), None)?;
+    let mut settings = fixture.settings.clone();
+    settings.model_url = server.url();
+    settings.max_review_requests = planned + 1;
+    let mut gate = Gate::new(settings)?;
+    let main = gate.pijul.snapshot("main")?;
+    let inbox = gate.pijul.snapshot("inbox")?;
+    let report = gate.review_report(false, &Selection::default())?;
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), planned + 1);
+    assert_eq!(windows(&requests).len(), planned);
+    assert!(requests.last().context("The path request is absent")?.body["questions"].get("path").is_some());
+    let usage = report.review_usage.as_ref().context("Review usage is absent")?;
+    assert_eq!(usage.stop, Some(ReviewStop::RequestLimit));
+    assert_eq!(usage.requests, planned + 1);
+    let record = report.records.iter().find(|record| record.hash == fixture.candidate)
+        .context("The stopped candidate record is absent")?;
+    assert_eq!(record.decision, "escalate");
+    assert_eq!(record.execution_error.as_deref(), Some("review-request-limit"));
+    assert!(record.coverage.as_ref().context("The window coverage is absent")?.complete);
+    assert!(record.answers.iter().any(|answer| answer.question == "path"));
+    assert!(!record.answers.iter().any(|answer| answer.question == "span"));
+    assert_eq!(gate.pijul.snapshot("main")?, main);
+    assert_eq!(gate.pijul.snapshot("inbox")?, inbox);
+    assert!(gate.ledger.pending()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn an_interrupted_active_window_cannot_accept_the_candidate() -> Result<()> {
+    let fixture = fixture(false)?;
+    let server = Server::start(
+        Script::Interrupt(Arc::clone(&fixture.settings.interrupted)),
+        fixture.span.clone(),
+        None,
+    )?;
+    let mut settings = fixture.settings.clone();
+    settings.model_url = server.url();
+    let mut gate = Gate::new(settings)?;
+    let main = gate.pijul.snapshot("main")?;
+    let inbox = gate.pijul.snapshot("inbox")?;
+    let report = gate.review_report(false, &Selection::default())?;
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 1);
+    let usage = report.review_usage.as_ref().context("Review usage is absent")?;
+    assert_eq!(usage.stop, Some(ReviewStop::Interrupted));
+    assert_eq!(usage.requests, 1);
+    let record = report.records.iter().find(|record| record.hash == fixture.candidate)
+        .context("The interrupted candidate record is absent")?;
+    assert_eq!(record.decision, "escalate");
+    assert_eq!(record.execution_error.as_deref(), Some("interrupted"));
+    assert!(!record.coverage.as_ref().context("The partial coverage is absent")?.complete);
+    assert_eq!(gate.pijul.snapshot("main")?, main);
+    assert_eq!(gate.pijul.snapshot("inbox")?, inbox);
+    assert!(gate.ledger.pending()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn cached_windows_leave_citations_and_acceptance_isolated_during_a_dry_run() -> Result<()> {
+    let fixture = fixture(false)?;
+    let server = Server::start(Script::Accept, fixture.span.clone(), None)?;
+    let mut settings = fixture.settings.clone();
+    settings.model_url = server.url();
+    let budget = Gate::budget(settings.clone(), &fixture.candidate)?;
+    let planned = match budget.bounded_review {
+        Some(crate::budget::BoundedReview::Planned { planned_pages, .. }) => planned_pages,
+        _ => bail!("The fixture needs a bounded review plan"),
+    };
+    settings.max_review_requests = planned + 1;
+    let mut gate = Gate::new(settings.clone())?;
+    let main = gate.pijul.snapshot("main")?;
+    let inbox = gate.pijul.snapshot("inbox")?;
+    let stopped = gate.review_report(false, &Selection::default())?;
+    assert_eq!(stopped.review_usage.as_ref().unwrap().stop, Some(ReviewStop::RequestLimit));
+    let history = gate.ledger.history()?.len();
+    let directory = settings.repo.join(crate::window_cache::DIRECTORY);
+    let cache_bytes = || -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+        fs::read_dir(&directory)?.map(|entry| {
+            let path = entry?.path();
+            Ok((path.clone(), fs::read(path)?))
+        }).collect()
+    };
+    let before = cache_bytes()?;
+    settings.max_review_requests = 2;
+    let report = Gate::reconsider_dry_run(
+        settings, &fixture.candidate, "Inspect cached work in isolation",
+    )?;
+    assert!(report.dry_run);
+    assert!(!report.authorizes_acceptance);
+    let usage = report.review_usage.as_ref().context("Review usage is absent")?;
+    assert_eq!(usage.requests, 2);
+    assert_eq!(usage.stop, None);
+    let record = report.records.iter().find(|record| record.hash == fixture.candidate)
+        .context("The isolated candidate record is absent")?;
+    assert_eq!(record.decision, "accept");
+    let coverage = record.coverage.as_ref().context("The window coverage is absent")?;
+    assert!(coverage.complete);
+    assert_eq!(coverage.pages.len(), planned);
+    assert!(coverage.pages.iter().all(|page| page.cache_hits.len() == 1));
+    assert_eq!(gate.pijul.snapshot("main")?, main);
+    assert_eq!(gate.pijul.snapshot("inbox")?, inbox);
+    assert_eq!(gate.ledger.history()?.len(), history);
+    assert_eq!(cache_bytes()?, before);
+    let requests = server.finish()?;
+    assert_eq!(windows(&requests).len(), planned);
+    assert_eq!(requests.len(), planned + 3);
+    assert!(requests[planned + 1].body["questions"].get("path").is_some());
+    assert!(requests[planned + 2].body["questions"].get("span").is_some());
+    assert!(gate.ledger.pending()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_changed_main_state_cannot_reuse_completed_windows() -> Result<()> {
+    let fixture = fixture(false)?;
+    let server = Server::start(Script::Accept, fixture.span.clone(), None)?;
+    let mut settings = fixture.settings.clone();
+    settings.model_url = server.url();
+    settings.max_review_requests = 1;
+    let mut gate = Gate::new(settings.clone())?;
+    let stopped = gate.review_report(false, &Selection::default())?;
+    assert_eq!(stopped.review_usage.as_ref().unwrap().requests, 1);
+    let other = fixture_edit(&settings, "independent.txt", "An independent main change.\n", "patchgate")?;
+    gate.pijul.run(["apply", "--channel", "main", &other])?;
+    let main = gate.pijul.snapshot("main")?;
+    assert!(!main.hashes.contains(&fixture.candidate));
+    let report = gate.reconsider(&fixture.candidate, "Review against the changed main state")?;
+    let usage = report.review_usage.as_ref().context("Review usage is absent")?;
+    assert_eq!(usage.requests, 1);
+    assert_eq!(usage.stop, Some(ReviewStop::RequestLimit));
+    assert_eq!(gate.pijul.snapshot("main")?, main);
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].body["state"]["coverage"]["page"], 0);
+    assert_ne!(requests[0].body["state"]["binding"], requests[1].body["state"]["binding"]);
+    assert!(gate.ledger.pending()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_cached_rejection_does_not_become_acceptance() -> Result<()> {
+    let fixture = fixture(false)?;
+    let server = Server::start(Script::RejectLater, fixture.span.clone(), None)?;
+    let mut settings = fixture.settings.clone();
+    settings.model_url = server.url();
+    let mut gate = Gate::new(settings)?;
+    let main = gate.pijul.snapshot("main")?;
+    let first = gate.review_report(false, &Selection::default())?;
+    assert_eq!(first.records.last().unwrap().decision, "reject");
+    let report = gate.reconsider(&fixture.candidate, "Inspect the same complete window answers")?;
+    let usage = report.review_usage.as_ref().context("Review usage is absent")?;
+    assert_eq!(usage.requests, 0);
+    assert_eq!(usage.stop, None);
+    let record = report.records.iter().find(|record| record.hash == fixture.candidate)
+        .context("The cached candidate record is absent")?;
+    assert_eq!(record.decision, "reject");
+    let coverage = record.coverage.as_ref().context("The window coverage is absent")?;
+    assert!(!coverage.complete);
+    assert_eq!(coverage.pages.len(), 2);
+    assert!(coverage.pages.iter().all(|page| page.cache_hits.len() == 1));
+    assert_eq!(gate.pijul.snapshot("main")?, main);
+    let requests = server.finish()?;
+    assert_eq!(requests.len(), 2);
+    assert!(gate.ledger.pending()?.is_none());
     Ok(())
 }

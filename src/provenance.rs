@@ -61,7 +61,7 @@ pub fn verifier_versions(pijul: &crate::pijul::Pijul) -> Result<VerifierVersions
     })
 }
 
-fn digest(value: &impl Serialize) -> Result<String> {
+pub(crate) fn digest(value: &impl Serialize) -> Result<String> {
     struct DigestWriter(Sha256);
 
     impl Write for DigestWriter {

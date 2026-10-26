@@ -23,6 +23,7 @@ use crate::change::{self, Choices, Conflict, ConflictFile, Hunks, Piece, Region,
 use crate::model::{Api, Model};
 use crate::pijul::{ChannelSnapshot, LogEntry, Pijul, Signer};
 use crate::review::{self, ReviewBinding};
+use crate::review_control::{ReviewControl, ReviewStop, ReviewUsage};
 use crate::verify::{self, Verification};
 
 /// Default probability below which a review goes to the larger typed profile.
@@ -54,6 +55,8 @@ pub struct Settings {
     max_change_chars: usize,
     pub(crate) timeout: Duration,
     pub(crate) check_timeout: Duration,
+    pub(crate) max_review_requests: usize,
+    pub(crate) review_timeout_seconds: f64,
     interrupted: Arc<AtomicBool>,
 }
 
@@ -121,6 +124,8 @@ impl Settings {
             timeout: Duration::try_from_secs_f64(timeout)
                 .context("PATCHGATE_TIMEOUT must be a finite, nonnegative number")?,
             check_timeout,
+            max_review_requests: number("PATCHGATE_MAX_REVIEW_REQUESTS", 128)?,
+            review_timeout_seconds: number("PATCHGATE_REVIEW_TIMEOUT", 900.0)?,
             interrupted,
         }
         .with_escalation_confidence()?)
@@ -170,6 +175,8 @@ impl Settings {
             max_change_chars: self.max_change_chars,
             timeout_seconds: self.timeout.as_secs_f64(),
             check_timeout_seconds: self.check_timeout.as_secs_f64(),
+            max_review_requests: self.max_review_requests,
+            review_timeout_seconds: self.review_timeout_seconds,
         }
     }
 }
@@ -295,6 +302,13 @@ pub struct TypedAnswer {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WindowCacheHit {
+    pub key: String,
+    pub request_start: usize,
+    pub request_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ContextPage {
     pub index: usize,
     pub input_sha256: String,
@@ -304,6 +318,8 @@ pub struct ContextPage {
     pub request_start: usize,
     pub request_count: usize,
     pub decision: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_hits: Vec<WindowCacheHit>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -594,6 +610,8 @@ pub struct ReviewReport {
     pub selection: Option<SelectionReport>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub lanes: Vec<LaneReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_usage: Option<ReviewUsage>,
 }
 
 #[derive(Debug)]
@@ -961,6 +979,7 @@ pub struct Gate {
     pub ledger: Ledger,
     decisions: crate::decision::Cache,
     merges: crate::decision::MergeCache,
+    windows: crate::window_cache::Cache,
     signer: Signer,
     model: Model,
     escalation: Option<Model>,
@@ -974,6 +993,8 @@ pub struct Gate {
     configuration: Rc<crate::configuration::Evidence>,
     capture_enabled: bool,
     verifiers: Option<crate::provenance::VerifierVersions>,
+    review_control: Option<Arc<ReviewControl>>,
+    last_review_usage: Option<ReviewUsage>,
 }
 
 impl Gate {
@@ -1026,6 +1047,7 @@ impl Gate {
         };
         let decisions = crate::decision::Cache::new(&settings.repo)?;
         let merges = crate::decision::MergeCache::new(&settings.repo)?;
+        let windows = crate::window_cache::Cache::new(&settings.repo)?;
         let mut gate = Self {
             pijul: Pijul::new(settings.repo.clone()),
             signer: Signer::new(ledger.directory.clone()),
@@ -1047,11 +1069,14 @@ impl Gate {
             ledger,
             decisions,
             merges,
+            windows,
             changes: HashMap::new(),
             baseline,
             configuration,
             capture_enabled: true,
             verifiers: None,
+            review_control: None,
+            last_review_usage: None,
         };
         let _lock = gate.ledger.lock()?;
         gate.recover()?;
@@ -1105,21 +1130,18 @@ impl Gate {
         }
         let timeout = Duration::try_from_secs_f64(values.timeout_seconds)?;
         if timeout != self.settings.timeout {
-            let model_key = self.settings.model_key()?;
-            self.model = Model::new(
-                &self.settings.model_url,
-                &self.settings.model,
-                timeout,
-                self.settings.model_api,
-                self.settings.model_revision.as_deref(),
-                model_key.as_deref(),
-            )?;
+            self.model.set_timeout(timeout);
+            if let Some(model) = &mut self.escalation {
+                model.set_timeout(timeout);
+            }
         }
         self.settings.policy.clone_from(&values.policy_path);
         self.settings.protected.clone_from(&values.protected);
         self.settings.max_change_chars = values.max_change_chars;
         self.settings.timeout = timeout;
         self.settings.check_timeout = Duration::try_from_secs_f64(values.check_timeout_seconds)?;
+        self.settings.max_review_requests = values.max_review_requests;
+        self.settings.review_timeout_seconds = values.review_timeout_seconds;
         self.configuration = Rc::new(evidence);
         Ok(())
     }
@@ -1298,6 +1320,7 @@ impl Gate {
         }
         original.history()?;
         let isolated = crate::isolation::copy_repository(&settings.repo)?;
+        crate::window_cache::Cache::copy_existing(&settings.repo, &isolated.pijul.repo)?;
         for entry in fs::read_dir(isolated.pijul.repo.join(".pijul"))? {
             let entry = entry?;
             if entry.file_name() != "changes" {
@@ -1595,7 +1618,16 @@ impl Gate {
         let boundary = history.len();
         let mut item = Item::from(entry);
         let mut hashes = main.hashes;
-        self.decide_and_land(&mut item, &text, &mut hashes, Some(reconsideration))?;
+        let result = self.with_review(|gate| {
+            gate.decide_and_land(&mut item, &text, &mut hashes, Some(reconsideration))
+        });
+        if let Err(error) = result {
+            let Some(stop) = error.downcast_ref::<ReviewStop>() else {
+                return Err(error);
+            };
+            item.state = State::from_decision(&previous.decision);
+            item.reason = format!("The review stopped: {stop}. The earlier decision stays unchanged.");
+        }
         let records = self.ledger.history()?.into_iter().skip(boundary).collect();
         Ok(ReviewReport {
             schema_version: 1,
@@ -1614,6 +1646,7 @@ impl Gate {
             records,
             selection: None,
             lanes: Vec::new(),
+            review_usage: self.last_review_usage.clone(),
         })
     }
 
@@ -1885,7 +1918,7 @@ impl Gate {
         self.refresh_configuration(&main)?;
         let inbox = self.pijul.snapshot(&self.settings.inbox)?;
         let boundary = self.ledger.history()?.len();
-        let (items, selection) = self.walk(true, selection, |_| {})?;
+        let (items, selection) = self.with_review(|gate| gate.walk(true, selection, |_| {}))?;
         let records = self.ledger.history()?.into_iter().skip(boundary).collect();
         Ok(ReviewReport {
             schema_version: 1,
@@ -1904,6 +1937,7 @@ impl Gate {
             records,
             selection,
             lanes,
+            review_usage: self.last_review_usage.clone(),
         })
     }
 
@@ -1936,7 +1970,13 @@ impl Gate {
                 self.settings.inbox
             );
         }
-        self.walk(true, selection, report)
+        let main = self.pijul.snapshot(&self.settings.main)?;
+        self.refresh_configuration(&main)?;
+        let result = self.with_review(|gate| gate.walk(true, selection, report));
+        if let Some(stop) = self.last_review_usage.as_ref().and_then(|usage| usage.stop) {
+            return Err(stop.into());
+        }
+        result
     }
 
     pub fn decide_by_hand(
@@ -2593,6 +2633,9 @@ impl Gate {
         let mut items = Vec::new();
         let mut chunk: Vec<(Item, Rc<str>)> = Vec::new();
         for (index, entry) in inbox.into_iter().enumerate() {
+            if self.review_stop().is_some() {
+                break;
+            }
             if main.contains(&entry.hash) {
                 continue;
             }
@@ -2613,6 +2656,9 @@ impl Gate {
                     for (item, _) in chunk.drain(..) {
                         states.insert(item.hash.clone(), item.state);
                         items.push(item);
+                    }
+                    if self.review_stop().is_some() {
+                        break;
                     }
                 }
                 let text = self.change_text(&item.hash)?;
@@ -2674,6 +2720,12 @@ impl Gate {
         let mut decided = Vec::with_capacity(chunk.len());
         for (item, text) in chunk.iter_mut() {
             decided.push(self.decide_ready(item, text, &reviewed, None)?);
+            if self.review_stop().is_some() {
+                break;
+            }
+        }
+        if let Some(stop) = self.review_stop() {
+            return self.stop_review_chunk(chunk, &mut decided, stop, report);
         }
         let accepted: Vec<usize> = decided
             .iter()
@@ -2726,6 +2778,10 @@ impl Gate {
                 }
                 self.check_extra(&extra)
             }
+            Err(error) if error.is::<ReviewStop>() => {
+                let stop = *error.downcast_ref::<ReviewStop>().expect("The review stop exists");
+                self.stop_review_chunk(chunk, &mut decided, stop, report)
+            }
             Err(error) if error.is::<SecretViolation>() || error.is::<Unmerged>() => {
                 // The set refused as a whole. Decide each accepted change alone.
                 for (index, record) in decided.iter().enumerate() {
@@ -2760,6 +2816,10 @@ impl Gate {
             None,
             &mut merge_requests,
         ) {
+            Err(error) if error.is::<ReviewStop>() => {
+                let stop = *error.downcast_ref::<ReviewStop>().expect("The review stop exists");
+                self.stop_review_record(&mut record, stop);
+            }
             Err(error) if error.is::<SecretViolation>() => {
                 let SecretViolation(findings) = error.downcast::<SecretViolation>()?;
                 record.reject_secrets(findings);
@@ -2823,8 +2883,26 @@ impl Gate {
         reconsideration: Option<Reconsideration>,
     ) -> Result<Record> {
         let case_id = self.capture_record_case(&item.hash, reviewed)?;
-        let mut record = self.decide(item, text, reviewed)?;
+        self.review_context(&item.hash, None, "primary");
+        let mut record = match self.decide(item, text, reviewed) {
+            Ok(record) => record,
+            Err(error) if error.is::<ReviewStop>() => {
+                let mut record = Record::new(
+                    item.hash.clone(),
+                    item.message.clone(),
+                    "escalate",
+                    "gate",
+                    String::new(),
+                );
+                record.configuration = Some(Rc::clone(&self.configuration));
+                self.review_failure(record, error)?
+            }
+            Err(error) => return Err(error),
+        };
         if reconsideration.is_some() && record.execution_error.is_some() {
+            if let Some(stop) = self.review_stop() {
+                return Err(stop.into());
+            }
             return Err(InvalidModelReply.into());
         }
         record.case_id = case_id;
@@ -3018,7 +3096,10 @@ impl Gate {
         if matches!(self.settings.model_api, Api::SystemOne) && !rules.is_empty() {
             return self.decide_typed(record, &item.hash, &candidate, &policy, &rules, binding, &input);
         }
-        let response = self.model.review(&policy, &input)?;
+        let response = match self.model.review(&policy, &input) {
+            Ok(response) => response,
+            Err(error) => return self.review_failure(record, error),
+        };
         let mut requests = vec![response.evidence];
         record.model = Some(self.settings.model.clone());
         let mut answers = Vec::new();
@@ -3044,11 +3125,22 @@ impl Gate {
             .escalation_confidence
             .unwrap_or(DEFAULT_ESCALATION_CONFIDENCE);
         if self.escalation.is_some() && verdict.confidence.is_none_or(|value| value < threshold) {
-            let second = self
+            self.review_context(&item.hash, None, "larger");
+            let second = match self
                 .escalation
                 .as_ref()
                 .expect("an escalation profile has a model")
-                .review(&policy, &input)?;
+                .review(&policy, &input)
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    record.answers = answers;
+                    record.review = Some(binding);
+                    record.provenance.as_mut().context("Decision provenance is absent")?
+                        .requests.extend(requests);
+                    return self.review_failure(record, error);
+                }
+            };
             requests.push(second.evidence);
             if let Some(second) = second.value {
                 answers.push(self.typed_answer(
@@ -3094,7 +3186,10 @@ impl Gate {
         binding: ReviewBinding,
         input: &RawValue,
     ) -> Result<Record> {
-        let mut batch = self.model.review_questions(policy, input, rules)?;
+        let mut batch = match self.model.review_questions(policy, input, rules) {
+            Ok(batch) => batch,
+            Err(error) => return self.review_failure(record, error),
+        };
         let mut answers = self.batch_answers("review", &batch, rules)?;
         let mut requests = std::mem::take(&mut batch.evidence);
         let mut escalation_used = None;
@@ -3108,7 +3203,17 @@ impl Gate {
             .any(|answer| answer.confidence.is_none_or(|value| value < threshold));
         if weak && batch.invalid.is_empty() {
             if let Some(model) = &self.escalation {
-                let mut second = model.review_questions(policy, input, rules)?;
+                self.review_context(hash, None, "larger");
+                let mut second = match model.review_questions(policy, input, rules) {
+                    Ok(batch) => batch,
+                    Err(error) => {
+                        record.answers = answers;
+                        record.review = Some(binding);
+                        record.provenance.as_mut().context("Decision provenance is absent")?
+                            .requests.extend(requests);
+                        return self.review_failure(record, error);
+                    }
+                };
                 if second.invalid.is_empty() {
                     answers.extend(self.batch_answers("review-escalation", &second, rules)?);
                     requests.extend(std::mem::take(&mut second.evidence));
@@ -3138,7 +3243,22 @@ impl Gate {
                 (Some(_), Some(model)) => model,
                 _ => &self.model,
             };
-            match self.pick_evidence(candidate, policy, input, model, &mut answers, &mut requests)? {
+            self.review_context(
+                hash,
+                None,
+                if escalation_used.is_some() { "larger" } else { "primary" },
+            );
+            let evidence = match self.pick_evidence(candidate, policy, input, model, &mut answers, &mut requests) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    record.answers = answers;
+                    record.review = Some(binding);
+                    record.provenance.as_mut().context("Decision provenance is absent")?
+                        .requests.extend(requests);
+                    return self.review_failure(record, error);
+                }
+            };
+            match evidence {
                 Ok(detail) => verdict.reason.push_str(&detail),
                 Err(problem) => {
                     verdict.decision = "escalate".into();
@@ -3473,6 +3593,10 @@ impl Gate {
         resolution: Option<ResolutionInput<'_>>,
         merge_requests: &mut Vec<crate::provenance::RequestEvidence>,
     ) -> Result<Landing> {
+        self.check_review()?;
+        if let Some(hash) = hashes.first() {
+            self.review_context(hash, None, "primary");
+        }
         let entries = if let Some(input) = &resolution {
             input.pijul.log(&self.settings.main)?
         } else {
@@ -3596,7 +3720,11 @@ impl Gate {
         if let Some(checks) = checks {
             self.require_current_main(main)?;
             let cache = self.ledger.verification_directory()?;
-            let verification = Rc::new(checks.run(
+            let timeout = match &self.review_control {
+                Some(control) => self.settings.check_timeout.min(control.remaining()?),
+                None => self.settings.check_timeout,
+            };
+            let verification = match checks.run(
                 &source,
                 hashes,
                 merge.as_ref().map(|record| record.hash.as_str()),
@@ -3604,10 +3732,18 @@ impl Gate {
                     channel: self.settings.main.clone(),
                     state: main.state.clone(),
                 },
-                self.settings.check_timeout,
+                timeout,
                 &self.settings.interrupted,
                 Some(&cache),
-            )?);
+            ) {
+                Ok(verification) => Rc::new(verification),
+                Err(error) => {
+                    if let Err(stop) = self.check_review() {
+                        return Err(stop.context(error));
+                    }
+                    return Err(error);
+                }
+            };
             for record in &mut audit {
                 record.verification = Some(Rc::clone(&verification));
                 record
@@ -3623,6 +3759,7 @@ impl Gate {
             .check_paths(&paths)
             .map_err(|error| Unmerged(error.to_string()))?;
         self.require_current_main(main)?;
+        self.check_review()?;
         if self.settings.interrupted.load(Ordering::Relaxed) {
             bail!("Interrupted before acceptance");
         }
@@ -3934,6 +4071,9 @@ impl Gate {
                         }
                     }
                     None => {
+                        if let Some(hash) = hashes.first() {
+                            self.review_context(hash, None, "primary");
+                        }
                         let response = self.model.merge(&prompt, &labels)?;
                         let result = response.value.ok_or_else(|| {
                             anyhow::Error::new(InvalidModelReply).context(Unmerged(format!(
@@ -3972,6 +4112,9 @@ impl Gate {
                     && self.escalation.is_some()
                     && result.confidence.is_none_or(|value| value < threshold)
                 {
+                    if let Some(hash) = hashes.first() {
+                        self.review_context(hash, None, "larger");
+                    }
                     let second = self
                         .escalation
                         .as_ref()
@@ -4570,6 +4713,7 @@ mod durability_tests {
 }
 
 mod window_review;
+mod review_controls;
 
 #[cfg(test)]
 mod bounded_tests;
@@ -4665,6 +4809,8 @@ mod feature_tests {
             max_change_chars: 100_000,
             timeout: Duration::from_secs(10),
             check_timeout: Duration::from_secs(10),
+            max_review_requests: 128,
+            review_timeout_seconds: 900.0,
             interrupted: Arc::new(AtomicBool::new(false)),
         };
         Ok((directory, settings, candidate))
@@ -5328,6 +5474,8 @@ mod feature_tests {
                 max_change_chars: 100_000,
                 timeout: Duration::from_secs(10),
                 check_timeout: Duration::from_secs(10),
+                max_review_requests: 128,
+                review_timeout_seconds: 900.0,
                 interrupted: Arc::new(AtomicBool::new(false)),
             },
             &Selection::default(),
@@ -5400,6 +5548,32 @@ mod feature_tests {
             Ok(())
         });
         Ok((format!("http://{address}/v1"), worker))
+    }
+
+    #[test]
+    fn a_review_request_budget_is_shared_after_an_earlier_acceptance() -> Result<()> {
+        let (_directory, mut settings, first) = pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let second = fixture_edit(&settings, "second.txt", "second\n", "patchgate")?;
+        let (url, worker) = accepting_server(1)?;
+        settings.model_url = url;
+        settings.max_review_requests = 1;
+        let mut gate = Gate::new(settings)?;
+        let inbox = gate.pijul.snapshot("inbox")?;
+        let report = gate.review_report(false, &Selection::default())?;
+        worker.join().expect("The model fixture panicked")?;
+        let usage = report.review_usage.as_ref().context("Review usage is absent")?;
+        assert_eq!(usage.stop, Some(ReviewStop::RequestLimit));
+        assert_eq!(usage.requests, 1);
+        let main = gate.pijul.hashes("main")?;
+        assert!(main.contains(&first));
+        assert!(!main.contains(&second));
+        assert_eq!(gate.pijul.snapshot("inbox")?, inbox);
+        let latest = gate.ledger.latest()?;
+        assert_eq!(latest[&first].decision, "accept");
+        assert_eq!(latest[&second].decision, "escalate");
+        assert_eq!(latest[&second].execution_error.as_deref(), Some("review-request-limit"));
+        assert!(gate.ledger.pending()?.is_none());
+        Ok(())
     }
 
     #[test]

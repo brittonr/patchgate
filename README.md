@@ -61,8 +61,11 @@ Ordinary model verdicts also go into `.pijul/patchgate/decisions/`.
 The key includes the candidate, policy bytes, reviewed main state, model identity, and confidence threshold.
 Typed conflict choices go into `.pijul/patchgate/merges/`, keyed by the conflict prompt, the exact options, and the model identity.
 The gate refuses a cache entry whose key, binding, size, or file type differs.
-An invalid entry causes a model request, not an acceptance.
+Invalid cache data cannot authorize acceptance.
 The typed review key also includes the typed review protocol version.
+
+Completed bounded-review batches go into `.pijul/patchgate/windows/`.
+They retain typed answers and request evidence, not source text.
 
 ### Structured review data
 
@@ -907,7 +910,7 @@ $ patchgate review --dry-run --json
 ```
 
 Dry-run copies native metadata into a private temporary repository.
-It restores recorded source, copies existing decisions, and executes the normal review flow there.
+It restores recorded source, copies existing decisions and completed-window cache entries, and executes the normal review flow there.
 It excludes original gate keys and unrecorded files.
 Original channels, work files, audit bytes, acceptance journals, and keys stay unchanged.
 The isolated flow can create its own merge key and Nix store results.
@@ -1049,6 +1052,80 @@ Reports omit source text, messages, authors, and policy bytes.
 Credential findings cause redaction of all reported file names without changes to cost counts.
 Context errors omit native details that could disclose file names.
 
+### Review progress and limits
+
+Progress uses stderr, including with `--json`.
+Each request reports the candidate, context window, model tier, request count, and elapsed seconds when available.
+Progress contains no source text, policy text, request bodies, response bodies, or bearer keys.
+
+One review pass shares one request limit and one monotonic deadline.
+Both model tiers, context windows, missing-answer recovery, citations, and merge requests use those limits.
+Failed HTTP attempts count. Cached decisions make no request.
+The exact request limit allows a complete review at that count.
+
+Trusted Nix checks receive at most the remaining review time.
+The gate checks the stop state before conditional native acceptance.
+
+```console
+$ PATCHGATE_MAX_REVIEW_REQUESTS=32 PATCHGATE_REVIEW_TIMEOUT=120 patchgate review --dry-run --json
+```
+
+Review JSON includes `review_usage` with `requests`, `max_requests`, `elapsed_seconds`, `timeout_seconds`, and `stop`.
+The `stop` value is `null`, `request-limit`, `timeout`, or `interrupted`.
+A stopped review returns valid JSON and a nonzero exit. SIGINT returns exit 130.
+Stop records use `review-request-limit`, `review-timeout`, or `interrupted` for `execution_error`.
+
+Partial coverage never authorizes acceptance. Earlier committed batches remain in main.
+SIGINT and the review deadline close an active HTTP header or body wait.
+Cancellation closes the client request, not the external model server.
+The server can continue inference after the client disconnects.
+
+Each watch pass and reconsideration starts a fresh count and deadline.
+Use `patchgate reconsider <hash> -m "Continue after interruption"` for a stopped candidate.
+This starts a new review scope. The gate can reuse exact completed windows under the same bindings.
+
+CLI smoke evidence: `.devenv/clef-tests/review-controls-20261025.json`.
+All eleven scenarios use actual Pijul changes and scripted local SystemOne replies.
+They cover exact-limit acceptance, isolated review, shared request limits, trusted settings, deadlines, and SIGINT.
+The header and body cancellation scenarios confirm client socket closure and unchanged source channels.
+These checks do not measure live CLEF accuracy or server-side inference cancellation.
+
+### Exact completed-window reuse
+
+Primary and larger-tier batches use separate entries in `.pijul/patchgate/windows/`.
+Keys bind the source and input digests, request evidence, both model identities, decision thresholds, and a window-review protocol version.
+Model identities include normalized endpoints, APIs, names, and declared revisions.
+A declared revision does not verify server weights.
+
+Only complete typed batches enter the cache. Interrupted or invalid batches do not.
+Changed window boundaries, policy, main state, models, or decision thresholds cause a cache miss.
+Changes to request and time limits do not discard completed windows.
+Unsafe or malformed cache files can stop the command.
+
+The ledger retains original typed answers and request evidence.
+Each `coverage.pages[].cache_hits` entry identifies reused evidence in `provenance.requests`:
+
+| Field | Meaning |
+| --- | --- |
+| `key` | Exact cache entry digest. |
+| `request_start` | First reused request-evidence index. |
+| `request_count` | Number of reused original requests, including missing-answer recovery. |
+
+Page `request_count` counts retained evidence entries.
+`review_usage.requests` counts only live HTTP requests.
+Cache hits do not consume the request limit, but they still consume elapsed review time.
+The record-level `reused` flag still describes ordinary whole-verdict reuse, not window cache hits.
+
+Citations run fresh after all windows pass.
+Secret checks, conflicts, trusted Nix checks, and conditional native acceptance remain active.
+Dry-run copies complete entries into its private repository without source cache writes.
+Remove `.pijul/patchgate/windows/` to force fresh bounded-window calls.
+
+Evidence: `.devenv/clef-tests/window-reuse-20261025.json`.
+All fifteen CLI scenarios use actual Pijul changes with scripted local SystemOne replies.
+They cover interrupted tiers, recovered answers, exact invalidation, isolated reuse, invalid cache answers, and fresh citation refusal.
+They do not measure live CLEF accuracy, performance, or human-effort savings.
+
 ### Replay case capture and human labels
 
 ```console
@@ -1178,6 +1255,8 @@ An optional `policy` file replaces trusted policy only inside the isolated repla
 | `max_change_chars` | `8000` |
 | `timeout_seconds` | `300` |
 | `check_timeout_seconds` | `900` |
+| `max_review_requests` | `128` |
+| `review_timeout_seconds` | `900` |
 
 Replay does not inherit these review settings from `PATCHGATE_*` variables.
 The gate retains its fixed protected paths, including `patchgate.json`.
@@ -1404,7 +1483,10 @@ Record `patchgate.json` on main to define repository review rules:
     "documentation_paths": ["docs/*", "*.md"],
     "max_change_chars": 8000,
     "timeout_seconds": 300,
-    "check_timeout_seconds": 900
+    "check_timeout_seconds": 900,
+
+    "max_review_requests": 128,
+    "review_timeout_seconds": 900
   }
 }
 ```
@@ -1433,6 +1515,9 @@ A malformed file never activates environment defaults.
 Paths must be safe and relative.
 `documentation_paths` patterns use the same safe syntax as `protected` patterns.
 Time limits must be finite positive seconds, and fractional seconds are valid.
+
+The request limit must be positive.
+The review deadline must also fit the monotonic clock range.
 
 The gate refreshes these settings before each review pass and human decision.
 New decision records retain their effective values, source, and exact configuration text SHA-256.
@@ -1507,6 +1592,8 @@ Use `PATCHGATE_MODEL_PROFILE=chat patchgate review` to select the example chat p
 | `PATCHGATE_MAX_CHANGE_CHARS` | `8000` | Structured input limit per review request or conflict prompt. SystemOne can divide unchanged context between bounded requests. |
 | `PATCHGATE_TIMEOUT` | `300` | The seconds to wait for one reply. The first reply includes the time to load the model. |
 | `PATCHGATE_CHECK_TIMEOUT` | `900` | The positive seconds allowed for Nix verification of one candidate. |
+| `PATCHGATE_MAX_REVIEW_REQUESTS` | `128` | Maximum HTTP requests in one review pass across both model tiers. |
+| `PATCHGATE_REVIEW_TIMEOUT` | `900` | Positive seconds for one complete review pass. |
 | `PATCHGATE_INBOX`, `PATCHGATE_MAIN` | `inbox`, `main` | The channel names. The `--inbox` and `--main` options also set them. |
 | `PATCHGATE_LANES` | unset | Lane channels, with commas between them. A review folds them into the inbox first. |
 | `PATCHGATE_MIN_CONFIDENCE` | unset | A typed answer below this selected-label probability becomes `escalate`. Use a value between 0 and 1. |
@@ -1516,6 +1603,8 @@ Use `PATCHGATE_MODEL_PROFILE=chat patchgate review` to select the example chat p
 
 `PATCHGATE_CHECK_TIMEOUT` must produce a finite, positive duration.
 Zero and values that round to zero nanoseconds stop the command.
+The review limits must also be positive.
+`PATCHGATE_REVIEW_TIMEOUT` must produce a finite, nonzero duration within the monotonic clock range.
 
 ## Limits
 
@@ -1530,7 +1619,8 @@ Zero and values that round to zero nanoseconds stop the command.
   Set the model context and `PATCHGATE_MAX_CHANGE_CHARS` together.
 - patchgate merges only the conflicts in the table above. A merge that needs a new line, for example a line that combines both sides, goes to a human.
 - Two gate processes can review at the same time. Each acceptance still needs the exact reviewed main state. A moved state stops that command without acceptance.
-- A reused verdict or conflict choice makes no model request. Remove `.pijul/patchgate/decisions/` or `.pijul/patchgate/merges/` to force a new request.
+- Cached verdicts, conflict choices, and context windows can avoid model requests.
+  Remove the corresponding directory under `.pijul/patchgate/`: `decisions/`, `merges/`, or `windows/`.
 - A typed rule citation that names a path or span outside the change escalates the change. patchgate does not accept a wrong citation.
 - The global verdict and the rule answers can disagree. A rejecting rule decides over an accepting global verdict.
 - A deterministic documentation acceptance skips only the model. Every secret check and Nix check still applies.

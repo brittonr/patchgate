@@ -18,9 +18,11 @@ pub mod provenance;
 pub mod release_policy;
 mod resolution;
 mod review;
+mod review_control;
 mod review_plan;
 mod secrets;
 mod verify;
+mod window_cache;
 
 use std::path::PathBuf;
 use std::sync::{
@@ -425,6 +427,9 @@ fn show_review(report: &gate::ReviewReport, json: bool) -> Result<()> {
                 "This report does not authorize acceptance. Run patchgate review for a new review."
             );
         }
+    }
+    if let Some(stop) = report.review_usage.as_ref().and_then(|usage| usage.stop) {
+        return Err(stop.into());
     }
     if report.dry_run
         && report

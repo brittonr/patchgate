@@ -1,5 +1,5 @@
 use std::path::{Component, Path};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,10 @@ pub struct Values {
     pub max_change_chars: usize,
     pub timeout_seconds: f64,
     pub check_timeout_seconds: f64,
+    /// Maximum model requests in one review pass.
+    pub max_review_requests: usize,
+    /// Maximum elapsed time for one review pass.
+    pub review_timeout_seconds: f64,
 }
 
 impl Default for Values {
@@ -30,6 +34,8 @@ impl Default for Values {
             max_change_chars: 8000,
             timeout_seconds: 300.0,
             check_timeout_seconds: 900.0,
+            max_review_requests: 128,
+            review_timeout_seconds: 900.0,
         }
     }
 }
@@ -59,6 +65,7 @@ pub fn load(pijul: &Pijul, main: &str, fallback: &Values) -> Result<Evidence> {
 
 fn evidence(text: Option<&str>, fallback: &Values) -> Result<Evidence> {
     let Some(text) = text else {
+        validate_review_limits(fallback.max_review_requests, fallback.review_timeout_seconds)?;
         return Ok(Evidence {
             source: "environment".into(),
             path: None,
@@ -124,6 +131,20 @@ fn validate(values: &Values) -> Result<()> {
             "Trusted configuration time limits must be finite, positive, and within range"
         );
     }
+    validate_review_limits(values.max_review_requests, values.review_timeout_seconds)?;
+    Ok(())
+}
+
+pub(crate) fn validate_review_limits(max_requests: usize, seconds: f64) -> Result<()> {
+    ensure!(max_requests > 0, "The review request limit must be positive.");
+    ensure!(
+        seconds.is_finite()
+            && seconds > 0.0
+            && Duration::try_from_secs_f64(seconds).is_ok_and(|duration| {
+                !duration.is_zero() && Instant::now().checked_add(duration).is_some()
+            }),
+        "The review time limit must be finite, positive, and within the clock range."
+    );
     Ok(())
 }
 
@@ -161,6 +182,8 @@ mod tests {
             max_change_chars: 0,
             timeout_seconds: 0.0,
             check_timeout_seconds: 0.0,
+            max_review_requests: 7,
+            review_timeout_seconds: 2.5,
         };
         let loaded = evidence(None, &fallback)?;
         assert_eq!(loaded.source, "environment");
@@ -179,6 +202,8 @@ mod tests {
             max_change_chars: 1,
             timeout_seconds: 1.0,
             check_timeout_seconds: 1.0,
+            max_review_requests: 7,
+            review_timeout_seconds: 2.5,
         };
         let text = "{\r\n  \"schema_version\": 1, \"settings\": {}\r\n}\n";
         let loaded = evidence(Some(text), &fallback)?;
@@ -281,6 +306,41 @@ mod tests {
                 assert!(validate(&values).is_err());
             }
         }
+    }
+
+    #[test]
+    fn review_limits_reject_unsafe_values_without_a_recorded_override() {
+        let mut fallback = Values::default();
+        fallback.max_review_requests = 0;
+        assert!(evidence(None, &fallback).is_err());
+        assert!(parse(json!({"max_review_requests": 0})).is_err());
+        assert!(parse(json!({"max_review_requests": -1})).is_err());
+        for seconds in [
+            0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX, 1e-100, 1e19,
+        ] {
+            fallback.max_review_requests = 1;
+            fallback.review_timeout_seconds = seconds;
+            assert!(evidence(None, &fallback).is_err(), "{seconds}");
+            let mut values = Values::default();
+            values.review_timeout_seconds = seconds;
+            assert!(validate(&values).is_err(), "{seconds}");
+        }
+    }
+
+    #[test]
+    fn recorded_review_limits_replace_unsafe_environment_limits() -> Result<()> {
+        let fallback = Values {
+            max_review_requests: 0,
+            review_timeout_seconds: f64::INFINITY,
+            ..Values::default()
+        };
+        let text = r#"{"schema_version":1,"settings":{"max_review_requests":3,"review_timeout_seconds":0.125}}"#;
+        let loaded = evidence(Some(text), &fallback)?;
+        assert_eq!(loaded.source, "main");
+        validate(&loaded.values)?;
+        assert_eq!(loaded.values.max_review_requests, 3);
+        assert_eq!(loaded.values.review_timeout_seconds, 0.125);
+        Ok(())
     }
 
     #[test]

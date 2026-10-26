@@ -76,6 +76,8 @@ struct Configuration {
     max_change_chars: usize,
     timeout_seconds: f64,
     check_timeout_seconds: f64,
+    max_review_requests: usize,
+    review_timeout_seconds: f64,
 }
 
 impl Default for Configuration {
@@ -86,6 +88,8 @@ impl Default for Configuration {
             max_change_chars: 8000,
             timeout_seconds: 300.0,
             check_timeout_seconds: 900.0,
+            max_review_requests: 128,
+            review_timeout_seconds: 900.0,
         }
     }
 }
@@ -584,6 +588,19 @@ fn validate_configuration(configuration: &Configuration) -> Result<()> {
         std::time::Duration::try_from_secs_f64(configuration.timeout_seconds).is_ok()
             && std::time::Duration::try_from_secs_f64(configuration.check_timeout_seconds).is_ok(),
         "Replay time limits must be finite and nonnegative."
+    );
+    ensure!(
+        configuration.max_review_requests > 0,
+        "The review request limit must be positive."
+    );
+    let seconds = configuration.review_timeout_seconds;
+    ensure!(
+        seconds.is_finite()
+            && seconds > 0.0
+            && std::time::Duration::try_from_secs_f64(seconds).is_ok_and(|duration| {
+                !duration.is_zero() && Instant::now().checked_add(duration).is_some()
+            }),
+        "The review time limit must be finite, positive, and within the clock range."
     );
     let policy = normalize_policy_path(Path::new(&configuration.policy_path))?;
     ensure!(
@@ -1202,6 +1219,14 @@ fn execute(
             "PATCHGATE_CHECK_TIMEOUT",
             comparison.configuration.check_timeout_seconds.to_string(),
         )
+        .env(
+            "PATCHGATE_MAX_REVIEW_REQUESTS",
+            comparison.configuration.max_review_requests.to_string(),
+        )
+        .env(
+            "PATCHGATE_REVIEW_TIMEOUT",
+            comparison.configuration.review_timeout_seconds.to_string(),
+        )
         .env("PATCHGATE_MODEL_URL", &variant.model_url)
         .env("PATCHGATE_MODEL", &variant.model)
         .env("PATCHGATE_MODEL_API", &variant.api)
@@ -1710,10 +1735,14 @@ mod tests {
         let mut manifest = fixture();
         manifest.configuration.max_change_chars = 100;
         manifest.configuration.timeout_seconds = 1.25;
+        manifest.configuration.max_review_requests = 11;
+        manifest.configuration.review_timeout_seconds = 1.75;
         let mut configuration = Configuration::default();
         configuration.max_change_chars = 200;
         configuration.timeout_seconds = 0.125;
         configuration.check_timeout_seconds = 2.75;
+        configuration.max_review_requests = 3;
+        configuration.review_timeout_seconds = 0.5;
         manifest.cases[0].configuration = Some(configuration.clone());
         assert!(validate(&manifest, "POLICY.md").is_ok());
         let comparison = Comparison::new(
@@ -1722,6 +1751,11 @@ mod tests {
             &manifest.configuration,
         );
         assert_eq!(comparison.configuration, configuration);
+        let mut observed = comparison;
+        observed.evidence = Some(json!({"configuration": {"values": manifest.configuration}}));
+        assert!(!observed_configuration_matches(&observed));
+        observed.evidence = Some(json!({"configuration": {"values": configuration}}));
+        assert!(observed_configuration_matches(&observed));
         manifest.cases[0]
             .configuration
             .as_mut()
@@ -1745,6 +1779,32 @@ mod tests {
             .timeout_seconds,
             1.25
         );
+    }
+
+    #[test]
+    fn replay_rejects_unsafe_review_limits_at_each_scope() {
+        let mut manifest = fixture();
+        manifest.configuration.max_review_requests = 0;
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.configuration = Configuration::default();
+        manifest.cases[0].configuration = Some(Configuration {
+            max_review_requests: 0,
+            ..Configuration::default()
+        });
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        for seconds in [
+            0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX, 1e-100, 1e19,
+        ] {
+            manifest.cases[0].configuration = None;
+            manifest.configuration.review_timeout_seconds = seconds;
+            assert!(validate(&manifest, "POLICY.md").is_err(), "{seconds}");
+            manifest.configuration = Configuration::default();
+            manifest.cases[0].configuration = Some(Configuration {
+                review_timeout_seconds: seconds,
+                ..Configuration::default()
+            });
+            assert!(validate(&manifest, "POLICY.md").is_err(), "{seconds}");
+        }
     }
 
     #[test]
@@ -1779,6 +1839,16 @@ mod tests {
         manifest.cases[0].expected = Label::Accept;
         assert!(validate(&manifest, "POLICY.md").is_err());
         manifest.cases[0].expected = Label::Reject;
+        manifest.cases[0].snapshot.as_mut().unwrap()["configuration"]["values"]
+            ["max_review_requests"] = json!(1);
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[0].snapshot.as_mut().unwrap()["configuration"]["values"]
+            ["max_review_requests"] = json!(manifest.configuration.max_review_requests);
+        manifest.cases[0].snapshot.as_mut().unwrap()["configuration"]["values"]
+            ["review_timeout_seconds"] = json!(0.5);
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[0].snapshot.as_mut().unwrap()["configuration"]["values"]
+            ["review_timeout_seconds"] = json!(manifest.configuration.review_timeout_seconds);
         manifest.cases[0].snapshot.as_mut().unwrap()["base"] = json!(["B".repeat(53)]);
         assert!(validate(&manifest, "POLICY.md").is_err());
     }

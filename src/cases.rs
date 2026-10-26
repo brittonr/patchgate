@@ -164,6 +164,10 @@ fn validate_values(values: &Values) -> Result<()> {
             && std::time::Duration::try_from_secs_f64(values.check_timeout_seconds).is_ok(),
         "Captured time limits must be finite and nonnegative."
     );
+    crate::configuration::validate_review_limits(
+        values.max_review_requests,
+        values.review_timeout_seconds,
+    )?;
     ensure!(
         values
             .protected
@@ -534,7 +538,7 @@ impl Store {
                     "base": record.snapshot.base,
                     "candidate": record.snapshot.candidate,
                     "expected": record.labels.last().context("The case label is absent.")?.expected,
-                    "configuration": settings(&record.snapshot)?,
+                    "configuration": record.snapshot.configuration["values"],
                     "snapshot": record.snapshot,
                     "labels": record.labels,
                     "tags": record.tags,
@@ -546,7 +550,7 @@ impl Store {
             "repository": repo,
             "main": first.snapshot.main,
             "inbox": first.snapshot.inbox,
-            "configuration": settings(&first.snapshot)?,
+            "configuration": first.snapshot.configuration["values"],
             "cases": cases,
             "variants": variants,
         });
@@ -752,6 +756,52 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn capture_rejects_unsafe_review_limits() {
+        let (_directory, snapshot) = fixture();
+        let store = Store::new(&snapshot.repository);
+        let mut invalid = snapshot.clone();
+        invalid.configuration["values"]["max_review_requests"] = json!(0);
+        assert!(store.capture(invalid).is_err());
+        for seconds in [0.0, -1.0, 1e-100, 1e19, f64::MAX] {
+            let mut invalid = snapshot.clone();
+            invalid.configuration["values"]["review_timeout_seconds"] = json!(seconds);
+            assert!(store.capture(invalid).is_err(), "{seconds}");
+        }
+    }
+
+    #[test]
+    fn historical_review_limits_do_not_change_case_bytes_or_identity() {
+        let (directory, mut snapshot) = fixture();
+        snapshot.repository = fs::canonicalize(&snapshot.repository).unwrap();
+        let store = Store::new(&snapshot.repository);
+        let expected_id = identity(&snapshot).unwrap();
+        let record = store.capture(snapshot.clone()).unwrap();
+        assert_eq!(record.id, expected_id);
+        let path = snapshot
+            .repository
+            .join(".pijul/patchgate/cases")
+            .join(format!("{}.json", record.id));
+        let original = fs::read(&path).unwrap();
+        let loaded = store.list().unwrap().pop().unwrap();
+        assert_eq!(loaded.id, expected_id);
+        assert_eq!(loaded.snapshot.configuration, snapshot.configuration);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        store
+            .label(&record.id, Label::Reject, "The reviewer rejects the change.")
+            .unwrap();
+        let labeled = fs::read(&path).unwrap();
+        let variants = variants(directory.path());
+        let output = directory.path().join("historical.json");
+        store.export(&[record.id], &variants, &output).unwrap();
+        let manifest: Value = serde_json::from_slice(&fs::read(output).unwrap()).unwrap();
+        let exported = &manifest["cases"][0];
+        assert_eq!(exported["id"], expected_id);
+        assert_eq!(exported["snapshot"]["configuration"], snapshot.configuration);
+        assert_eq!(exported["configuration"], snapshot.configuration["values"]);
+        assert_eq!(fs::read(path).unwrap(), labeled);
     }
 
     #[test]
@@ -970,6 +1020,8 @@ mod tests {
             .unwrap();
         let mut second = snapshot.clone();
         second.configuration["values"]["max_change_chars"] = json!(16000);
+        second.configuration["values"]["max_review_requests"] = json!(5);
+        second.configuration["values"]["review_timeout_seconds"] = json!(0.25);
         let second = store.capture(second).unwrap();
         store
             .label(
@@ -983,8 +1035,11 @@ mod tests {
         let manifest: Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
         for case in manifest["cases"].as_array().unwrap() {
             assert_eq!(
-                case["configuration"],
-                case["snapshot"]["configuration"]["values"]
+                serde_json::from_value::<Values>(case["configuration"].clone()).unwrap(),
+                serde_json::from_value::<Values>(
+                    case["snapshot"]["configuration"]["values"].clone()
+                )
+                .unwrap()
             );
             assert_eq!(case["base"], case["snapshot"]["base"]);
             assert_eq!(case["expected"], case["labels"][0]["expected"]);
