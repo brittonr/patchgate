@@ -1134,6 +1134,27 @@ Client sandbox configuration does not prove daemon enforcement.
 The daemon, build machines, caches, and sandbox policy remain trusted.
 Pijul, Nix, and merge-signature tools resolve from absolute `PATH` directories, not relative entries.
 
+#### Model readiness failures
+
+Failed model requests include an optional `model_failure` object in the diagnostic check.
+The object contains `kind`. HTTP failures also contain numeric `status`.
+Text output gives the corresponding failure and repair detail.
+
+| `kind` | Meaning |
+| --- | --- |
+| `connection` | The client could not connect to the configured endpoint. |
+| `timeout` | The model request exceeded its time limit. |
+| `http` | The server returned an HTTP error status. Check the API path and authentication settings. |
+| `invalid-response` | The HTTP response contained no valid review decision. |
+| `request` | Another request or response transfer failure occurred. |
+
+These diagnostics exclude server replies, credentials, endpoint URLs, and declared checkpoint revisions from the failure object.
+They do not change failure exits or acceptance authority.
+Local configuration errors retain their existing details.
+Checked initialization uses the same failure object for the optional escalation model.
+Doctor does not probe that escalation profile.
+
+
 #### Runtime probes
 
 ```console

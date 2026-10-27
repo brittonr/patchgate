@@ -85,6 +85,19 @@ pub struct Response<T> {
     pub evidence: RequestEvidence,
 }
 
+#[derive(Debug)]
+pub(crate) struct HttpStatusError {
+    pub status: u16,
+}
+
+impl std::fmt::Display for HttpStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Model server answered HTTP {}", self.status)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
 #[derive(Serialize)]
 struct SystemOneRequest<'a, S, Q = Value> {
     model: &'a str,
@@ -755,7 +768,7 @@ impl Model {
                     .context("Model request failed")?;
                 let status = response.status().as_u16();
                 if status >= 400 {
-                    bail!("Model server answered HTTP {status}");
+                    return Err(HttpStatusError { status }.into());
                 }
                 let bytes = response
                     .bytes()

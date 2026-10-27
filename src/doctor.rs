@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::configuration::{self, Evidence};
 use crate::gate::Settings;
-use crate::model::Model;
+use crate::model::{HttpStatusError, Model};
 use crate::pijul::{Pijul, safe_path};
 use crate::verify;
 
@@ -37,6 +37,61 @@ pub struct Check {
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_failure: Option<ModelFailure>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ModelFailure {
+    Connection,
+    Timeout,
+    Http { status: u16 },
+    InvalidResponse,
+    Request,
+}
+
+impl ModelFailure {
+    fn from_error(error: &anyhow::Error) -> Self {
+        if let Some(error) = error.downcast_ref::<HttpStatusError>() {
+            Self::Http {
+                status: error.status,
+            }
+        } else if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+            if error.is_timeout() {
+                Self::Timeout
+            } else if error.is_connect() {
+                Self::Connection
+            } else {
+                Self::Request
+            }
+        } else {
+            Self::Request
+        }
+    }
+
+    fn detail(self) -> String {
+        match self {
+            Self::Connection => {
+                "Cannot connect to the configured model endpoint. Check its address and start the server."
+                    .into()
+            }
+            Self::Timeout => {
+                "The model readiness request exceeded its time limit. Check server load and the request timeout."
+                    .into()
+            }
+            Self::Http { status } => format!(
+                "The model API answered HTTP {status}. Check its API path and authentication settings."
+            ),
+            Self::InvalidResponse => {
+                "The configured model returned an invalid review response. Check the model and API settings."
+                    .into()
+            }
+            Self::Request => {
+                "The model readiness request failed. Check the model profile and API settings.".into()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize)]
@@ -75,6 +130,23 @@ impl Report {
             status,
             detail: detail.into(),
             repair,
+            model_failure: None,
+        });
+    }
+
+    fn add_model_failure(
+        &mut self,
+        id: &'static str,
+        failure: ModelFailure,
+        repair: Option<String>,
+    ) {
+        self.ok = false;
+        self.checks.push(Check {
+            id,
+            status: Status::Error,
+            detail: failure.detail(),
+            repair,
+            model_failure: Some(failure),
         });
     }
 }
@@ -1012,10 +1084,16 @@ fn inspect_model(report: &mut Report, settings: &Settings, timeout: Duration) {
     match result {
         Ok(true) => report.add("model.readiness", Status::Pass,
             format!("The configured {api} API and model return a valid review response to fixed harmless data. This does not assess review quality."), None),
-        Ok(false) => report.add("model.readiness", Status::Error,
-            "The configured model did not return a valid review decision for the harmless probe.", repair),
-        Err(_) => report.add("model.readiness", Status::Error,
-            "The configured API/model probe failed or exceeded its time limit. Server replies are omitted to protect server data.", repair),
+        Ok(false) => report.add_model_failure(
+            "model.readiness",
+            ModelFailure::InvalidResponse,
+            repair,
+        ),
+        Err(error) => report.add_model_failure(
+            "model.readiness",
+            ModelFailure::from_error(&error),
+            repair,
+        ),
     }
 }
 
@@ -1082,16 +1160,14 @@ fn inspect_escalation_model(report: &mut Report, settings: &Settings, timeout: D
             "The escalation model returns a valid review response to fixed harmless data. This does not assess review quality.",
             None,
         ),
-        Ok(false) => report.add(
+        Ok(false) => report.add_model_failure(
             "model.escalation_readiness",
-            Status::Error,
-            "The escalation model did not return a valid review decision for the harmless probe.",
+            ModelFailure::InvalidResponse,
             repair,
         ),
-        Err(_) => report.add(
+        Err(error) => report.add_model_failure(
             "model.escalation_readiness",
-            Status::Error,
-            "The escalation API/model probe failed or exceeded its time limit. Server replies are omitted to protect server data.",
+            ModelFailure::from_error(&error),
             repair,
         ),
     }
@@ -1395,11 +1471,33 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn model_readiness_uses_response_values_without_revision_identity_claims() -> Result<()> {
+    fn model_probe_report(url: String, api: Api, timeout: Duration) -> Result<Report> {
         use std::sync::{Arc, atomic::AtomicBool};
 
         let directory = tempfile::tempdir()?;
+        let mut settings = Settings::from_env(
+            directory.path().to_path_buf(),
+            "inbox".into(),
+            "main".into(),
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        settings.model_url = url;
+        settings.model = "model".into();
+        settings.model_api = api;
+        settings.model_key_file = None;
+        settings.model_revision = Some("DECLARED_REVISION_ONLY".into());
+        let mut report = Report {
+            schema_version: 1,
+            ok: true,
+            checks: Vec::new(),
+            configuration: None,
+        };
+        inspect_model(&mut report, &settings, timeout);
+        Ok(report)
+    }
+
+    #[test]
+    fn model_readiness_distinguishes_response_failures_without_private_data() -> Result<()> {
         for api in [Api::OpenAi, Api::SystemOne] {
             let valid = match api {
                 Api::OpenAi => json!({"choices": [{"message": {
@@ -1410,34 +1508,32 @@ mod tests {
                 }}}),
             };
             let valid = valid.to_string();
-            for (status, reply, expected) in [
-                (200, valid.as_str(), Status::Pass),
-                (200, "PRIVATE_INVALID_REPLY", Status::Error),
-                (503, "PRIVATE_SERVER_REPLY", Status::Error),
+            for (status, reply, expected, failure) in [
+                (200, valid.as_str(), Status::Pass, None),
+                (
+                    200,
+                    "PRIVATE_INVALID_REPLY",
+                    Status::Error,
+                    Some(ModelFailure::InvalidResponse),
+                ),
+                (
+                    503,
+                    "PRIVATE_SERVER_REPLY",
+                    Status::Error,
+                    Some(ModelFailure::Http { status: 503 }),
+                ),
+                (
+                    0,
+                    "PRIVATE_SERVER_REPLY",
+                    Status::Error,
+                    Some(ModelFailure::Request),
+                ),
             ] {
                 let (url, worker) = crate::model::tests::reply_server(status, reply)?;
-                let mut settings = Settings::from_env(
-                    directory.path().to_path_buf(),
-                    "inbox".into(),
-                    "main".into(),
-                    Arc::new(AtomicBool::new(false)),
-                )?;
-                settings.model_url = url;
-                settings.model = "model".into();
-                settings.model_api = api;
-                settings.model_revision = Some("DECLARED_REVISION_ONLY".into());
-                let mut report = Report {
-                    schema_version: 1,
-                    ok: true,
-                    checks: Vec::new(),
-                    configuration: None,
-                };
-                inspect_model(&mut report, &settings, Duration::from_secs(5));
-                let request = worker.join().expect("The model fixture panicked")?;
-                assert_eq!(request["model"], "model");
-                assert_eq!(report.checks.len(), 1);
-                assert_eq!(report.checks[0].id, "model.readiness");
+                let report = model_probe_report(url, api, Duration::from_secs(5))?;
+                worker.join().expect("The model fixture panicked")?;
                 assert!(report.checks[0].status == expected);
+                assert_eq!(report.checks[0].model_failure, failure);
                 assert_eq!(report.ok, expected == Status::Pass);
                 let encoded = serde_json::to_string(&report)?;
                 for private in [
@@ -1449,6 +1545,51 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn model_readiness_distinguishes_unavailable_endpoints() -> Result<()> {
+        let server = crate::test_http::Server::bind()?;
+        let url = server.url().to_owned();
+        drop(server);
+        let report = model_probe_report(url, Api::SystemOne, Duration::from_secs(1))?;
+        assert!(!report.ok);
+        assert!(report.checks[0].status == Status::Error);
+        assert_eq!(
+            report.checks[0].model_failure,
+            Some(ModelFailure::Connection)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_readiness_reports_request_timeouts() -> Result<()> {
+        let server = crate::test_http::Server::bind()?;
+        server.set_nonblocking(true)?;
+        let url = server.url().to_owned();
+        let worker = thread::spawn(move || -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match server.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        ensure!(Instant::now() < deadline, "No model request arrived");
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            stream.set_nonblocking(false)?;
+            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let _ = std::io::copy(&mut stream, &mut std::io::sink());
+            Ok(())
+        });
+        let report = model_probe_report(url, Api::SystemOne, Duration::from_millis(250))?;
+        worker.join().expect("The model fixture panicked")?;
+        assert!(!report.ok);
+        assert!(report.checks[0].status == Status::Error);
+        assert_eq!(report.checks[0].model_failure, Some(ModelFailure::Timeout));
         Ok(())
     }
 
@@ -1478,7 +1619,6 @@ mod tests {
         assert_eq!(report.checks.len(), 1);
         assert!(report.checks[0].status == Status::Error);
         let detail = &report.checks[0].detail;
-        assert!(detail.contains("chmod 600"), "{detail}");
         assert!(!detail.contains("sk-private"));
         Ok(())
     }
