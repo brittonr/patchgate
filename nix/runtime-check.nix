@@ -73,7 +73,8 @@ pkgs.runCommand "patchgate-runtime-check"
 
     # The evaluator must inspect its own processes without caller tools.
     ${pkgs.coreutils}/bin/env -u PATCHGATE_BIN -u PATCHGATE_EVAL_UNWRAPPED_BIN \
-      PATH="" ${package.eval}/bin/patchgate-eval smoke --case concurrent-review-once
+      PATH="" ${package.eval}/bin/patchgate-eval smoke --case concurrent-review-once \
+        --case revert-race --case revert-uncertain-error
 
     ${pkgs.coreutils}/bin/mkdir "$out"
     printf 'passed\n' > "$out/result"

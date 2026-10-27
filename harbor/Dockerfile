@@ -7,7 +7,7 @@ FROM nixos/nix:2.35.3@sha256:ff480dbb23511aa1c10710aa068ceea5b93fed9bfce5f5379f3
 COPY devenv.lock /build/devenv.lock
 
 COPY nix/harbor-tools.nix nix/pijul.nix /build/nix/
-COPY nix/pijul-apply.patch nix/pijul-archive.patch /build/nix/
+COPY nix/pijul-apply.patch nix/pijul-archive.patch nix/pijul-unrecord.patch /build/nix/
 
 RUN <<'SH'
 set -eu

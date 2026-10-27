@@ -267,7 +267,18 @@ The revert keeps the inbox unchanged. The ledger gets one `revert` record for ea
 
 The revert uses a durable journal like acceptance. A process stop before the native unrecord leaves no revert record. A process stop after it restores the records exactly once.
 
-A direct `pijul apply` or `pijul unrecord` command can change main during a revert. patchgate compares the state under the ledger lock, but the native unrecord has no state condition. Do not run native write commands during a revert.
+Every revert calls patched Pijul with `unrecord --expected-state <STATE>`.
+Pijul compares the full reviewed main state inside the same exclusive native transaction as removal.
+A mismatch returns exit 42 without removal.
+The gate cancels the prepared journal and preserves existing audit bytes.
+
+Other native errors keep the journal because removal can complete before the error.
+Run `patchgate status` to recover that result.
+Recovery records a completed removal exactly once.
+Independent native commands can still change main before or after the transaction.
+
+Use the pinned Pijul runtime.
+Older binaries without conditional removal cannot run gate reverts.
 
 ### When a human must merge
 
@@ -694,6 +705,11 @@ Each binary build uses a generated manifest that declares only its target.
 The application source set also includes the Rust files in `tests/`.
 Both package checks run all test targets from their own source sets.
 
+Application HTTP fixtures use private Unix sockets during tests.
+The production client still uses configured HTTP or HTTPS endpoints.
+These fixtures let the full application suite run inside the Darwin sandbox without a network exception.
+Tests for model replies, timeouts, cancellation, and request limits remain active.
+
 The dependency build receives only materialized `Cargo.toml` and `Cargo.lock` files.
 Rust source changes reuse compiled dependencies.
 Dependency feature changes select new artifacts.
@@ -720,7 +736,7 @@ Caller commands cannot replace its pinned Pijul, OpenSSH, and Nix commands.
 `devenv build` also builds the evaluator and runtime check.
 The runtime check initializes repositories, reviews changes, and verifies a recorded merge with empty and incorrect caller paths.
 It compiles and executes the merged Rust program.
-It also checks evaluator process control without caller tools.
+It also checks evaluator process control, stale revert refusal, and uncertain revert recovery without caller tools.
 Harbor uses the same package outputs and runs the runtime check on Linux.
 
 Normal evaluator operations use the wrapped application.
@@ -1049,6 +1065,7 @@ It uses isolated metadata and fixed harmless model data.
 Each external probe has a time limit of 15 seconds or less.
 Doctor never executes repair commands or reconciles a journal.
 
+Doctor checks `--expected-state` support for both native `apply` and `unrecord`.
 The Pijul help probe does not prove transaction semantics.
 Client sandbox configuration does not prove daemon enforcement.
 The daemon, build machines, caches, and sandbox policy remain trusted.
@@ -1064,7 +1081,7 @@ Runtime mode adds two private probes without source repository changes:
 
 | Check ID | Observed behavior |
 | --- | --- |
-| `pijul.runtime_expected_state` | A stale native state refuses the candidate without state or file changes. The current state accepts the same candidate. |
+| `pijul.runtime_expected_state` | Both native operations refuse stale states without state or file changes. Both succeed with matching states. |
 | `nix.runtime_isolation` | A fresh local derivation cannot read a harmless host marker or inherit private client data. Its output bytes must match. |
 
 The native fixture uses a new temporary signer, not source keys.
@@ -2102,6 +2119,27 @@ Reports:
 
 - `.devenv/atomic-application-verification.json`
 - `.devenv/atomic-native-contract-complete/report.json`
+
+### Atomic revert checks
+
+Both native revert cases fail against the old gate and pass against the conditional removal fix.
+
+```bash
+patchgate-eval smoke --case revert-race --case revert-uncertain-error
+```
+
+`revert-race` advances main at the actual native removal boundary.
+The fixed gate returns exit 42 and keeps both the accepted target and the independent change.
+It preserves audit bytes, inbox state, and work files.
+It cancels the prepared journal.
+
+`revert-uncertain-error` completes real native removal, then returns a wrapper error.
+The gate keeps the durable journal and writes no premature revert record.
+Two later status commands prove recovery and unchanged audit bytes after the first recovery.
+The recovered ledger contains exactly one complete revert record.
+
+Both cases include oracle and nop controls.
+The packaged runtime check executes both cases with its pinned Pijul binary.
 
 ### Trusted Nix checks
 

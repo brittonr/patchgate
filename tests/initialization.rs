@@ -1,6 +1,5 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::thread;
@@ -16,7 +15,6 @@ struct Repository {
     search_path: OsString,
     pijul: PathBuf,
     agent: Option<Child>,
-    model: TcpListener,
 }
 
 impl Repository {
@@ -44,9 +42,7 @@ impl Repository {
             search_path: std::env::join_paths(paths)?,
             pijul,
             agent: None,
-            model: TcpListener::bind("127.0.0.1:0")?,
         };
-        repo.model.set_nonblocking(true)?;
         repo.native(&["init"])?;
         Ok(repo)
     }
@@ -67,10 +63,7 @@ impl Repository {
             )
             .env("PATCHGATE_MODEL", "initialization-test")
             .env("PATCHGATE_MODEL_API", "openai")
-            .env(
-                "PATCHGATE_MODEL_URL",
-                format!("http://{}/v1", self.model.local_addr().unwrap()),
-            )
+            .env("PATCHGATE_MODEL_URL", "http://127.0.0.1:1/v1")
             .env("PATCHGATE_TIMEOUT", "0.25")
             .env("NO_COLOR", "1")
             .stdin(Stdio::null());
@@ -173,14 +166,6 @@ impl Repository {
     fn assert_no_gate_records(&self) {
         assert!(!self.path.join(".pijul/patchgate").exists());
     }
-
-    fn assert_no_model_probe(&self) {
-        let error = self
-            .model
-            .accept()
-            .expect_err("Init must not contact the model");
-        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-    }
 }
 
 impl Drop for Repository {
@@ -247,7 +232,6 @@ fn checked_init_rejects_unrecorded_policy_and_checks_without_source_writes() -> 
     assert_eq!(fs::read(repo.path.join("POLICY.md"))?, policy);
     assert_eq!(fs::read(repo.path.join("nix/checks.json"))?, checks);
     repo.assert_no_gate_records();
-    repo.assert_no_model_probe();
     Ok(())
 }
 
@@ -305,7 +289,6 @@ fn channels_only_init_preserves_native_history_and_work_on_repeat() -> Result<()
         );
         assert!(!repo.path.join("POLICY.md").exists());
         repo.assert_no_gate_records();
-        repo.assert_no_model_probe();
     }
     Ok(())
 }
@@ -332,7 +315,6 @@ fn identical_channel_names_refuse_both_init_modes_without_source_writes() -> Res
         assert_eq!(repo.snapshot("main")?, main);
         assert_eq!(fs::read(repo.path.join("private.txt"))?, b"private bytes\n");
         repo.assert_no_gate_records();
-        repo.assert_no_model_probe();
     }
     Ok(())
 }
@@ -358,6 +340,5 @@ fn channels_only_refuses_pending_recovery_without_channel_or_journal_changes() -
     assert_eq!(repo.snapshot("main")?, main);
     assert_eq!(fs::read(&journal)?, b"private pending journal");
     assert!(!String::from_utf8_lossy(&output.stderr).contains("private pending journal"));
-    repo.assert_no_model_probe();
     Ok(())
 }

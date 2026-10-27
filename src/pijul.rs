@@ -661,16 +661,31 @@ impl Pijul {
             .collect())
     }
 
-    /// Unrecord an exact set of changes from one channel.
-    pub fn unrecord(&self, channel: &str, hashes: &[String]) -> Result<()> {
-        let mut args = vec![
-            OsString::from("unrecord"),
-            OsString::from("--channel"),
-            OsString::from(channel),
-        ];
-        args.extend(hashes.iter().map(OsString::from));
-        self.run(args)?;
-        Ok(())
+    /// Unrecord an exact set only when the channel state matches.
+    pub fn unrecord_if_current(
+        &self,
+        channel: &str,
+        state: Option<&str>,
+        hashes: &[String],
+    ) -> Result<bool> {
+        let (command, output) = self.execute(
+            [
+                "unrecord",
+                "--channel",
+                channel,
+                "--expected-state",
+                state.unwrap_or("empty"),
+            ]
+            .into_iter()
+            .map(OsStr::new)
+            .chain(hashes.iter().map(OsStr::new)),
+            None,
+        )?;
+        if output.status.code() == Some(EXPECTED_STATE_MISMATCH) {
+            return Ok(false);
+        }
+        text_output(output, &command)?;
+        Ok(true)
     }
 }
 

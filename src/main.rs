@@ -25,6 +25,8 @@ mod review_delta;
 mod review_guide;
 mod review_plan;
 mod secrets;
+#[cfg(test)]
+mod test_http;
 mod verify;
 mod window_cache;
 

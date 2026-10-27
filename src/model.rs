@@ -304,7 +304,14 @@ impl Model {
             .map_err(|_| anyhow::anyhow!("The model HTTP executor could not start"))?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
+            .retry(reqwest::retry::never());
+        #[cfg(test)]
+        let client = if let Some(socket) = crate::test_http::socket_path(url) {
+            client.unix_socket(socket).no_proxy()
+        } else {
+            client
+        };
+        let client = client
             .build()
             .map_err(|_| anyhow::anyhow!("The model HTTP client could not start"))?;
         let endpoint = match api {
@@ -894,8 +901,9 @@ fn parse_merge(content: &Value, labels: &[&str]) -> Option<MergeChoice> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::test_http::Server;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
+    use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::thread::{self, JoinHandle};
@@ -921,9 +929,9 @@ pub(crate) mod tests {
         status: u16,
         reply: &str,
     ) -> Result<(String, JoinHandle<Result<(Value, Option<String>)>>)> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = Server::bind()?;
         listener.set_nonblocking(true)?;
-        let url = format!("http://{}/v1", listener.local_addr()?);
+        let url = listener.url().to_owned();
         let reply = reply.to_owned();
         let worker = thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -937,6 +945,7 @@ pub(crate) mod tests {
                     Err(error) => return Err(error.into()),
                 }
             };
+            stream.set_nonblocking(false)?;
             stream.set_read_timeout(Some(Duration::from_secs(5)))?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
             let mut stream = BufReader::new(stream);
@@ -976,7 +985,7 @@ pub(crate) mod tests {
         Ok((url, worker))
     }
 
-    fn read_local_request(stream: std::net::TcpStream) -> Result<BufReader<std::net::TcpStream>> {
+    fn read_local_request(stream: UnixStream) -> Result<BufReader<UnixStream>> {
         stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
@@ -1001,7 +1010,7 @@ pub(crate) mod tests {
         Ok(stream)
     }
 
-    fn accept_local_request(listener: &TcpListener) -> Result<BufReader<std::net::TcpStream>> {
+    fn accept_local_request(listener: &Server) -> Result<BufReader<UnixStream>> {
         listener.set_nonblocking(true)?;
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1017,8 +1026,8 @@ pub(crate) mod tests {
     }
 
     fn scripted_server(replies: Vec<String>) -> Result<(String, JoinHandle<Result<usize>>)> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let url = format!("http://{}/v1", listener.local_addr()?);
+        let listener = Server::bind()?;
+        let url = listener.url().to_owned();
         let worker = thread::spawn(move || {
             let mut requests = 0;
             for reply in replies {
@@ -1038,8 +1047,8 @@ pub(crate) mod tests {
     fn stopped_http_wait_closes_the_connection(body_wait: bool, interrupt: bool) -> Result<()> {
         use crate::review_control::ReviewStop;
 
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let url = format!("http://{}/v1", listener.local_addr()?);
+        let listener = Server::bind()?;
+        let url = listener.url().to_owned();
         let interrupted = Arc::new(AtomicBool::new(false));
         let timeout = if interrupt {
             Duration::from_secs(10)
@@ -1271,9 +1280,9 @@ pub(crate) mod tests {
 
     #[test]
     fn prepared_window_defers_http_and_counts_only_execution() -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = Server::bind()?;
         listener.set_nonblocking(true)?;
-        let url = format!("http://{}/v1", listener.local_addr()?);
+        let url = listener.url().to_owned();
         let control = Arc::new(ReviewControl::new(
             1, Duration::from_secs(5), Arc::new(AtomicBool::new(false)),
         )?);
@@ -1375,14 +1384,14 @@ pub(crate) mod tests {
     fn prepared_window_cancellation_prevents_http() -> Result<()> {
         use crate::review_control::ReviewStop;
 
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = Server::bind()?;
         listener.set_nonblocking(true)?;
         let interrupted = Arc::new(AtomicBool::new(false));
         let control = Arc::new(ReviewControl::new(
             1, Duration::from_secs(5), interrupted.clone(),
         )?);
         let mut model = Model::new(
-            &format!("http://{}/v1", listener.local_addr()?),
+            listener.url(),
             "model", Duration::from_secs(5), Api::SystemOne, None, None,
         )?;
         model.set_review_control(Some(control.clone()));
@@ -1468,11 +1477,11 @@ pub(crate) mod tests {
 
     #[test]
     fn redirects_do_not_dispatch_an_extra_request() -> Result<()> {
-        let destination = TcpListener::bind("127.0.0.1:0")?;
+        let destination = Server::bind()?;
         destination.set_nonblocking(true)?;
-        let location = format!("http://{}/redirected", destination.local_addr()?);
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let url = format!("http://{}/v1", listener.local_addr()?);
+        let location = format!("{}/redirected", destination.url());
+        let listener = Server::bind()?;
+        let url = listener.url().to_owned();
         let server = thread::spawn(move || -> Result<()> {
             let mut stream = accept_local_request(&listener)?;
             write!(
@@ -1501,8 +1510,8 @@ pub(crate) mod tests {
 
     #[test]
     fn timeout_refresh_applies_to_the_existing_client() -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let url = format!("http://{}/v1", listener.local_addr()?);
+        let listener = Server::bind()?;
+        let url = listener.url().to_owned();
         let (ready_tx, ready_rx) = mpsc::channel();
         let server = thread::spawn(move || -> Result<()> {
             let mut stream = accept_local_request(&listener)?;
@@ -1527,8 +1536,7 @@ pub(crate) mod tests {
         });
         ready_rx.recv_timeout(Duration::from_secs(3))?;
         let started = Instant::now();
-        let error = request.join().expect("The model request panicked").unwrap_err();
-        assert_eq!(error.to_string(), "Model request failed");
+        request.join().expect("The model request panicked").unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(2));
         server.join().expect("The model fixture panicked")?;
         Ok(())

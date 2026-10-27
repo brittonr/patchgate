@@ -9,6 +9,7 @@ pkgs.pijul.overrideAttrs (old: {
     patch -d "$(dirname "$archive")" < ${./pijul-archive.patch}
     # Compare channel states inside the native write transaction.
     patch -p1 < ${./pijul-apply.patch}
+    patch -p1 < ${./pijul-unrecord.patch}
   # <!-- ste-disable-next-line semicolon -->
   '';
 })

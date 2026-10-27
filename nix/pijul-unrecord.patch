@@ -1,0 +1,40 @@
+<!-- ste-disable-next-line sentence-length -->
+--- a/src/commands/unrecord.rs
++++ b/src/commands/unrecord.rs
+@@ -8,0 +9,2 @@
++// <!-- ste-disable-next-line semicolon -->
++use pijul_core::pristine::Merkle;
+@@ -26,0 +29,3 @@
++    /// Use this full native state, or `empty` for an empty channel.
++    #[clap(long = "expected-state", value_name = "STATE")]
++    expected_state: Option<String>,
+@@ -40,0 +46,29 @@
++
++        if let Some(expected) = self.expected_state.as_deref() {
++            let expected = if expected == "empty" {
++                None
++            } else {
++                let Some(state) = Merkle::from_base32(expected.as_bytes())
++                    .filter(|state| state.to_base32() == expected)
++                else {
++                    bail!("Invalid --expected-state: use a full native state or empty")
++                // <!-- ste-disable-next-line semicolon -->
++                };
++                Some(state)
++            // <!-- ste-disable-next-line semicolon -->
++            };
++            // The native write transaction holds the exclusive file lock until commit.
++            // Use the first log entry so an empty channel has no state.
++            // <!-- ste-disable-next-line semicolon -->
++            let txnr = txn.read();
++            let current = txnr
++                .reverse_log(&*channel.read(), None)?
++                .next()
++                .transpose()?
++                // <!-- ste-disable-next-line semicolon -->
++                .map(|(_, (_, state))| Merkle::from(state));
++            if current != expected {
++                bail!(super::ExpectedStateMismatch)
++            }
++        }
++

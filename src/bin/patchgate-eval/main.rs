@@ -24,6 +24,7 @@ mod recovery;
 #[path = "../../release_policy.rs"]
 pub mod release_policy;
 mod replay;
+mod revert_race;
 #[path = "../../secrets.rs"]
 pub mod secrets;
 mod stale;
@@ -81,6 +82,11 @@ enum Action {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
+    #[command(disable_help_flag = true)]
+    InterceptRevertRace {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<OsString>,
+    },
 }
 
 #[derive(Args)]
@@ -119,6 +125,7 @@ fn scenarios() -> impl Iterator<Item = &'static Scenario> {
         typed_rules::SCENARIOS,
         stale::SCENARIOS,
         apply_race::SCENARIOS,
+        revert_race::SCENARIOS,
         storage::SCENARIOS,
         structured::SCENARIOS,
         trusted_nix::SCENARIOS,
@@ -263,6 +270,7 @@ fn run() -> Result<()> {
         Action::Baseline(args) => baseline::run(args)?,
         Action::InterceptPijul { args } => recovery::intercept_pijul(&args)?,
         Action::InterceptApplyRace { args } => apply_race::intercept_pijul(&args)?,
+        Action::InterceptRevertRace { args } => revert_race::intercept_pijul(&args)?,
     }
     Ok(())
 }

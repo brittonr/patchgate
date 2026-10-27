@@ -1,7 +1,8 @@
 use super::*;
 use super::feature_tests::{fixture_edit, pending_fixture};
+use crate::test_http::Server as HttpServer;
 use serde_json::{Value, json};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::thread::{self, JoinHandle};
 
 const LIMIT: usize = 8_000;
@@ -88,15 +89,17 @@ enum Script {
 }
 
 struct Server {
-    address: SocketAddr,
+    url: String,
+    socket_path: PathBuf,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<Result<Vec<Request>>>>,
 }
 
 impl Server {
     fn start(script: Script, span: String, movement: Option<(PathBuf, String)>) -> Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let address = listener.local_addr()?;
+        let listener = HttpServer::bind()?;
+        let url = listener.url().to_owned();
+        let socket_path = listener.socket_path().to_owned();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = Arc::clone(&stop);
         let worker = thread::spawn(move || -> Result<Vec<Request>> {
@@ -190,16 +193,16 @@ impl Server {
                 )?;
             }
         });
-        Ok(Self { address, stop, worker: Some(worker) })
+        Ok(Self { url, socket_path, stop, worker: Some(worker) })
     }
 
     fn url(&self) -> String {
-        format!("http://{}/v1", self.address)
+        self.url.clone()
     }
 
     fn finish(mut self) -> Result<Vec<Request>> {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.address);
+        let _ = UnixStream::connect(&self.socket_path);
         self.worker.take().expect("The server thread is absent")
             .join().expect("The server thread panicked")
     }
@@ -208,7 +211,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.address);
+        let _ = UnixStream::connect(&self.socket_path);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

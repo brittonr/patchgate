@@ -124,11 +124,19 @@ fn inspect_readiness(
         .prefix("patchgate-doctor-help-")
         .tempdir()?;
     let help_pijul = Pijul::with_timeout(help_directory.path().to_path_buf(), PROBE_LIMIT);
-    match help_pijul.run(["apply", "--help"]) {
-        Ok(help) if supports_expected_state(&help) => report.add("pijul.expected_state", Status::Pass,
-            "Pijul advertises apply --expected-state. This read-only probe does not test its transaction semantics.", None),
-        Ok(_) => report.add("pijul.expected_state", Status::Error,
-            "Pijul does not advertise apply --expected-state.",
+    let conditional_commands = (|| -> Result<bool> {
+        for operation in ["apply", "unrecord"] {
+            if !supports_expected_state(&help_pijul.run([operation, "--help"])?) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })();
+    match conditional_commands {
+        Ok(true) => report.add("pijul.expected_state", Status::Pass,
+            "Pijul advertises apply and unrecord --expected-state. This read-only probe does not test transaction semantics.", None),
+        Ok(false) => report.add("pijul.expected_state", Status::Error,
+            "Pijul must advertise --expected-state for both apply and unrecord.",
             Some("Use the pinned patched Pijul runtime. Run: devenv shell".into())),
         Err(error) => report.add("pijul.expected_state", Status::Error, format!("{error:#}"),
             Some("Use the pinned patched Pijul runtime. Run: devenv shell".into())),
@@ -263,7 +271,7 @@ fn inspect_runtime_probes(report: &mut Report, settings: &Settings) {
         Ok(()) => report.add(
             "pijul.runtime_expected_state",
             Status::Pass,
-            "A private native fixture refused a stale state without state or file changes. The same candidate applied with the current state.",
+            "A private native fixture refused stale apply and unrecord operations without state or file changes. Both operations succeeded with current states.",
             None,
         ),
         Err(_) => report.add(
@@ -606,6 +614,41 @@ fn native_runtime_probe() -> Result<()> {
     ensure!(
         probe.files()? == expected_files,
         "Current-state acceptance changed unexpected file bytes"
+    );
+    let mut command = probe.command(&probe.pijul);
+    command.args([
+        "unrecord",
+        "--channel",
+        "main",
+        "--expected-state",
+        current.0.as_deref().context("Missing stale removal state")?,
+        &candidate[0],
+    ]);
+    let (status, _) = probe.execute(&mut command)?;
+    check_native_refusal(
+        status,
+        &applied,
+        &probe.snapshot("main")?,
+        &expected_files,
+        &probe.files()?,
+    )?;
+    probe.run(&[
+        "unrecord",
+        "--channel",
+        "main",
+        "--expected-state",
+        applied.0.as_deref().context("Missing current removal state")?,
+        &candidate[0],
+    ])?;
+    let removed = probe.snapshot("main")?;
+    expected.remove(&candidate[0]);
+    ensure!(
+        removed.1 == expected && removed.0 == current.0,
+        "Current-state removal failed"
+    );
+    ensure!(
+        probe.files()? == expected_files,
+        "Native removal changed work files without reset"
     );
     Ok(())
 }
@@ -1315,7 +1358,10 @@ mod tests {
 
     #[test]
     fn initialization_requires_recorded_checks_before_model_or_nix_probes() -> Result<()> {
-        let (_directory, settings) = initialization_fixture()?;
+        let (_directory, mut settings) = initialization_fixture()?;
+        let model = crate::test_http::Server::bind()?;
+        model.set_nonblocking(true)?;
+        settings.model_url = model.url().to_owned();
         fs::create_dir(settings.repo.join("nix"))?;
         fs::write(
             settings.repo.join(verify::MANIFEST),
@@ -1342,6 +1388,10 @@ mod tests {
         assert_eq!(snapshot, Some(expected));
         assert!(!report.ok);
         assert_eq!(repository_files(&settings.repo)?, before);
+        assert_eq!(
+            model.accept().expect_err("Trusted check errors must prevent model requests").kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         Ok(())
     }
 

@@ -673,7 +673,7 @@ impl std::fmt::Display for StateTokenMismatch {
 
 impl std::error::Error for StateTokenMismatch {}
 
-/// The exit code of a state token mismatch. It matches the native apply contract.
+/// The exit code of a state token mismatch. It matches the native state contract.
 pub const STATE_TOKEN_MISMATCH: u8 = 42;
 
 #[derive(Deserialize, Serialize)]
@@ -2280,15 +2280,22 @@ impl Gate {
         let intent = self
             .ledger
             .prepare("revert", &self.settings.main, &self.settings.inbox, records.clone())?;
-        if let Err(error) = self.pijul.unrecord(&self.settings.main, &ordered) {
-            self.ledger.reconcile(&intent, false)?;
-            self.ledger.finish()?;
-            return Err(error).with_context(|| {
+        if !self
+            .pijul
+            .unrecord_if_current(&self.settings.main, main.state.as_deref(), &ordered)
+            .with_context(|| {
                 format!(
-                    "Pijul refused to unrecord from {}. Revert the dependent changes first.",
+                    "Pijul could not confirm the revert from {}. The journal remains for recovery.",
                     self.settings.main
                 )
-            });
+            })?
+        {
+            self.ledger.finish()?;
+            let observed = self.pijul.snapshot(&self.settings.main)?.state;
+            return Err(anyhow::Error::new(StateTokenMismatch {
+                expected: main.state.unwrap_or_else(|| "empty".to_owned()),
+                observed,
+            }));
         }
         let after = self.pijul.hashes(&self.settings.main)?;
         let remaining: Vec<_> = ordered
@@ -4775,8 +4782,8 @@ mod bounded_tests;
 #[cfg(test)]
 mod feature_tests {
     use super::*;
+    use crate::test_http::Server;
     use std::io::BufRead;
-    use std::net::TcpListener;
     use std::thread;
     use std::time::Instant;
 
@@ -5088,9 +5095,9 @@ mod feature_tests {
     fn invalid_reconsideration_preserves_the_previous_decision() -> Result<()> {
         let (_directory, mut settings, candidate) =
             pending_fixture(&[("value.txt", b"candidate\n")])?;
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = Server::bind()?;
         listener.set_nonblocking(true)?;
-        settings.model_url = format!("http://{}/v1", listener.local_addr()?);
+        settings.model_url = listener.url().to_owned();
         let worker = thread::spawn(move || -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(10);
             let stream = loop {
@@ -5480,9 +5487,9 @@ mod feature_tests {
         let main = pijul.snapshot("main")?;
         let inbox = pijul.snapshot("inbox")?;
         let before = source_bytes(&root)?;
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = Server::bind()?;
         listener.set_nonblocking(true)?;
-        let address = listener.local_addr()?;
+        let url = listener.url().to_owned();
         let worker = thread::spawn(move || -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(10);
             let stream = loop {
@@ -5531,7 +5538,7 @@ mod feature_tests {
                 repo: root.clone(),
                 inbox: "inbox".into(),
                 main: "main".into(),
-                model_url: format!("http://{address}/v1"),
+                model_url: url,
                 model: "dry-run-test".into(),
                 model_api: Api::OpenAi,
                 model_revision: None,
@@ -5572,9 +5579,9 @@ mod feature_tests {
 
     /// Serve exactly `requests` review replies, then stop listening.
     fn accepting_server(requests: usize) -> Result<(String, thread::JoinHandle<Result<()>>)> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let listener = Server::bind()?;
         listener.set_nonblocking(true)?;
-        let address = listener.local_addr()?;
+        let url = listener.url().to_owned();
         let worker = thread::spawn(move || -> Result<()> {
             let deadline = Instant::now() + Duration::from_secs(20);
             for _ in 0..requests {
@@ -5620,7 +5627,7 @@ mod feature_tests {
             }
             Ok(())
         });
-        Ok((format!("http://{address}/v1"), worker))
+        Ok((url, worker))
     }
 
     #[test]
