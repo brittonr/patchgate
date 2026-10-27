@@ -232,16 +232,29 @@ pub fn build(input: Input<'_>) -> Result<Guide> {
     })
 }
 
-fn text(prefix: &str, value: &str) {
+pub(crate) fn write_text(
+    output: &mut impl std::io::Write,
+    prefix: &str,
+    value: &str,
+) -> std::io::Result<()> {
+    if value.is_empty() {
+        return writeln!(output, "{prefix}[empty]");
+    }
     for line in value.split_inclusive('\n') {
-        println!(
+        writeln!(
+            output,
             "{prefix}{}",
             line.strip_suffix('\n').unwrap_or(line).escape_debug()
-        );
+        )?;
     }
-    if !value.is_empty() && !value.ends_with('\n') {
-        println!("  [no final LF]");
+    if !value.ends_with('\n') {
+        writeln!(output, "  [no final LF]")?;
     }
+    Ok(())
+}
+
+fn text(prefix: &str, value: &str) {
+    write_text(&mut std::io::stdout().lock(), prefix, value).expect("Write native source evidence");
 }
 
 pub fn show(explanation: &Explanation) -> Result<()> {
@@ -480,6 +493,19 @@ mod tests {
         assert_eq!(guide.evidence[1].review_binding_matches, Some(false));
         assert_eq!(guide.evidence[2].review_binding_matches, None);
         assert_ne!(guide.evidence[2].scope, "current_review");
+        Ok(())
+    }
+
+    #[test]
+    fn source_text_distinguishes_empty_and_final_line_endings() -> Result<()> {
+        let render = |value: &str| -> Result<Vec<u8>> {
+            let mut output = Vec::new();
+            write_text(&mut output, "  ", value)?;
+            Ok(output)
+        };
+        assert_ne!(render("")?, render("\n")?);
+        assert_ne!(render("value")?, render("value\n")?);
+        assert_ne!(render("value\n")?, render("value\n\n")?);
         Ok(())
     }
 }

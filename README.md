@@ -1772,7 +1772,7 @@ A report destination cannot replace a file of the release repository.
 ### Historical case inspection
 
 ```console
-$ patchgate cases show <case-id> --json
+$ patchgate cases show <case-id>
 ```
 
 The command shows the captured snapshot, the tag history, the captured policy text, and the exact candidate change context.
@@ -1780,6 +1780,19 @@ It uses the recorded base order, native state, and captured bindings, not the cu
 It never reads model decisions or ledger contents, calls a model, or records in the source.
 Captured source goes to the caller only, never to a model.
 Incomplete or altered native data fails instead of inventing source text.
+
+Text output shows policy, native changes, and captured source fragments on separate lines.
+Each native span retains its origin change, kind, and byte range.
+Source prefixes identify additions, deletions, and unchanged text.
+Metadata context retains both the before and after text.
+
+Text mode uses the same safety escapes as `explain`.
+Quotes, backslashes, terminal controls, and Unicode format controls use visible escapes.
+`[empty]` identifies an empty fragment. `[no final LF]` identifies a fragment without a final newline.
+Absent metadata stays distinct from empty text.
+
+Use `--json` for the complete machine-readable report and exact source strings.
+Display escapes do not change that report, captured data, or acceptance authority.
 
 ### Human workspace verification
 

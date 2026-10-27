@@ -503,7 +503,7 @@ fn run_cases(settings: Settings, command: CaseCommand) -> Result<()> {
             if json {
                 print_json(&report)?;
             } else {
-                case_view::show(&report);
+                case_view::show(&report)?;
             }
         }
         CaseCommand::List { json } => {

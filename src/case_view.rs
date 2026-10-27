@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 
 use crate::cases::{NoteRecord, SeenRecord, Snapshot, Store, TagRecord};
 use crate::configuration::{self, Evidence};
-use crate::pijul::{Pijul, ReviewChange};
+use crate::pijul::{NativeVertexKind, Pijul, ReviewChange};
+use crate::review_guide::write_text;
 
 #[derive(Serialize)]
 pub struct Report {
@@ -200,36 +201,90 @@ fn display_json(value: &impl Serialize) -> String {
     let text = serde_json::to_string_pretty(value).expect("Serialize captured case data");
     let mut safe = String::with_capacity(text.len());
     for character in text.chars() {
-        if character.is_control() && character != '\n' {
-            safe.extend(character.escape_default());
-        } else {
+        if character == '\n' || (character.is_ascii() && !character.is_ascii_control()) {
             safe.push(character);
+        } else {
+            safe.extend(character.escape_debug());
         }
     }
     safe
 }
 
-pub fn show(report: &Report) {
-    // JSON string escapes retain exact text and prevent terminal control commands.
-    println!("Case: {}", report.id);
-    println!("Captured: {}", report.captured_at);
-    println!("Authorizes acceptance: false");
-    println!("Captured snapshot:");
-    println!("{}", display_json(&report.snapshot));
-    println!("Tag history:");
-    println!("{}", display_json(&report.tags));
-    println!("Note history:");
-    println!("{}", display_json(&report.notes));
-    println!("Seen history:");
-    println!("{}", display_json(&report.seen));
-    println!("Captured policy:");
-    println!("{}", display_json(&report.policy_text));
-    println!("Exact native change:");
-    println!("{}", display_json(&report.change_text));
-    println!("Complete change context:");
-    println!("{}", display_json(&report.change));
-    println!("Captured native conflicts:");
-    println!("{}", display_json(&report.conflicts));
+fn write_change_context(output: &mut impl Write, change: &ReviewChange) -> Result<()> {
+    writeln!(output, "Candidate: {}", change.hash.escape_debug())?;
+    writeln!(output, "Message: {}", change.message.escape_debug())?;
+    writeln!(output, "Authors: {}", display_json(&change.authors))?;
+    writeln!(output, "Timestamp: {}", change.timestamp.escape_debug())?;
+    writeln!(
+        output,
+        "Dependencies: {}",
+        display_json(&change.dependencies)
+    )?;
+    writeln!(output, "Paths: {}", display_json(&change.paths))?;
+    writeln!(output, "Full context: {}", change.context.full)?;
+    for file in &change.context.files {
+        writeln!(output, "Path: {}", file.path.escape_debug())?;
+        for (index, vertex) in file.vertices.iter().enumerate() {
+            let (kind, prefix) = match vertex.kind {
+                NativeVertexKind::Add => ("add", "+ "),
+                NativeVertexKind::Del => ("del", "- "),
+                NativeVertexKind::Keep => ("keep", "  "),
+            };
+            writeln!(
+                output,
+                "  Span {}: {kind} {} {}..{}",
+                index + 1,
+                vertex.change.escape_debug(),
+                vertex.start,
+                vertex.end
+            )?;
+            write_text(output, prefix, &vertex.text)?;
+        }
+    }
+    for file in &change.metadata_context {
+        writeln!(output, "Metadata path: {}", file.path.escape_debug())?;
+        writeln!(output, "  Before:")?;
+        match &file.before {
+            Some(before) => write_text(output, "- ", before)?,
+            None => writeln!(output, "  [absent]")?,
+        }
+        writeln!(output, "  After:")?;
+        match &file.after {
+            Some(after) => write_text(output, "+ ", after)?,
+            None => writeln!(output, "  [absent]")?,
+        }
+    }
+    Ok(())
+}
+
+fn write_report(output: &mut impl Write, report: &Report) -> Result<()> {
+    writeln!(output, "Case: {}", report.id.escape_debug())?;
+    writeln!(output, "Captured: {}", report.captured_at.escape_debug())?;
+    writeln!(output, "Authorizes acceptance: false")?;
+    writeln!(output, "Captured snapshot:")?;
+    writeln!(output, "{}", display_json(&report.snapshot))?;
+    writeln!(output, "Tag history:")?;
+    writeln!(output, "{}", display_json(&report.tags))?;
+    writeln!(output, "Note history:")?;
+    writeln!(output, "{}", display_json(&report.notes))?;
+    writeln!(output, "Seen history:")?;
+    writeln!(output, "{}", display_json(&report.seen))?;
+    writeln!(output, "Captured policy (escaped text):")?;
+    match &report.policy_text {
+        Some(policy) => write_text(output, "  ", policy)?,
+        None => writeln!(output, "  [absent]")?,
+    }
+    writeln!(output, "Exact native change (escaped text):")?;
+    write_text(output, "  ", &report.change_text)?;
+    writeln!(output, "Complete change context:")?;
+    write_change_context(output, &report.change)?;
+    writeln!(output, "Captured native conflicts:")?;
+    writeln!(output, "{}", display_json(&report.conflicts))?;
+    Ok(())
+}
+
+pub fn show(report: &Report) -> Result<()> {
+    write_report(&mut io::stdout().lock(), report)
 }
 
 #[cfg(test)]
@@ -584,13 +639,47 @@ mod tests {
     }
 
     #[test]
-    fn text_display_escapes_terminal_controls_without_changing_json_data() {
-        let text = "\u{1b}[31m\u{9b}31m\r\nsource";
-        let displayed = display_json(&text);
-        assert!(!displayed.chars().any(char::is_control));
-        assert_eq!(
-            serde_json::from_str::<String>(&serde_json::to_string(text).unwrap()).unwrap(),
-            text
+    fn text_display_blocks_terminal_controls_and_forged_headers() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let record = Store::new(&fixture.pijul.repo).capture(fixture.snapshot.clone())?;
+        let mut report = inspect(&fixture.pijul.repo, &record.id)?;
+        let attack = "\u{1b}]52;c;VEVSTUlOQUxfQ0FOQVJZ\u{7}\u{9b}2J\u{202e}reverse\u{2066}isolate\u{2069}\r\nFORGED-HEADER";
+        report.captured_at = attack.into();
+        report.snapshot.configuration = json!({"terminal": attack});
+        report.policy_text = Some(attack.into());
+        report.change_text = attack.into();
+        report.change.message = attack.into();
+        report.change.authors = vec![attack.into()];
+        report.change.timestamp = attack.into();
+        report.change.paths = [attack.into()].into_iter().collect();
+        for file in &mut report.change.context.files {
+            file.path = attack.into();
+            for vertex in &mut file.vertices {
+                vertex.text = attack.into();
+            }
+        }
+        report.change.metadata_context = vec![crate::pijul::MetadataContext {
+            path: attack.into(),
+            before: Some(attack.into()),
+            after: Some(attack.into()),
+        }];
+        report.conflicts = vec![crate::change::Conflict {
+            kind: attack.into(),
+            path: attack.into(),
+            line: 1,
+        }];
+        let mut output = Vec::new();
+        write_report(&mut output, &report)?;
+        let output = String::from_utf8(output)?;
+        assert!(
+            !output
+                .chars()
+                .any(|character| { character.is_control() && character != '\n' })
         );
+        for control in ['\u{202e}', '\u{2066}', '\u{2069}'] {
+            assert!(!output.contains(control));
+        }
+        assert!(!output.lines().any(|line| line.starts_with("FORGED-HEADER")));
+        Ok(())
     }
 }
