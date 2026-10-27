@@ -4,19 +4,19 @@ use sha2::{Digest, Sha256};
 
 use crate::pijul::{ChannelSnapshot, ReviewChange};
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct PolicyBinding {
     pub path: String,
     pub sha256: String,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct MainBinding {
     pub channel: String,
     pub state: Option<String>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct ReviewBinding {
     pub candidates: Vec<String>,
     pub policy: Option<PolicyBinding>,

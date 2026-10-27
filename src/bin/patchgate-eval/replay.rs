@@ -11,6 +11,9 @@ use std::sync::Arc;
 #[path = "replay_gate.rs"]
 mod release_gate;
 
+use crate::case_metadata;
+use crate::case_metadata::{NoteRecord, SeenRecord};
+
 #[derive(Args, Default)]
 pub struct ReplayArgs {
     #[arg(required_unless_present = "bundle", conflicts_with = "bundle")]
@@ -117,6 +120,10 @@ struct Case {
     labels: Vec<Value>,
     #[serde(default)]
     tags: Vec<TagRecord>,
+    #[serde(default)]
+    notes: Vec<NoteRecord>,
+    #[serde(default)]
+    seen: Vec<SeenRecord>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -273,6 +280,10 @@ struct Comparison {
     labels: Vec<Value>,
     #[serde(default)]
     tags: Vec<TagRecord>,
+    #[serde(default)]
+    notes: Vec<NoteRecord>,
+    #[serde(default)]
+    seen: Vec<SeenRecord>,
 }
 
 impl Comparison {
@@ -303,6 +314,8 @@ impl Comparison {
             snapshot: case.snapshot.clone(),
             labels: case.labels.clone(),
             tags: case.tags.clone(),
+            notes: case.notes.clone(),
+            seen: case.seen.clone(),
         }
     }
 
@@ -658,13 +671,19 @@ fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
                 .unwrap_or(&manifest.configuration),
         )?;
         validate_tag_history(&case.tags)?;
+        case_metadata::validate_histories(&case.notes, &case.seen)?;
+        ensure!(
+            (case.notes.is_empty() && case.seen.is_empty()) || case.snapshot.is_some(),
+            "Human notes and seen records need a captured snapshot."
+        );
         if let Some(identity) = capture_identity(case, manifest)? {
-            if let Some((tags, labels, expected)) =
-                captures.insert(identity, (&case.tags, &case.labels, case.expected))
+            if let Some((tags, labels, notes, seen, expected)) =
+                captures.insert(identity, (&case.tags, &case.labels, &case.notes, &case.seen, case.expected))
             {
                 ensure!(
-                    tags == &case.tags && labels == &case.labels && expected == case.expected,
-                    "Duplicate captures must use the same human tag and label histories."
+                    tags == &case.tags && labels == &case.labels && notes == &case.notes
+                        && seen == &case.seen && expected == case.expected,
+                    "Duplicate captures must use the same human metadata and labels."
                 );
             }
         }
@@ -1854,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_capture_tag_histories_must_match() {
+    fn duplicate_capture_human_histories_must_match() {
         let mut manifest = fixture();
         manifest.cases[0].snapshot = Some(json!({
             "repository": "/captured/source",
@@ -1874,11 +1893,22 @@ mod tests {
             policy_rules: vec!["protected-path".into()],
             conflict_kinds: Vec::new(),
         }];
+        manifest.cases[0].notes = vec![serde_json::from_value(json!({
+            "user": "reviewer", "time": "2026-10-21T00:00:00Z", "kind": "evidence",
+            "text": "The test report supports this claim.", "references": ["test:parser"],
+            "anchor": {"path": "value.txt", "vertex_change": "A".repeat(53),
+                "start": 0, "end": 4, "kind": "add", "text_sha256": "a".repeat(64)},
+        })).unwrap()];
+        manifest.cases[0].seen = vec![SeenRecord {
+            user: "reviewer".into(), time: "2026-10-21T00:00:00Z".into(),
+            path: "value.txt".into(), content_sha256: "b".repeat(64), seen: true,
+        }];
         let duplicate: Case = serde_json::from_value(json!({
             "id": "duplicate", "base": manifest.cases[0].base,
             "candidate": manifest.cases[0].candidate, "expected": "reject",
             "snapshot": manifest.cases[0].snapshot, "labels": manifest.cases[0].labels,
             "tags": manifest.cases[0].tags,
+            "notes": manifest.cases[0].notes, "seen": manifest.cases[0].seen,
         }))
         .unwrap();
         manifest.cases.push(duplicate);
@@ -1892,6 +1922,18 @@ mod tests {
             serde_json::to_value(&comparison).unwrap()["tags"],
             json!(manifest.cases[0].tags)
         );
+        let encoded = serde_json::to_value(&comparison).unwrap();
+        assert_eq!(encoded["notes"], json!(manifest.cases[0].notes));
+        assert_eq!(encoded["seen"], json!(manifest.cases[0].seen));
+        manifest.cases[1].notes[0].references.clear();
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[1].notes = manifest.cases[0].notes.clone();
+        manifest.cases[1].seen[0].seen = false;
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[1].seen = manifest.cases[0].seen.clone();
+        manifest.cases[1].labels.clear();
+        assert!(validate(&manifest, "POLICY.md").is_err());
+        manifest.cases[1].labels = manifest.cases[0].labels.clone();
         manifest.cases[1].tags[0].policy_rules.clear();
         assert!(validate(&manifest, "POLICY.md").is_err());
         manifest.cases[1].tags = manifest.cases[0].tags.clone();
@@ -2081,6 +2123,8 @@ mod tests {
             snapshot: None,
             labels: Vec::new(),
             tags: Vec::new(),
+            notes: Vec::new(),
+            seen: Vec::new(),
         };
         let source_path = fs::canonicalize(&source.path)?;
         let states: Vec<Value> = serde_json::from_str(&source.pijul(&[

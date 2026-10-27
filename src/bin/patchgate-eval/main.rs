@@ -4,6 +4,8 @@ pub mod artifact;
 mod baseline;
 #[path = "../../bundle.rs"]
 pub mod bundle;
+#[path = "../../case_metadata.rs"]
+mod case_metadata;
 #[path = "../../change.rs"]
 pub mod change;
 mod concurrency;

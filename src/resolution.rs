@@ -65,6 +65,9 @@ pub struct VerificationReport {
     pub validated_hashes: Vec<String>,
     pub validation: ValidationEvidence,
     pub verification: Option<std::rc::Rc<crate::verify::Verification>>,
+    pub workflow: Readiness,
+    pub private_recorded_changes: Vec<String>,
+    pub acceptance_requires_live_guards: bool,
 }
 
 #[derive(Serialize)]
@@ -77,19 +80,39 @@ pub struct ValidationEvidence {
     pub conflicts_absent: bool,
 }
 
-pub fn show_verification(report: &VerificationReport) {
-    println!("Workspace verification passed.");
-    println!("Prepared identity: {}", report.prepared.id);
-    println!("Validated changes: {}", report.validated_hashes.len());
-    if let Some(verification) = &report.verification {
-        if let Some(version) = verification.observed_nix_version() {
-            println!("Observed Nix version: {}", version.escape_debug());
+impl VerificationReport {
+    pub fn new(
+        prepared: Prepared,
+        validated_hashes: Vec<String>,
+        validation: ValidationEvidence,
+        verification: Option<std::rc::Rc<crate::verify::Verification>>,
+        mut workflow: Readiness,
+    ) -> Self {
+        let private_recorded_changes = validated_hashes
+            .iter()
+            .filter(|hash| {
+                !prepared.base.contains(hash)
+                    && !prepared.candidates.contains(hash)
+                    && !workflow
+                        .recorded_supplemental_changes
+                        .as_ref()
+                        .is_some_and(|recorded| recorded.contains(hash))
+            })
+            .cloned()
+            .collect();
+        workflow.next_actions.retain(|action| action.code != "verify");
+        Self {
+            schema_version: 1,
+            authorizes_acceptance: false,
+            prepared,
+            validated_hashes,
+            validation,
+            verification,
+            workflow,
+            private_recorded_changes,
+            acceptance_requires_live_guards: true,
         }
-        println!("Trusted Nix checks and fresh isolation passed.");
-    } else {
-        println!("Trusted main defines no Nix checks.");
     }
-    println!("This report does not authorize acceptance. Acceptance repeats all live guards.");
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,6 +142,13 @@ pub struct PendingCheck {
 }
 
 #[derive(Serialize)]
+pub struct NextAction {
+    pub code: String,
+    pub detail: String,
+    pub command: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct Readiness {
     pub schema_version: u8,
     pub authorizes_acceptance: bool,
@@ -134,6 +164,12 @@ pub struct Readiness {
     pub stale_policy: Option<bool>,
     pub blockers: Vec<Blocker>,
     pub pending_verification: Vec<PendingCheck>,
+    pub source_authority: bool,
+    pub prepared_base: Option<Vec<String>>,
+    pub review_binding: Option<ReviewBinding>,
+    pub recorded_supplemental_changes: Option<Vec<String>>,
+    pub workspace_state: Option<String>,
+    pub next_actions: Vec<NextAction>,
 }
 
 impl Readiness {
@@ -152,6 +188,298 @@ impl Readiness {
             detail: detail.to_owned(),
         });
     }
+
+    fn add_action(&mut self, code: &str, detail: &str, command: Option<String>) {
+        self.next_actions.push(NextAction {
+            code: code.to_owned(),
+            detail: detail.to_owned(),
+            command,
+        });
+    }
+
+    /// Rebuild human actions after all static and gate blockers are present.
+    pub fn finalize_actions(&mut self, source: &Path) {
+        self.next_actions.clear();
+        if !self.source_authority
+            || self.blockers.iter().any(|blocker| blocker.code == "invalid_authority")
+        {
+            self.add_action(
+                "restore_authority",
+                "Restore valid source authority and the original workspace identity before further workspace actions.",
+                None,
+            );
+            return;
+        }
+        let command = workflow_command(source, &self.workspace, self.main.as_deref(), self.inbox.as_deref());
+        let stale = self.stale_main == Some(true)
+            || self.stale_configuration == Some(true)
+            || self.stale_policy == Some(true)
+            || self.blockers.iter().any(|blocker| {
+                matches!(blocker.code.as_str(), "candidate_dependencies" | "source_candidates")
+            });
+        let unsafe_state = self.blockers.iter().any(|blocker| {
+            !matches!(
+                blocker.code.as_str(),
+                "stale_main" | "stale_configuration" | "stale_policy"
+                    | "candidate_dependencies" | "source_candidates" | "recorded_conflicts" | "candidate_in_main"
+            )
+        });
+        if unsafe_state {
+            self.add_action(
+                "resolve_blockers",
+                "Resolve the listed authority, source, or workspace blockers before native records, refresh, verification, or acceptance.",
+                None,
+            );
+            return;
+        }
+        if self.blockers.iter().any(|blocker| blocker.code == "candidate_in_main") {
+            let primary = self.candidates.as_ref().and_then(|candidates| candidates.last());
+            self.add_action(
+                "inspect_accepted_change",
+                "The primary candidate is in main. Inspect its accepted history. Keep this workspace only for reference.",
+                command.as_ref().and_then(|prefix| Some(format!("{prefix} explain {}", shell_quote(OsStr::new(primary?))?))),
+            );
+            return;
+        }
+        if stale {
+            if self.pending_tracked_edits == Some(true) {
+                self.add_action(
+                    "record_before_refresh",
+                    "Record pending tracked edits before refresh. Untracked files remain in the old workspace.",
+                    record_command(&self.workspace),
+                );
+                self.add_action(
+                    "inspect_after_record",
+                    "Inspect the workspace again after the native record. Then refresh into a new workspace.",
+                    command.as_ref().and_then(|prefix| Some(format!("{prefix} workspace-status {}", shell_quote(self.workspace.as_os_str())?))),
+                );
+            } else if self.pending_tracked_edits == Some(false) {
+                self.add_action(
+                    "refresh",
+                    "Refresh into a new workspace outside the old workspace. The destination must not exist. Untracked files remain in the old workspace.",
+                    command.as_ref().and_then(|prefix| {
+                        let mut name = self.workspace.file_name()?.to_os_string();
+                        name.push("-refreshed");
+                        let destination = self.workspace.parent()?.join(name);
+                        let source = canonical_directory(source).ok()?;
+                        let destination = new_workspace_path(&source, &destination).ok()?;
+                        Some(format!(
+                            "{prefix} resolve --refresh {} --workspace {}",
+                            shell_quote(self.workspace.as_os_str())?,
+                            shell_quote(destination.as_os_str())?,
+                        ))
+                    }),
+                );
+            }
+            return;
+        }
+        if self.recorded_conflicts.as_ref().is_some_and(|conflicts| !conflicts.is_empty()) {
+            self.add_action(
+                "resolve_conflicts",
+                "Resolve the listed conflicts in tracked files. A native record must confirm the result.",
+                None,
+            );
+            if self.pending_tracked_edits != Some(true) {
+                return;
+            }
+        }
+        if self.blockers.is_empty() {
+            self.add_action(
+                "verify",
+                "Verify a private copy without source changes or acceptance. Pending tracked edits receive private native records.",
+                command.as_ref().and_then(|prefix| Some(format!("{prefix} verify --resolution {}", shell_quote(self.workspace.as_os_str())?))),
+            );
+            self.add_action(
+                "accept_explicitly",
+                "Only explicit acceptance can authorize source changes. It repeats all live guards and can record pending tracked edits.",
+                command.as_ref().and_then(|prefix| Some(format!("{prefix} accept --resolution {}", shell_quote(self.workspace.as_os_str())?))),
+            );
+        }
+    }
+}
+
+pub(crate) fn shell_quote(value: &OsStr) -> Option<String> {
+    let value = value.to_str()?;
+    if value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(format!("'{}'", value.replace('\'', "'\\''")))
+}
+
+fn workflow_command(
+    source: &Path,
+    workspace: &Path,
+    main: Option<&str>,
+    inbox: Option<&str>,
+) -> Option<String> {
+    // Do not emit a partial command for a path that a shell cannot represent safely.
+    shell_quote(workspace.as_os_str())?;
+    command_prefix(source, main, inbox)
+}
+
+pub(crate) fn command_prefix(
+    source: &Path,
+    main: Option<&str>,
+    inbox: Option<&str>,
+) -> Option<String> {
+    Some(format!(
+        "patchgate --repo {} --main {} --inbox {}",
+        shell_quote(source.as_os_str())?,
+        shell_quote(OsStr::new(main?))?,
+        shell_quote(OsStr::new(inbox?))?,
+    ))
+}
+
+fn record_command(workspace: &Path) -> Option<String> {
+    Some(format!(
+        "pijul record --repository {} -a -m 'Record human edits'",
+        shell_quote(workspace.as_os_str())?,
+    ))
+}
+
+fn show_hashes(title: &str, hashes: &[String]) {
+    println!("{title}: {}", hashes.len());
+    for hash in hashes {
+        println!("  {}", hash.escape_debug());
+    }
+}
+
+fn show_binding(binding: &ReviewBinding, base: &[String]) {
+    println!("Trusted main channel: {:?}", binding.main.channel);
+    match &binding.main.state {
+        Some(state) => println!("Prepared main state: {}", state.escape_debug()),
+        None => println!("Prepared main state: empty"),
+    }
+    show_hashes("Prepared base changes", base);
+    show_hashes("Exact review candidates", &binding.candidates);
+    match &binding.policy {
+        Some(policy) => {
+            println!("Bound policy path: {:?}", policy.path);
+            println!("Bound policy SHA-256: {}", policy.sha256.escape_debug());
+        }
+        None => println!("Bound policy: absent"),
+    }
+}
+
+fn show_conflicts(conflicts: &[Conflict]) {
+    println!("Recorded conflicts: {}", conflicts.len());
+    for conflict in conflicts {
+        println!("  {} at {:?}:{}", conflict.kind.escape_debug(), conflict.path, conflict.line);
+    }
+}
+
+fn show_actions(actions: &[NextAction]) {
+    for action in actions {
+        println!("Next [{}]: {}", action.code, action.detail);
+        if let Some(command) = &action.command {
+            println!("  {command}");
+        }
+    }
+}
+
+fn show_workflow_facts(report: &Readiness) {
+    println!("Workspace: {:?}", report.workspace);
+    println!("Valid source authority: {}", report.source_authority);
+    if let Some(id) = &report.prepared_id {
+        println!("Prepared identity: {}", id.escape_debug());
+    }
+    if let (Some(binding), Some(base)) = (&report.review_binding, &report.prepared_base) {
+        show_binding(binding, base);
+    }
+    if let Some(inbox) = &report.inbox {
+        println!("Trusted inbox channel: {inbox:?}");
+    }
+    if let Some(state) = &report.workspace_state {
+        println!("Recorded workspace state: {}", state.escape_debug());
+    }
+    match &report.recorded_supplemental_changes {
+        Some(hashes) => show_hashes("Recorded supplemental human changes", hashes),
+        None => println!("Recorded supplemental human changes: unknown"),
+    }
+    match report.pending_tracked_edits {
+        Some(pending) => println!("Pending tracked edits: {pending}"),
+        None => println!("Pending tracked edits: unknown"),
+    }
+    if let Some(conflicts) = &report.recorded_conflicts {
+        show_conflicts(conflicts);
+    }
+    for (name, stale) in [
+        ("main", report.stale_main),
+        ("configuration", report.stale_configuration),
+        ("policy", report.stale_policy),
+    ] {
+        match stale {
+            Some(stale) => println!("Stale {name}: {stale}"),
+            None => println!("Stale {name}: unknown"),
+        }
+    }
+    for blocker in &report.blockers {
+        println!("Blocked [{}]: {}", blocker.code, blocker.detail);
+    }
+}
+
+pub fn show_readiness(report: &Readiness) {
+    show_workflow_facts(report);
+    for check in &report.pending_verification {
+        println!("Pending [{}]: {}", check.code, check.detail);
+    }
+    show_actions(&report.next_actions);
+    println!("This static report does not authorize acceptance. Acceptance repeats all live guards.");
+}
+
+pub fn show_prepared(
+    prepared: &Prepared,
+    source: &Path,
+    refreshed: Option<(&str, &[String])>,
+) {
+    println!("Prepared identity: {}", prepared.id);
+    println!("Source: {source:?}");
+    println!("Workspace: {:?}", prepared.workspace);
+    show_binding(&prepared.binding, &prepared.base);
+    println!("Trusted inbox channel: {:?}", prepared.inbox);
+    show_conflicts(&prepared.conflicts);
+    if let Some((previous, preserved)) = refreshed {
+        println!("Refreshed from: {}", previous.escape_debug());
+        show_hashes("Preserved human records", preserved);
+        println!("The old workspace remains unchanged. Its untracked files stay there.");
+    }
+    if let Some(policy) = &prepared.policy_file {
+        println!("Trusted policy copy: {policy:?}");
+    }
+    println!("Native review: {:?}", prepared.review_file);
+    println!("Edit tracked files. Use pijul add for new files.");
+    println!("Record pending tracked edits before any refresh into a new workspace.");
+    if let Some(prefix) = workflow_command(source, &prepared.workspace, Some(&prepared.main), Some(&prepared.inbox)) {
+        if let Some(workspace) = shell_quote(prepared.workspace.as_os_str()) {
+            println!("Inspect: {prefix} workspace-status {workspace}");
+            println!("Verify privately: {prefix} verify --resolution {workspace}");
+            println!("Accept explicitly: {prefix} accept --resolution {workspace}");
+        }
+    }
+    println!("Preparation does not authorize acceptance. Acceptance repeats all live guards.");
+}
+
+pub fn show_verification(report: &VerificationReport) {
+    println!("Workspace verification passed for a private snapshot.");
+    println!("Workspace facts describe the private copy before its native record.");
+    println!("Source facts describe the static inspection.");
+    show_workflow_facts(&report.workflow);
+    show_hashes("Validated native changes", &report.validated_hashes);
+    show_hashes("New private human records", &report.private_recorded_changes);
+    println!("Private native records do not change the source workspace.");
+    if let Some(verification) = &report.verification {
+        if let Some(version) = verification.observed_nix_version() {
+            println!("Observed Nix version: {}", version.escape_debug());
+        }
+        println!("Trusted Nix checks and fresh isolation passed.");
+    } else {
+        println!("Trusted main defines no Nix checks.");
+    }
+    for check in &report.workflow.pending_verification {
+        println!("Acceptance guard [{}]: {}", check.code, check.detail);
+    }
+    show_actions(&report.workflow.next_actions);
+    println!("This report does not authorize acceptance. Acceptance repeats all live guards.");
 }
 
 /// Inspect static readiness without acceptance authority or source execution.
@@ -175,6 +503,12 @@ pub fn inspect(
         stale_policy: None,
         blockers: Vec::new(),
         pending_verification: Vec::new(),
+        source_authority: false,
+        prepared_base: None,
+        review_binding: None,
+        recorded_supplemental_changes: None,
+        workspace_state: None,
+        next_actions: Vec::new(),
     };
     report.add_pending(
         "credential_checks",
@@ -203,6 +537,7 @@ pub fn inspect(
                 "invalid_authority",
                 "Source authority or workspace identity is absent, unsafe, or invalid.",
             );
+            report.finalize_actions(source);
             return Ok(report);
         }
     };
@@ -211,6 +546,9 @@ pub fn inspect(
     report.main = Some(prepared.main.clone());
     report.inbox = Some(prepared.inbox.clone());
     report.candidates = Some(prepared.candidates.clone());
+    report.source_authority = true;
+    report.prepared_base = Some(prepared.base.clone());
+    report.review_binding = Some(prepared.binding.clone());
     if [&prepared.main, &prepared.inbox].iter().any(|name| {
         name.is_empty()
             || name.starts_with('-')
@@ -221,14 +559,17 @@ pub fn inspect(
             "unsupported_channels",
             "The trusted channel names are not supported.",
         );
+        report.finalize_actions(source);
         return Ok(report);
     }
     if let Some(source_copy) = inspection_copy(&prepared.source, false, &mut report) {
         inspect_source(&source_copy.pijul, &prepared, baseline, &mut report);
     }
     if let Some(workspace_copy) = inspection_copy(&prepared.workspace, true, &mut report) {
-        inspect_workspace(&workspace_copy.pijul, &prepared, &mut report);
+        let workspace = Pijul::new(prepared.workspace.clone());
+        inspect_workspace(&workspace_copy.pijul, &workspace, &prepared, &mut report);
     }
+    report.finalize_actions(source);
     Ok(report)
 }
 
@@ -391,7 +732,12 @@ fn inspect_source(
     }
 }
 
-fn inspect_workspace(private: &Pijul, prepared: &Prepared, report: &mut Readiness) {
+fn inspect_workspace(
+    private: &Pijul,
+    workspace: &Pijul,
+    prepared: &Prepared,
+    report: &mut Readiness,
+) {
     match private.channels() {
         Ok((current, channels))
             if current.as_deref() == Some(prepared.main.as_str())
@@ -411,11 +757,25 @@ fn inspect_workspace(private: &Pijul, prepared: &Prepared, report: &mut Readines
             return;
         }
     }
-    if native_order(private, prepared).is_err() {
-        report.add_blocker(
+    match native_order(private, prepared) {
+        Ok(order) => {
+            report.recorded_supplemental_changes = Some(
+                order.into_iter()
+                    .filter(|hash| !prepared.base.contains(hash) && !prepared.candidates.contains(hash))
+                    .collect(),
+            );
+            match private.snapshot(&prepared.main) {
+                Ok(snapshot) => report.workspace_state = snapshot.state,
+                Err(_) => report.add_blocker(
+                    "workspace_state",
+                    "The recorded workspace state is not available.",
+                ),
+            }
+        }
+        Err(_) => report.add_blocker(
             "workspace_native_changes",
             "Prepared workspace changes are absent, incomplete, or in a different order.",
-        );
+        ),
     }
     if validate_prepared_files(private, prepared).is_err() {
         report.add_blocker(
@@ -433,8 +793,7 @@ fn inspect_workspace(private: &Pijul, prepared: &Prepared, report: &mut Readines
             "Recorded workspace conflicts are not available.",
         ),
     }
-    let workspace = Pijul::new(prepared.workspace.clone());
-    match tracked_workspace_clean_private(&workspace, private, &prepared.main) {
+    match tracked_workspace_clean_private(workspace, private, &prepared.main) {
         Ok(clean) => report.pending_tracked_edits = Some(!clean),
         Err(_) => report.add_blocker(
             "tracked_edits_unavailable",
@@ -458,6 +817,50 @@ fn inspect_workspace(private: &Pijul, prepared: &Prepared, report: &mut Readines
             "Recorded conflicts remain without pending tracked edits.",
         );
     }
+}
+
+/// Replace workspace facts with the exact private snapshot before its native record.
+pub(crate) fn inspect_verified_copy(
+    private: &Pijul,
+    prepared: &Prepared,
+    report: &mut Readiness,
+) -> Result<()> {
+    ensure!(
+        report.source_authority
+            && report.prepared_id.as_deref() == Some(prepared.id.as_str())
+            && report.workspace == prepared.workspace,
+        "The verification report binding differs"
+    );
+    refuse_native_configuration(&private.repo)?;
+    validate_native_metadata(&private.repo.join(".pijul"))?;
+    report.recorded_conflicts = None;
+    report.pending_tracked_edits = None;
+    report.recorded_supplemental_changes = None;
+    report.workspace_state = None;
+    report.next_actions.clear();
+    report.blockers.retain(|blocker| {
+        !matches!(
+            blocker.code.as_str(),
+            "workspace_native_configuration" | "workspace_metadata" | "workspace_snapshot"
+                | "workspace_channels" | "workspace_native_read" | "workspace_native_changes"
+                | "workspace_state" | "prepared_data_changed" | "workspace_conflicts"
+                | "tracked_edits_unavailable" | "recorded_conflicts"
+        )
+    });
+    report.pending_verification.retain(|check| {
+        !matches!(check.code.as_str(), "record_tracked_edits" | "conflict_verification")
+    });
+    report.add_pending(
+        "conflict_verification",
+        "Explicit acceptance must verify conflicts after any pending tracked edits receive a native record.",
+    );
+    let mut files = prepared.clone();
+    files.review_file = private.repo.join(PRIVATE).join("review.txt");
+    files.policy_file = prepared.policy_file.as_ref()
+        .map(|_| private.repo.join(PRIVATE).join("policy.txt"));
+    inspect_workspace(private, private, &files, report);
+    report.finalize_actions(&prepared.source);
+    Ok(())
 }
 
 fn readiness_conflict(conflict: crate::change::Conflict) -> Conflict {
@@ -806,11 +1209,14 @@ fn tracked_workspace_clean(old: &Pijul, channel: &str) -> Result<bool> {
 
 fn tracked_workspace_clean_private(old: &Pijul, private: &Pijul, channel: &str) -> Result<bool> {
     refuse_native_configuration(&private.repo)?;
-    let directory = private
+    let parent = private
         .repo
         .parent()
         .context("The private repository has no parent")?;
-    let archive_path = directory.join("tracked.tar.gz");
+    let directory = tempfile::Builder::new()
+        .prefix("patchgate-tracked-")
+        .tempdir_in(parent)?;
+    let archive_path = directory.path().join("tracked.tar.gz");
     private.run([
         OsStr::new("archive"),
         OsStr::new("--channel"),
@@ -854,7 +1260,7 @@ fn tracked_workspace_clean_private(old: &Pijul, private: &Pijul, channel: &str) 
         }
     }
     // A fresh clone excludes staged additions and removals from the path list.
-    let recorded = directory.join("recorded");
+    let recorded = directory.path().join("recorded");
     private.run([
         OsStr::new("clone"),
         OsStr::new("--channel"),
@@ -2228,6 +2634,109 @@ mod tests {
         report.blockers.iter().any(|blocker| blocker.code == code)
     }
 
+    fn has_action(report: &Readiness, code: &str) -> bool {
+        report.next_actions.iter().any(|action| action.code == code)
+    }
+
+    #[test]
+    fn shell_arguments_preserve_literal_bytes_and_refuse_unsafe_display() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+
+        for value in ["a b", "a'b", "$HOME", "`id`", "' && exit 31 #", "a\\b", "--flag"] {
+            let quoted = shell_quote(OsStr::new(value)).unwrap();
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("printf '%s' {quoted}")])
+                .output()?;
+            assert!(output.status.success());
+            assert_eq!(output.stdout, value.as_bytes());
+        }
+        assert!(shell_quote(OsStr::new("line\nbreak")).is_none());
+        assert!(shell_quote(OsStr::from_bytes(b"invalid-\xff")).is_none());
+        assert!(workflow_command(
+            Path::new("source"),
+            Path::new("line\nbreak"),
+            Some("main"),
+            Some("inbox"),
+        ).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn readiness_binds_recorded_supplements_without_source_or_workspace_writes() -> Result<()> {
+        let (_directory, prepared, signer) = native_fixture(false)?;
+        let workspace = Pijul::new(prepared.workspace.clone());
+        fs::write(workspace.repo.join("value.txt"), "A human native record.\n")?;
+        let supplement = native_record(&workspace, &signer, "Record the human edit")?;
+        let state = workspace.snapshot(&prepared.main)?.state;
+        let source_before = tree_bytes(&prepared.source)?;
+        let workspace_before = tree_bytes(&prepared.workspace)?;
+        let report = readiness(&prepared)?;
+        assert_eq!(report.prepared_base.as_ref(), Some(&prepared.base));
+        assert_eq!(
+            serde_json::to_value(&report.review_binding)?,
+            serde_json::to_value(&prepared.binding)?,
+        );
+        assert_eq!(report.recorded_supplemental_changes, Some(vec![supplement]));
+        assert_eq!(report.workspace_state, state);
+        assert_eq!(report.pending_tracked_edits, Some(false));
+        assert!(!report.authorizes_acceptance);
+        assert_eq!(tree_bytes(&prepared.source)?, source_before);
+        assert_eq!(tree_bytes(&prepared.workspace)?, workspace_before);
+        Ok(())
+    }
+
+    #[test]
+    fn verified_copy_replaces_workspace_facts_without_live_workspace_access() -> Result<()> {
+        let (_directory, prepared, signer) = native_fixture(false)?;
+        let private = copy_workspace(&prepared)?;
+        fs::write(prepared.workspace.join("value.txt"), "A live edit after the copy.\n")?;
+        let mut report = readiness(&prepared)?;
+        assert_eq!(report.pending_tracked_edits, Some(true));
+        report.add_blocker("workspace_native_read", "Old workspace facts are not available.");
+        report.add_blocker("acceptance_journal", "Source recovery is required.");
+        let source_before = tree_bytes(&prepared.source)?;
+        let workspace_before = tree_bytes(&prepared.workspace)?;
+        inspect_verified_copy(&private.pijul, &prepared, &mut report)?;
+        assert_eq!(report.pending_tracked_edits, Some(false));
+        assert!(!has_blocker(&report, "workspace_native_read"));
+        assert!(has_blocker(&report, "acceptance_journal"));
+        assert!(!report.pending_verification.iter().any(|check| check.code == "record_tracked_edits"));
+        assert!(report.source_authority);
+        assert_eq!(report.prepared_id.as_deref(), Some(prepared.id.as_str()));
+        assert_eq!(report.stale_main, Some(false));
+        fs::write(private.pijul.repo.join("value.txt"), "A record in the private copy.\n")?;
+        let supplement = native_record(&private.pijul, &signer, "Record a private supplement")?;
+        inspect_verified_copy(&private.pijul, &prepared, &mut report)?;
+        assert_eq!(report.recorded_supplemental_changes.as_ref(), Some(&vec![supplement.clone()]));
+        fs::write(private.pijul.repo.join("value.txt"), "A pending private edit.\n")?;
+        inspect_verified_copy(&private.pijul, &prepared, &mut report)?;
+        assert_eq!(report.pending_tracked_edits, Some(true));
+        assert_eq!(report.pending_verification.iter().filter(|check| check.code == "record_tracked_edits").count(), 1);
+        let completed = record_private(&prepared, &private.pijul, &signer, "Verify the exact private copy")?;
+        let verification = VerificationReport::new(
+            prepared.clone(),
+            completed.hashes,
+            ValidationEvidence {
+                source_authority: true,
+                current_bindings: true,
+                permitted_dependencies: true,
+                native_expected_state: true,
+                credential_scan: true,
+                conflicts_absent: true,
+            },
+            None,
+            report,
+        );
+        assert_eq!(verification.private_recorded_changes.len(), 1);
+        assert!(!verification.private_recorded_changes.contains(&supplement));
+        assert!(!verification.authorizes_acceptance);
+        assert!(verification.acceptance_requires_live_guards);
+        assert!(!has_action(&verification.workflow, "verify"));
+        assert_eq!(tree_bytes(&prepared.source)?, source_before);
+        assert_eq!(tree_bytes(&prepared.workspace)?, workspace_before);
+        Ok(())
+    }
+
     fn tree_bytes(root: &Path) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
         let mut files = std::collections::BTreeMap::new();
         for entry in fs::read_dir(root)? {
@@ -2263,6 +2772,14 @@ mod tests {
         assert!(report.inbox.is_none());
         assert!(report.candidates.is_none());
         assert!(report.pending_tracked_edits.is_none());
+        assert!(!report.source_authority);
+        assert!(report.prepared_base.is_none());
+        assert!(report.review_binding.is_none());
+        assert!(report.recorded_supplemental_changes.is_none());
+        assert!(has_action(&report, "restore_authority"));
+        assert!(!has_action(&report, "refresh"));
+        assert!(!has_action(&report, "verify"));
+        assert!(!has_action(&report, "accept_explicitly"));
         assert_eq!(tree_bytes(&source)?, source_before);
         assert_eq!(tree_bytes(&prepared.workspace)?, workspace_before);
         assert!(!serde_json::to_string(&report)?.contains("editable-channel"));
@@ -2412,13 +2929,35 @@ mod tests {
         native_record(&source, &signer, "Change trusted configuration")?;
         fs::write(source.repo.join("value.txt"), "Dirty source data.\n")?;
         let before = tree_bytes(&source.repo)?;
-        let report = readiness(&prepared)?;
+        let mut report = readiness(&prepared)?;
         assert_eq!(report.stale_main, Some(true));
         assert_eq!(report.stale_configuration, Some(true));
         assert_eq!(report.stale_policy, Some(true));
         for code in ["stale_main", "stale_configuration", "stale_policy"] {
             assert!(has_blocker(&report, code));
         }
+        assert!(has_action(&report, "refresh"));
+        assert!(!has_action(&report, "verify"));
+        assert!(!has_action(&report, "accept_explicitly"));
+        assert!(report.next_actions.iter().any(|action| {
+            action.code == "refresh" && action.command.is_some()
+        }));
+        let destination = prepared.workspace.with_file_name("workspace-refreshed");
+        fs::create_dir(&destination)?;
+        fs::write(destination.join("keep.txt"), "Keep this existing workspace.\n")?;
+        report.finalize_actions(&prepared.source);
+        assert!(report.next_actions.iter().all(|action| action.command.is_none()));
+        assert_eq!(fs::read(destination.join("keep.txt"))?, b"Keep this existing workspace.\n");
+        fs::write(prepared.workspace.join("value.txt"), "A pending edit before refresh.\n")?;
+        report = readiness(&prepared)?;
+        assert!(has_action(&report, "record_before_refresh"));
+        assert!(!has_action(&report, "refresh"));
+        report.add_blocker("acceptance_journal", "Source recovery is required.");
+        report.finalize_actions(&prepared.source);
+        assert!(has_action(&report, "resolve_blockers"));
+        assert!(!has_action(&report, "record_before_refresh"));
+        assert!(!has_action(&report, "refresh"));
+        assert!(!has_action(&report, "accept_explicitly"));
         assert_eq!(tree_bytes(&source.repo)?, before);
         Ok(())
     }

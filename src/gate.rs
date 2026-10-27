@@ -530,6 +530,7 @@ pub struct DependencyInfo {
 #[derive(Serialize)]
 pub struct Explanation {
     pub schema_version: u8,
+    pub authorizes_acceptance: bool,
     pub hash: String,
     pub message: String,
     pub state: State,
@@ -541,6 +542,7 @@ pub struct Explanation {
     pub checks: Option<serde_json::Value>,
     pub records: Vec<Record>,
     pub next_actions: Vec<String>,
+    pub guide: crate::review_guide::Guide,
 }
 
 #[derive(Serialize)]
@@ -1226,6 +1228,13 @@ impl Gate {
         settings: Settings,
         workspace: &Path,
     ) -> Result<crate::resolution::Readiness> {
+        enum CandidateSet {
+            Current,
+            Changed,
+            AlreadyAccepted,
+            Absent,
+        }
+        let source = settings.repo.clone();
         let mut report =
             crate::resolution::inspect(&settings.repo, workspace, &settings.baseline_values())?;
         let original = Ledger::new(&settings.repo);
@@ -1267,7 +1276,7 @@ impl Gate {
         if let (Some(main), Some(inbox), Some(candidates), Some(history)) =
             (&report.main, &report.inbox, &report.candidates, history)
         {
-            let dependency_state = (|| -> Result<bool> {
+            let dependency_state = (|| -> Result<CandidateSet> {
                 let isolated = crate::isolation::copy_repository(&settings.repo)?;
                 let mut settings = settings;
                 settings.repo = isolated.pijul.repo.clone();
@@ -1283,28 +1292,39 @@ impl Gate {
                 let primary = candidates
                     .last()
                     .context("The workspace has no primary candidate")?;
-                if current.hashes.contains(primary)
-                    || !inbox.iter().any(|entry| entry.hash == *primary)
-                {
-                    return Ok(false);
+                if current.hashes.contains(primary) {
+                    return Ok(CandidateSet::AlreadyAccepted);
                 }
-                Ok(
-                    gate.with_conflicting_dependencies(primary, &current.hashes, &inbox)?
-                        == *candidates,
-                )
+                if !inbox.iter().any(|entry| entry.hash == *primary) {
+                    return Ok(CandidateSet::Absent);
+                }
+                Ok(if gate.with_conflicting_dependencies(primary, &current.hashes, &inbox)? == *candidates {
+                    CandidateSet::Current
+                } else {
+                    CandidateSet::Changed
+                })
             })();
             match dependency_state {
-                Ok(true) => {}
-                Ok(false) => report.add_blocker(
+                Ok(CandidateSet::Current) => {}
+                Ok(CandidateSet::Changed) => report.add_blocker(
                     "candidate_dependencies",
                     "The permitted source candidate set differs from the prepared workspace.",
                 ),
+                Ok(CandidateSet::AlreadyAccepted) => report.add_blocker(
+                    "candidate_in_main",
+                    "The primary candidate is already in main. This workspace cannot accept it again.",
+                ),
+                Ok(CandidateSet::Absent) => report.add_blocker(
+                    "source_candidate_absent",
+                    "The primary candidate is absent from the source inbox.",
+                ),
                 Err(_) => report.add_blocker(
-                    "candidate_dependencies",
+                    "candidate_decisions",
                     "Current source dependencies or decisions prevent this prepared acceptance.",
                 ),
             }
         }
+        report.finalize_actions(&source);
         Ok(report)
     }
 
@@ -1346,10 +1366,15 @@ impl Gate {
         workspace: &Path,
     ) -> Result<crate::resolution::VerificationReport> {
         (|| -> Result<_> {
+            let mut workflow = Self::workspace_status(settings.clone(), workspace)?;
             let prepared = crate::resolution::load(&settings.repo, workspace)?;
             let (isolated, mut gate) = Self::isolated(settings, false)?;
             crate::resolution::detach_files(&isolated.pijul.repo.join(".pijul"))?;
-            gate.accept_prepared_resolution(prepared.clone(), Some("Verify the human workspace"), true)?;
+            gate.accept_prepared_resolution(
+                prepared.clone(),
+                Some("Verify the human workspace"),
+                Some(&mut workflow),
+            )?;
             let records: Vec<_> = gate
                 .ledger
                 .history()?
@@ -1362,12 +1387,10 @@ impl Gate {
             if records.is_empty() {
                 bail!("The private validation audit is absent.");
             }
-            Ok(crate::resolution::VerificationReport {
-                schema_version: 1,
-                authorizes_acceptance: false,
+            Ok(crate::resolution::VerificationReport::new(
                 prepared,
-                validated_hashes: records.iter().map(|record| record.hash.clone()).collect(),
-                validation: crate::resolution::ValidationEvidence {
+                records.iter().map(|record| record.hash.clone()).collect(),
+                crate::resolution::ValidationEvidence {
                     source_authority: true,
                     current_bindings: true,
                     permitted_dependencies: true,
@@ -1375,8 +1398,9 @@ impl Gate {
                     credential_scan: true,
                     conflicts_absent: true,
                 },
-                verification: records.iter().find_map(|record| record.verification.clone()),
-            })
+                records.iter().find_map(|record| record.verification.clone()),
+                workflow,
+            ))
         })()
         .map_err(|_| anyhow!(
             "Workspace verification failed. Check source authority, current bindings, dependencies, native configuration, credentials, conflicts, and trusted Nix checks."
@@ -1855,9 +1879,37 @@ impl Gate {
                     || record.for_hashes.contains(&hash)
             })
             .collect();
-        let secret_rejection = records
-            .iter()
-            .any(|record| record.hash == hash && !record.findings.is_empty());
+        let cases: Vec<_> = crate::cases::Store::new(&self.settings.repo)
+            .list()?
+            .into_iter()
+            .filter(|record| record.snapshot.candidate == hash)
+            .collect();
+        let context = self
+            .pijul
+            .review_change(&self.settings.inbox, &hash, &text, &paths);
+        let conflicts = if main.hashes.contains(&hash) {
+            self.pijul.conflicts(&self.settings.main)?
+        } else {
+            let isolated = crate::isolation::copy_repository(&self.settings.repo)?;
+            if isolated.pijul.snapshot(&self.settings.main)? != main {
+                bail!("Main changed before the private conflict preview. Repeat the explanation.");
+            }
+            isolated.pijul.apply(&hash, &self.settings.main)?;
+            isolated.pijul.conflicts(&self.settings.main)?
+        };
+        let guide = crate::review_guide::build(crate::review_guide::Input {
+            binding: &current,
+            configuration: &self.configuration,
+            policy,
+            context,
+            conflicts,
+            protected_paths: &protected_paths,
+            dependencies: &dependencies,
+            records: &records,
+            cases: &cases,
+            state,
+        })?;
+        let secret_rejection = !guide.findings.is_empty();
         let message = if secret_rejection {
             paths.clear();
             protected_paths.clear();
@@ -1865,29 +1917,50 @@ impl Gate {
         } else {
             entry.message.clone()
         };
+        let command = || crate::resolution::command_prefix(
+            &self.settings.repo,
+            Some(&self.settings.main),
+            Some(&self.settings.inbox),
+        );
         let next_actions = match state {
             State::Accepted => Vec::new(),
-            State::Pending => vec!["patchgate review --dry-run".into()],
+            State::Pending => vec![command()
+                .map(|prefix| format!("{prefix} review --change {hash} --dry-run"))
+                .unwrap_or_else(|| "Inspect the selected repository and channels before review.".into())],
             State::Rejected => vec![
-                format!("pijul unrecord {}", short(&hash)),
-                "Record a corrected change in the inbox.".into(),
+                "Remove or replace the rejected inbox record, then record a corrected change.".into(),
             ],
-            State::Escalated => vec![
-                format!("patchgate accept {}", short(&hash)),
-                format!("patchgate reject {}", short(&hash)),
-            ],
+            State::Escalated => {
+                let mut actions = Vec::new();
+                if let Some(prefix) = command() {
+                    let workspace = self.settings.repo.parent().map(|parent| {
+                        parent.join(format!("patchgate-review-{}", short(&hash)))
+                    });
+                    if let Some(workspace) = workspace.filter(|path| {
+                        matches!(fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+                    }).and_then(|path| crate::resolution::shell_quote(path.as_os_str())) {
+                        actions.push(format!("{prefix} resolve {hash} --workspace {workspace}"));
+                    } else {
+                        actions.push("Choose a new workspace directory outside the source repository before human edits.".into());
+                    }
+                    actions.push(format!("{prefix} reject {hash}"));
+                } else {
+                    actions.push("Inspect the selected repository and channels before a human decision.".into());
+                }
+                actions
+            }
             State::Waiting | State::Blocked => {
                 vec!["Decide the unmet dependencies before this change.".into()]
             }
-            State::Removed => vec!["Examine the removal from main before another decision.".into()],
-            State::Reverted => vec![
-                format!("patchgate explain {hash}"),
-                "Record a corrected change in the inbox.".into(),
-            ],
+            State::Removed | State::Reverted => {
+                vec!["Examine the removal from main before another decision.".into()]
+            }
             State::Unknown => vec!["Examine the channel and dependency state.".into()],
         };
+        self.require_current_main(&main)?;
         Ok(Explanation {
             schema_version: 1,
+            authorizes_acceptance: false,
             hash,
             message,
             state,
@@ -1899,6 +1972,7 @@ impl Gate {
             checks,
             records,
             next_actions,
+            guide,
         })
     }
 
@@ -2268,7 +2342,7 @@ impl Gate {
     pub fn accept_resolution(&mut self, workspace: &Path, reason: Option<&str>) -> Result<Item> {
         self.recover_under_lock()?;
         let prepared = crate::resolution::load(&self.settings.repo, workspace)?;
-        self.accept_prepared_resolution(prepared, reason, false)
+        self.accept_prepared_resolution(prepared, reason, None)
     }
 
     fn resolution_plan(
@@ -2323,7 +2397,7 @@ impl Gate {
         &mut self,
         prepared: crate::resolution::Prepared,
         reason: Option<&str>,
-        verification_only: bool,
+        workflow: Option<&mut crate::resolution::Readiness>,
     ) -> Result<Item> {
         let (main, mut item) = self.resolution_plan(&prepared)?;
         let primary = prepared
@@ -2336,12 +2410,15 @@ impl Gate {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{user} accepted the prepared human resolution."));
         self.require_current_main(&main)?;
-        let private = if verification_only {
+        let private = if workflow.is_some() {
             Some(crate::resolution::copy_workspace(&prepared)?)
         } else {
             None
         };
         let completed = if let Some(private) = &private {
+            if let Some(workflow) = workflow {
+                crate::resolution::inspect_verified_copy(&private.pijul, &prepared, workflow)?;
+            }
             crate::resolution::record_private(&prepared, &private.pijul, &self.signer, &reason)?
         } else {
             crate::resolution::record(&prepared, &self.signer, &reason)?
@@ -5193,6 +5270,25 @@ mod feature_tests {
         assert_eq!(source_bytes(&prepared.workspace)?, changed);
         let mut gate = Gate::new(settings)?;
         assert!(gate.accept_resolution(&prepared.workspace, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn accepted_workspace_offers_history_instead_of_an_invalid_refresh() -> Result<()> {
+        let (directory, settings, candidate) = pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let prepared = Gate::prepare_resolution(
+            settings.clone(),
+            &candidate,
+            &fs::canonicalize(directory.path())?.join("workspace"),
+        )?;
+        Gate::new(settings.clone())?.accept_resolution(&prepared.workspace, Some("Accept the native change"))?;
+        let report = Gate::workspace_status(settings, &prepared.workspace)?;
+        assert!(report.blockers.iter().any(|blocker| blocker.code == "candidate_in_main"));
+        assert!(report.next_actions.iter().any(|action| action.code == "inspect_accepted_change"));
+        assert!(report.next_actions.iter().all(|action| {
+            !matches!(action.code.as_str(), "refresh" | "verify" | "accept_explicitly" | "record_before_refresh")
+        }));
+        assert!(!report.authorizes_acceptance);
         Ok(())
     }
 

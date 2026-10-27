@@ -13,6 +13,11 @@ use sha2::{Digest, Sha256};
 
 use crate::configuration::{Evidence, Values};
 
+use crate::case_metadata as metadata;
+pub use crate::case_metadata::{NoteKind, NoteRecord, SeenRecord, SpanAnchor};
+
+use crate::pijul::{MetadataContext, NativeContextFile, NativeVertex, NativeVertexKind, ReviewChange};
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -64,6 +69,10 @@ pub struct CaseRecord {
     pub labels: Vec<LabelRecord>,
     #[serde(default)]
     pub tags: Vec<TagRecord>,
+    #[serde(default)]
+    pub notes: Vec<NoteRecord>,
+    #[serde(default)]
+    pub seen: Vec<SeenRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -102,6 +111,66 @@ fn valid_hash(hash: &str) -> bool {
 
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn file_context<'a>(
+    change: &'a ReviewChange,
+    path: &str,
+) -> Result<(Option<&'a NativeContextFile>, Option<&'a MetadataContext>)> {
+    metadata::validate_path(path)?;
+    ensure!(change.context.full, "The native file context is not complete.");
+    let mut files = change.context.files.iter().filter(|file| file.path == path);
+    let mut metadata = change.metadata_context.iter().filter(|file| file.path == path);
+    let file = files.next();
+    let context = metadata.next();
+    ensure!(
+        file.is_some() != context.is_some() && files.next().is_none() && metadata.next().is_none(),
+        "The captured file path is absent or ambiguous."
+    );
+    Ok((file, context))
+}
+
+struct DigestWriter(Sha256);
+
+impl Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn file_digest(change: &ReviewChange, path: &str) -> Result<String> {
+    let (file, metadata) = file_context(change, path)?;
+    let mut writer = DigestWriter(Sha256::new());
+    serde_json::to_writer(&mut writer, &(path, file, metadata))?;
+    Ok(format!("{:x}", writer.0.finalize()))
+}
+
+pub fn span_anchor(change: &ReviewChange, path: &str, span: usize) -> Result<SpanAnchor> {
+    let (file, _) = file_context(change, path)?;
+    let vertex = file
+        .and_then(|file| span.checked_sub(1).and_then(|index| file.vertices.get(index)))
+        .context("The native span index is not valid for this file.")?;
+    Ok(vertex_anchor(path, vertex))
+}
+
+pub fn vertex_anchor(path: &str, vertex: &NativeVertex) -> SpanAnchor {
+    SpanAnchor {
+        path: path.into(),
+        vertex_change: vertex.change.clone(),
+        start: vertex.start,
+        end: vertex.end,
+        kind: match vertex.kind {
+            NativeVertexKind::Add => "add",
+            NativeVertexKind::Del => "del",
+            NativeVertexKind::Keep => "keep",
+        }.into(),
+        text_sha256: digest(vertex.text.as_bytes()),
+    }
 }
 
 fn identity(snapshot: &Snapshot) -> Result<String> {
@@ -317,6 +386,7 @@ impl Store {
         for tags in &record.tags {
             validate_tags(tags)?;
         }
+        metadata::validate_histories(&record.notes, &record.seen)?;
         Ok(Some(record))
     }
 
@@ -398,6 +468,8 @@ impl Store {
             captured_at: now(),
             labels: Vec::new(),
             tags: Vec::new(),
+            notes: Vec::new(),
+            seen: Vec::new(),
         };
         self.save(&repo, &record)?;
         Ok(record)
@@ -455,6 +527,67 @@ impl Store {
         let records = self.records(&repo)?;
         let mut record = select(&records, prefix)?.clone();
         record.tags.push(tags);
+        self.save(&repo, &record)?;
+        Ok(record)
+    }
+
+    pub fn note(
+        &self,
+        prefix: &str,
+        kind: NoteKind,
+        text: &str,
+        references: &[String],
+        path: Option<&str>,
+        span: Option<usize>,
+    ) -> Result<CaseRecord> {
+        ensure!(path.is_some() == span.is_some(), "A note target needs both a path and a span.");
+        let mut note = NoteRecord {
+            user: std::env::var("USER").unwrap_or_else(|_| "a human".into()),
+            time: now(),
+            kind,
+            text: text.into(),
+            references: references.into(),
+            anchor: None,
+        };
+        metadata::validate_histories(std::slice::from_ref(&note), &[])?;
+        let repo = self.repository()?;
+        let _lock = self.lock(&repo)?;
+        let records = self.records(&repo)?;
+        let mut record = select(&records, prefix)?.clone();
+        let report = crate::case_view::inspect(&repo, &record.id)?;
+        ensure!(
+            report.snapshot == record.snapshot && report.id == record.id,
+            "The note target differs from its captured snapshot."
+        );
+        if let (Some(path), Some(span)) = (path, span) {
+            note.anchor = Some(span_anchor(&report.change, path, span)?);
+        }
+        metadata::validate_histories(std::slice::from_ref(&note), &[])?;
+        record.notes.push(note);
+        self.save(&repo, &record)?;
+        Ok(record)
+    }
+
+    pub fn seen(&self, prefix: &str, path: &str, seen: bool) -> Result<CaseRecord> {
+        metadata::validate_path(path)?;
+        let repo = self.repository()?;
+        let _lock = self.lock(&repo)?;
+        let records = self.records(&repo)?;
+        let mut record = select(&records, prefix)?.clone();
+        let report = crate::case_view::inspect(&repo, &record.id)?;
+        ensure!(
+            report.snapshot == record.snapshot && report.id == record.id,
+            "The seen file differs from its captured snapshot."
+        );
+        let entry = SeenRecord {
+            user: std::env::var("USER").unwrap_or_else(|_| "a human".into()),
+            time: now(),
+            path: path.into(),
+            content_sha256: file_digest(&report.change, path)?,
+            seen,
+        };
+        metadata::validate_histories(&[], std::slice::from_ref(&entry))?;
+        record.seen.push(entry);
         self.save(&repo, &record)?;
         Ok(record)
     }
@@ -542,6 +675,8 @@ impl Store {
                     "snapshot": record.snapshot,
                     "labels": record.labels,
                     "tags": record.tags,
+                    "notes": record.notes,
+                    "seen": record.seen,
                 }))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -717,6 +852,74 @@ fn export_path(path: &Path, repo: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_case_files_default_to_empty_human_metadata() {
+        let (_directory, snapshot) = fixture();
+        let store = Store::new(&snapshot.repository);
+        let record = store.capture(snapshot).unwrap();
+        let mut old = serde_json::to_value(&record).unwrap();
+        old.as_object_mut().unwrap().remove("notes");
+        old.as_object_mut().unwrap().remove("seen");
+        let path = record.snapshot.repository.join(".pijul/patchgate/cases")
+            .join(format!("{}.json", record.id));
+        fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        assert_eq!(store.get(&record.id).unwrap(), record);
+    }
+
+    fn native_fixture() -> ReviewChange {
+        ReviewChange {
+            hash: "A".repeat(53),
+            message: "Change a file".into(),
+            authors: Vec::new(),
+            timestamp: String::new(),
+            dependencies: Vec::new(),
+            paths: ["value.txt".into(), "empty.txt".into()].into_iter().collect(),
+            context: serde_json::from_value(json!({
+                "full": true, "files": [{"path": "value.txt", "vertices": [{
+                    "change": "A".repeat(53), "start": 4, "end": 8,
+                    "kind": "add", "text": "one\n"
+                }]}]
+            })).unwrap(),
+            metadata_context: vec![crate::pijul::MetadataContext {
+                path: "empty.txt".into(), before: None, after: Some(String::new()),
+            }],
+        }
+    }
+
+    #[test]
+    fn native_targets_bind_origin_range_kind_text_and_metadata() {
+        let mut change = native_fixture();
+        let anchor = span_anchor(&change, "value.txt", 1).unwrap();
+        assert_eq!(anchor.path, "value.txt");
+        assert_eq!(anchor.vertex_change, "A".repeat(53));
+        assert_eq!((anchor.start, anchor.end), (4, 8));
+        assert_eq!(anchor.kind, "add");
+        assert_eq!(anchor.text_sha256, digest(b"one\n"));
+        assert!(span_anchor(&change, "value.txt", 0).is_err());
+        assert!(span_anchor(&change, "value.txt", 2).is_err());
+        assert!(span_anchor(&change, "empty.txt", 1).is_err());
+        for path in ["missing.txt", "../value.txt", "/value.txt", "./value.txt", ".pijul/key"] {
+            assert!(file_digest(&change, path).is_err());
+        }
+        let original = file_digest(&change, "value.txt").unwrap();
+        change.context.files[0].vertices[0].change = "B".repeat(53);
+        assert_ne!(file_digest(&change, "value.txt").unwrap(), original);
+        change = native_fixture();
+        change.context.files[0].vertices[0].start = 3;
+        assert_ne!(file_digest(&change, "value.txt").unwrap(), original);
+        change = native_fixture();
+        change.context.files[0].vertices[0].kind = NativeVertexKind::Keep;
+        assert_ne!(file_digest(&change, "value.txt").unwrap(), original);
+        change = native_fixture();
+        change.context.files[0].vertices[0].text = "two\n".into();
+        assert_ne!(file_digest(&change, "value.txt").unwrap(), original);
+        let empty = file_digest(&change, "empty.txt").unwrap();
+        change.metadata_context[0].before = Some(String::new());
+        assert_ne!(file_digest(&change, "empty.txt").unwrap(), empty);
+        change.context.full = false;
+        assert!(file_digest(&change, "value.txt").is_err());
+    }
 
     fn fixture() -> (tempfile::TempDir, Snapshot) {
         let directory = tempfile::tempdir().unwrap();

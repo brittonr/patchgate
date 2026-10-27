@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::case_metadata;
+
 const MANIFEST: &str = "manifest.json";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -267,6 +269,13 @@ fn members(manifest: &Value) -> Result<(PathBuf, Vec<String>, BTreeSet<String>)>
             }),
             "A bundle case needs an explicit human label."
         );
+        let notes: Vec<case_metadata::NoteRecord> = case.get("notes")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose().context("The bundle notes are not valid.")?.unwrap_or_default();
+        let seen: Vec<case_metadata::SeenRecord> = case.get("seen")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose().context("The bundle seen records are not valid.")?.unwrap_or_default();
+        case_metadata::validate_histories(&notes, &seen)?;
         let candidate = text(case, "candidate")?;
         paths.insert(native_path(candidate)?);
         let mut base_hashes = BTreeSet::new();

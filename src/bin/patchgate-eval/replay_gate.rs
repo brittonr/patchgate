@@ -328,6 +328,8 @@ fn compatible(row: &Comparison, previous: &Comparison) -> bool {
         && row.snapshot == previous.snapshot
         && row.labels == previous.labels
         && row.tags == previous.tags
+        && row.notes == previous.notes
+        && row.seen == previous.seen
         && row.configuration == previous.configuration
 }
 
@@ -338,6 +340,8 @@ fn matches_case(row: &Comparison, case: &Case, default: &Configuration) -> bool 
         && row.snapshot == case.snapshot
         && row.labels == case.labels
         && row.tags == case.tags
+        && row.notes == case.notes
+        && row.seen == case.seen
         && row.configuration == *case.configuration.as_ref().unwrap_or(default)
 }
 
@@ -941,7 +945,7 @@ mod tests {
     fn baseline_bindings_cannot_change() {
         let manifest = manifest();
         let current = rows(&manifest, [Label::Reject, Label::Reject]);
-        for field in 0..11 {
+        for field in 0..13 {
             let mut previous = baseline(&manifest, &current);
             let row = &mut previous.comparisons[0];
             match field {
@@ -955,12 +959,21 @@ mod tests {
                 7 => previous.inbox = "another-inbox".into(),
                 8 => previous.repository = "/another/source".into(),
                 9 => previous.schema_version = 99,
-                _ => row.tags.push(TagRecord {
+                10 => row.tags.push(TagRecord {
                     user: "reviewer".into(),
                     time: "2026-10-21T00:00:00Z".into(),
                     reason: "The reviewer identifies a policy rule.".into(),
                     policy_rules: vec!["policy".into()],
                     conflict_kinds: Vec::new(),
+                }),
+                11 => row.notes.push(serde_json::from_value(json!({
+                    "user": "reviewer", "time": "2026-10-21T00:00:00Z",
+                    "kind": "comment", "text": "Inspect the file contract.",
+                    "references": ["issue:42"], "anchor": null,
+                })).unwrap()),
+                _ => row.seen.push(SeenRecord {
+                    user: "reviewer".into(), time: "2026-10-21T00:00:00Z".into(),
+                    path: "value.txt".into(), content_sha256: "a".repeat(64), seen: true,
                 }),
             }
             let result = evaluate_rows(&args(), &manifest, &current, Some(&Ok(previous)));

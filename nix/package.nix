@@ -126,6 +126,7 @@ let
       (pkgs.lib.fileset.fileFilter (file: file.hasExt "rs") (sourceRoot + "/src/bin/patchgate-eval"))
       (sourceRoot + "/src/artifact.rs")
       (sourceRoot + "/src/bundle.rs")
+      (sourceRoot + "/src/case_metadata.rs")
       (sourceRoot + "/src/change.rs")
       (sourceRoot + "/src/isolation.rs")
       (sourceRoot + "/src/pijul.rs")

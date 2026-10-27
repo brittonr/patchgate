@@ -3,6 +3,7 @@ use std::fmt;
 use std::sync::LazyLock;
 
 use regex::Regex;
+use serde::Serialize;
 use serde_json::Value;
 
 static DEPENDENCY: LazyLock<Regex> = LazyLock::new(|| {
@@ -40,7 +41,7 @@ impl fmt::Display for Unmerged {
 
 impl std::error::Error for Unmerged {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Conflict {
     pub kind: String,
     pub path: String,

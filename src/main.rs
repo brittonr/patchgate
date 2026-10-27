@@ -1,6 +1,7 @@
 pub mod artifact;
 mod budget;
 pub mod bundle;
+mod case_metadata;
 mod case_view;
 mod cases;
 mod change;
@@ -19,6 +20,8 @@ pub mod release_policy;
 mod resolution;
 mod review;
 mod review_control;
+mod review_delta;
+mod review_guide;
 mod review_plan;
 mod secrets;
 mod verify;
@@ -272,6 +275,48 @@ enum CaseCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Append selected intent or feedback to an exact review snapshot.
+    Note {
+        case: String,
+        #[arg(long, value_enum, default_value = "comment")]
+        kind: cases::NoteKind,
+        #[arg(short = 'm', long)]
+        text: String,
+        #[arg(long = "reference")]
+        references: Vec<String>,
+        #[arg(long, requires = "span")]
+        path: Option<String>,
+        /// The native vertex index within the file. The first index is one.
+        #[arg(long, requires = "path")]
+        span: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show original review notes and their state against a captured snapshot.
+    Notes {
+        case: String,
+        #[arg(long)]
+        against: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record per-user file review state without approval.
+    Seen {
+        case: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        unseen: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare exact captured source and review evidence.
+    Compare {
+        before: String,
+        after: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Export labeled cases and explicit model variants for replay.
     Export {
         #[arg(long)]
@@ -368,42 +413,6 @@ fn print_json(value: &impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
-fn show_explanation(explanation: &gate::Explanation) -> Result<()> {
-    println!("{}  {}", explanation.hash, explanation.message);
-    println!("State: {}", explanation.state.as_str());
-    for path in &explanation.paths {
-        let protected = if explanation.protected_paths.contains(path) {
-            " (protected)"
-        } else {
-            ""
-        };
-        println!("Path: {path}{protected}");
-    }
-    for dependency in &explanation.dependencies {
-        println!(
-            "Dependency: {} ({})",
-            dependency.hash,
-            dependency.state.as_str()
-        );
-        for need in &dependency.needs {
-            println!("  needs {need}");
-        }
-    }
-    println!("Current policy and main binding:");
-    print_json(&explanation.current)?;
-    if let Some(checks) = &explanation.checks {
-        println!("Trusted check manifest:");
-        print_json(checks)?;
-    }
-    if !explanation.records.is_empty() {
-        println!("Decision and verification evidence:");
-        print_json(&explanation.records)?;
-    }
-    for action in &explanation.next_actions {
-        println!("Next: {action}");
-    }
-    Ok(())
-}
 
 fn show_review(report: &gate::ReviewReport, json: bool) -> Result<()> {
     if json {
@@ -525,6 +534,75 @@ fn run_cases(settings: Settings, command: CaseCommand) -> Result<()> {
             )?;
             show_case(&record, json)?;
         }
+        CaseCommand::Note {
+            case,
+            kind,
+            text,
+            references,
+            path,
+            span,
+            json,
+        } => {
+            let record = cases::Store::new(&settings.repo).note(
+                &case,
+                kind,
+                &text,
+                &references,
+                path.as_deref(),
+                span,
+            )?;
+            if json {
+                print_json(&record)?;
+            } else {
+                show_case(&record, false)?;
+                if let Some(note) = record.notes.last() {
+                    println!("Note {}: {:?} by {}", record.notes.len(), note.kind, note.user);
+                    println!("{}", note.text);
+                    for reference in &note.references {
+                        println!("Reference: {reference}");
+                    }
+                    if let Some(anchor) = &note.anchor {
+                        println!("Anchor: {} {} {}..{}", anchor.path, anchor.vertex_change, anchor.start, anchor.end);
+                    }
+                }
+                println!("This note is untrusted review context. It grants no acceptance authority.");
+            }
+        }
+        CaseCommand::Notes { case, against, json } => {
+            let report = review_delta::case_annotations(&settings.repo, &case, against.as_deref())?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!("Target candidate: {}", report.candidate);
+                println!(
+                    "Bound main: {} {}",
+                    report.binding.main.channel.escape_debug(),
+                    report.binding.main.state.as_deref().unwrap_or("empty")
+                );
+                review_delta::show_annotations(&report);
+                println!("Review metadata is not approval and does not authorize acceptance.");
+            }
+        }
+        CaseCommand::Seen { case, path, unseen, json } => {
+            let record = cases::Store::new(&settings.repo).seen(&case, &path, !unseen)?;
+            if json {
+                print_json(&record)?;
+            } else {
+                show_case(&record, false)?;
+                if let Some(seen) = record.seen.last() {
+                    println!("Seen: {} {} by {}", seen.path, seen.seen, seen.user);
+                }
+                println!("Seen state is not approval and grants no acceptance authority.");
+            }
+        }
+        CaseCommand::Compare { before, after, json } => {
+            let report = review_delta::compare(&settings.repo, &before, &after)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                review_delta::show_comparison(&report);
+            }
+        }
         CaseCommand::Export {
             variants,
             output,
@@ -613,9 +691,6 @@ fn run_artifact(source: &std::path::Path, command: ArtifactCommand) -> Result<()
     Ok(())
 }
 
-fn quote_path(path: &std::path::Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
-}
 
 fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result<()> {
     match command {
@@ -633,20 +708,7 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
             if json {
                 print_json(&report)?;
             } else {
-                println!("Workspace: {}", report.workspace.display());
-                for blocker in &report.blockers {
-                    println!("Blocked [{}]: {}", blocker.code, blocker.detail);
-                }
-                if let Some(pending) = report.pending_tracked_edits {
-                    println!("Pending tracked edits: {pending}");
-                }
-                if let Some(conflicts) = &report.recorded_conflicts {
-                    println!("Recorded conflicts: {}", conflicts.len());
-                }
-                for check in &report.pending_verification {
-                    println!("Pending [{}]: {}", check.code, check.detail);
-                }
-                println!("The report grants no acceptance authority.");
+                resolution::show_readiness(&report);
             }
             if !report.blockers.is_empty() {
                 bail!("Workspace inspection found acceptance blockers.");
@@ -754,7 +816,7 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
             if json {
                 print_json(&explanation)?;
             } else {
-                show_explanation(&explanation)?;
+                review_guide::show(&explanation)?;
             }
         }
         Command::Budget { change, json } => {
@@ -809,25 +871,10 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                     preserved: refreshed.as_ref().map(|(_, hashes)| hashes.as_slice()),
                 })?;
             } else {
-                println!("Resolution: {}", prepared.id);
-                println!("Workspace: {}", prepared.workspace.display());
-                println!("Conflicts: {}", prepared.conflicts.len());
-                if let Some((previous, preserved)) = &refreshed {
-                    println!("Refreshed from: {previous}");
-                    println!("Preserved human records: {}", preserved.len());
-                    println!(
-                        "The old workspace remains unchanged. Its untracked files stay there."
-                    );
-                }
-                if let Some(policy) = &prepared.policy_file {
-                    println!("Trusted policy: {}", policy.display());
-                }
-                println!("Native review: {}", prepared.review_file.display());
-                println!("Edit tracked files. Use pijul add for new files.");
-                println!(
-                    "Accept explicitly: patchgate --repo {} accept --resolution {}",
-                    quote_path(&repository),
-                    quote_path(&prepared.workspace),
+                resolution::show_prepared(
+                    &prepared,
+                    &repository,
+                    refreshed.as_ref().map(|(previous, hashes)| (previous.as_str(), hashes.as_slice())),
                 );
             }
         }

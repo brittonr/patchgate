@@ -341,6 +341,21 @@ Invalid authority leaves trusted binding fields `null`.
 `pending_verification` lists credential, isolation, Nix, conflict, and native conditional checks.
 A clear static report never authorizes acceptance or proves that those checks pass.
 
+Readiness also includes the exact prepared base, candidate set, review binding, recorded supplemental changes, and recorded workspace state.
+`next_actions` supplies quoted commands for the current state.
+
+A stale workspace with pending tracked edits needs a native record before refresh.
+Invalid authority or blocked source decisions suppress operational commands.
+A candidate already in main offers history inspection, not another refresh or acceptance.
+
+Private verification returns `workflow` for the exact private workspace copy before its native record.
+Source facts describe the static inspection.
+
+`private_recorded_changes` identifies records that exist only in the private result.
+`acceptance_requires_live_guards: true` means acceptance repeats all guards.
+The report never authorizes acceptance.
+
+
 
 #### Refresh a human workspace
 
@@ -667,7 +682,7 @@ cargo test --locked
 
 `nix/package.nix` first builds shared Cargo dependency artifacts.
 Separate Crane derivations compile and test the application and evaluator from independent Rust source sets.
-The evaluator source set includes the native and replay modules that it shares with the application.
+The evaluator source set includes the native, case metadata, and replay modules that it shares with the application.
 A final derivation copies both binaries and creates their wrappers.
 The evaluator wrapper always binds to that assembly's application output.
 
@@ -816,7 +831,7 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate blame <path>` | Shows native line attribution and the recorded decision of each change. |
 | `patchgate lanes` | Folds each configured lane channel into the inbox without a review. |
 | `patchgate log` | Shows the decisions and the merges, newest first. |
-| `patchgate explain <hash>` | Shows paths, unmet dependency chains, current policy/main bindings, and recorded decision and verification evidence. |
+| `patchgate explain <hash>` | Shows native spans, trusted policy, blockers, review notes, seen state, and recorded decisions. |
 | `patchgate review --dry-run` | Runs the review, merge, and check flow in an isolated repository without source acceptance. |
 | `patchgate model` | Shows the effective model profile, endpoint, decision path, and key-file presence. It makes no model request. |
 | `patchgate model --probe` | Sends two harmless typed questions and reports whether every question has a valid answer. |
@@ -901,6 +916,31 @@ A successful Nix verification adds the observed Nix version.
 Gate refusals can retain earlier request evidence without a claim of model approval.
 Older records can lack provenance.
 Missing old evidence is not a claim that verification occurred.
+
+### Complete review view
+
+```console
+$ patchgate explain <hash>
+$ patchgate explain <hash> --json
+```
+
+The `guide` combines exact source spans, trusted policy text, identified rule IDs, blockers, notes, seen state, and decision history.
+The native change message supplies author intent, not a verified claim.
+Native context comes only from the candidate and its prerequisites.
+
+A separate private preview applies the candidate to the bound main state to find native conflicts.
+The report marks a preview that also needs unmet prerequisites.
+An empty native conflict path stays empty.
+The command does not guess a file name.
+
+`guide.evidence` identifies each record and separates matching review bindings from historical evidence.
+Historical verification never becomes current approval.
+Credential findings omit source context and affected paths.
+
+Binary or incomplete native text keeps the affected-path list and states the context limit.
+The command makes no model request and authorizes no acceptance.
+Declared Nix checks are requirements, not successful verification results.
+Only normal review or explicit acceptance can execute the live acceptance guards.
 
 ### Isolated review
 
@@ -1141,7 +1181,8 @@ Dry runs do not persist cases in the source repository.
 Manual capture selects one unaccepted inbox change.
 
 Each snapshot retains ordered native base hashes, candidate hash, main state, policy digest, channel names, and effective review settings.
-The private `.pijul/patchgate/cases` store contains snapshot metadata and human label history, not source text.
+The private `.pijul/patchgate/cases` store contains snapshot metadata, selected human notes, seen history, and explicit label history.
+It does not copy native source text.
 Native `.pijul/changes` files remain the replay data source.
 Retain the native files that exported cases need.
 
@@ -1181,6 +1222,69 @@ Use unique lowercase identifiers, at most 64 characters.
 Tags start with a letter and can contain letters, digits, hyphens, and underscores.
 Reasons and tags must not contain supported credentials or control characters.
 Ordinary manifests, portable bundles, replay reports, and baseline bindings retain the complete tag history.
+
+### Review notes, seen state, and snapshot comparison
+
+```console
+$ patchgate cases capture <hash> --json
+$ patchgate cases show <case-id> --json
+```
+
+Note kinds are `comment`, `constraint`, `alternative`, and `evidence`.
+The default is `comment`.
+A note retains the user, time, type, selected text, references, and optional native anchor.
+
+Use `--reference` more than once for several evidence links or identifiers.
+patchgate does not fetch or execute references.
+
+```console
+$ patchgate cases note <case-id> --kind constraint -m "Preserve the public data format."
+$ patchgate cases note <case-id> --kind comment --path src/lib.rs --span 1 -m "Inspect this span."
+$ patchgate cases note <case-id> --kind evidence -m "The report covers this change." --reference test:parser
+```
+
+Path and span must occur together.
+A span index starts at one within that file's captured native vertices.
+`cases show --json` exposes those vertices.
+
+The anchor stores the origin change, byte range, kind, and text digest, not quoted source.
+A later snapshot keeps the original note and marks changed bindings or absent spans as stale.
+
+```console
+$ patchgate cases seen <case-id> --path src/lib.rs
+$ patchgate cases seen <case-id> --path src/lib.rs --unseen
+```
+
+Seen events retain user, time, path, exact file digest, and explicit set or clear state.
+The last appended event for an exact binding controls current seen state.
+Clock order does not replace append order.
+
+A changed candidate, policy, main state, configuration, or file digest clears current seen state.
+Old events remain visible as stale history.
+
+```console
+$ patchgate cases notes <case-id> --against <new-case-id> --json
+$ patchgate cases compare <case-id> <new-case-id> --json
+```
+
+`cases compare` reports new, changed, removed, and unchanged paths in candidate review context.
+It compares exact native spans, metadata before/after text, policy, main state, settings, dependencies, conflicts, and verification evidence.
+Current and historical verification remain separate.
+
+No comparison skips gate checks.
+These records stay in existing case files without a change to case identity.
+Old case files without notes or seen history remain readable.
+
+Explicit `cases label` remains the only source of human replay labels.
+Ordinary exports, portable bundles, replay reports, and baseline comparisons retain the metadata.
+Notes and seen state never enter model requests or trusted policy.
+
+The metadata grants no acceptance authority.
+The store refuses control characters, supported credentials, unsafe paths, invalid spans, and unsafe case files.
+It retains only explicit note text, not automatic prompt or terminal transcripts.
+
+Human identity follows the existing `USER` convention.
+It is not authenticated identity.
 
 ### Portable replay bundles
 
