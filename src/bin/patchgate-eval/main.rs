@@ -71,6 +71,8 @@ enum Action {
     VerifyHarbor(controls::ControlArgs),
     ModelHarbor(real_model::LiveArgs),
     Replay(replay::ReplayArgs),
+    /// Compare explicit human effort with captured replay decisions.
+    Pilot(replay::pilot::PilotArgs),
     Baseline(baseline::BaselineArgs),
     #[command(disable_help_flag = true)]
     InterceptPijul {
@@ -267,6 +269,7 @@ fn run() -> Result<()> {
         Action::VerifyHarbor(args) => controls::verify_harbor(args)?,
         Action::ModelHarbor(args) => real_model::model_harbor(args)?,
         Action::Replay(args) => replay::run(args)?,
+        Action::Pilot(args) => replay::pilot::run(args)?,
         Action::Baseline(args) => baseline::run(args)?,
         Action::InterceptPijul { args } => recovery::intercept_pijul(&args)?,
         Action::InterceptApplyRace { args } => apply_race::intercept_pijul(&args)?,

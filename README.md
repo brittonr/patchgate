@@ -900,6 +900,7 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate model --probe` | Sends two harmless typed questions and reports whether every question has a valid answer. |
 | `patchgate doctor` | Diagnoses setup and gives repair commands without repository changes. |
 | `patchgate-eval replay <manifest>` | Compares labeled historical changes across model and policy variants. |
+| `patchgate-eval pilot <replay> --measurements <file>` | Compares explicit human effort with native replay evidence. Missing evidence blocks the report. |
 | `patchgate resolve <hash> --workspace <path>` | Prepares a separate human workspace without acceptance. |
 | `patchgate accept --resolution <path>` | Verifies and accepts the prepared human resolution against its original bindings. |
 | `patchgate reconsider <hash> -m <reason>` | Reviews an earlier gate or model rejection or escalation and retains its history. |
@@ -1412,6 +1413,98 @@ It retains only explicit note text, not automatic prompt or terminal transcripts
 
 Human identity follows the existing `USER` convention.
 It is not authenticated identity.
+
+### Practical-value pilot reports
+
+```console
+$ patchgate-eval pilot ../replay-report.json --measurements ../human-effort.json --report ../pilot.json
+```
+
+The pilot evaluator reads artifacts without model, Pijul, or Nix commands.
+It does not create labels, estimate effort, or change native channels.
+It can operate after the original source repository no longer exists.
+Use captured native cases and explicit human labels from the workflow above.
+
+Record the independent baseline before model review.
+New replay reports record `started_at` before execution.
+The pilot checks that the latest label time is strictly before that start.
+This checks declared chronology, not whether a reviewer saw earlier model output.
+Old reports without `started_at` remain readable, but cannot complete a routine pilot.
+
+The measurement file has these top-level fields:
+
+| Field | Value |
+| --- | --- |
+| `schema_version` | `1` |
+| `replay_sha256` | Lowercase SHA-256 of the exact replay file bytes, including whitespace |
+| `variant_id` | One variant ID from that replay |
+| `reviews` | An array of explicit case measurements |
+
+Each review has these fields:
+
+| Field | Value |
+| --- | --- |
+| `case_id` | An exact case ID from the replay |
+| `workload` | `routine` or `synthetic` |
+| `independent_baseline` | Explicit `true` for a routine case |
+| `reviewer` | The user from the latest captured human label |
+| `label_time` | The exact RFC 3339 time string from that label |
+| `baseline_seconds` | Finite, positive human baseline effort |
+| `assisted_seconds` | Finite, nonnegative human effort with assistance |
+| `correction_seconds` | Finite, nonnegative later human correction effort |
+| `assisted_decision` | The assisted human decision: `accept`, `reject`, or `escalate` |
+| `final_decision` | The final human decision after corrections |
+
+Only `case_id` must occur within a review.
+Omit fields whose values are unknown, rather than insert estimates or `null`.
+Missing routine evidence blocks metrics. Invalid explicit values cause an input error.
+Explicit zero differs from an omitted value.
+
+The caller must supply measured effort.
+Command duration and model latency do not supply human effort.
+Unknown field names cause an input error.
+
+Every case needs an explicit workload classification.
+Synthetic cases remain visible but never enter routine totals.
+Routine cases need a native capture, recorded policy digest, explicit label, declared independence, complete comparison, both decisions, and all effort values.
+Duplicate native captures cannot increase the sample count.
+Missing cases or incomplete routine comparisons block the whole cohort.
+The evaluator recomputes comparison bindings and summaries instead of trusting aggregate claims.
+
+The report retains per-case evidence, exclusions, static blockers, and exact input digests.
+`selected_cases`, `routine_cases`, and `excluded_synthetic_cases` list case IDs.
+Declared routine cases remain in the list even when evidence blocks them.
+Blocked reports have `metrics: null` and exit one.
+Complete reports exit zero, even when the observations show unsafe decisions or negative savings.
+The optional report file contains the same JSON as standard output.
+
+| Metric | Definition |
+| --- | --- |
+| `completed_routine_reviews` | Complete routine cases with distinct native captures |
+| `unsafe_acceptances` | Tool acceptance when the human expected rejection or escalation |
+| `missed_policy_violations` | Tool acceptance when the human expected rejection |
+| `unnecessary_escalations` | Tool escalation when the human expected acceptance |
+| `label_mismatches` | Tool decisions that differ from the human label |
+| `decision_corrections` | Assisted human decisions that differ from final human decisions |
+| `final_label_mismatches` | Final human decisions that differ from the baseline label |
+| `human_baseline_seconds` | Total explicit baseline effort |
+| `assisted_human_seconds` | Total explicit assisted effort |
+| `human_correction_seconds` | Total explicit correction effort |
+| `net_human_seconds_saved` | Baseline effort minus assisted effort and correction effort |
+
+The report always sets `authorizes_acceptance` to `false`.
+It uses `evidence_scope: "caller-reported"`.
+Human identity, workload provenance, and model identity verification flags remain `false`.
+Names, classifications, effort, and independence remain caller claims.
+A complete report does not prove model quality, model weights, or real-world time savings.
+Controlled fixture checks do not supply real pilot evidence.
+
+Both inputs must be regular, single-link files of at most 16 MiB.
+Every path component must be free of symbolic links.
+On Darwin, use canonical `/private/tmp` paths instead of `/tmp` aliases.
+The report parent directory must exist.
+Output uses private mode `0600` and atomic publication to a new file.
+Existing files and source or release repositories named by the replay remain protected.
 
 ### Portable replay bundles
 

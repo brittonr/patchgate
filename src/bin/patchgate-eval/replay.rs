@@ -11,6 +11,15 @@ use std::sync::Arc;
 #[path = "replay_gate.rs"]
 mod release_gate;
 
+#[path = "pilot.rs"]
+pub(crate) mod pilot;
+#[path = "pilot_io.rs"]
+mod pilot_io;
+#[path = "pilot_replay.rs"]
+mod pilot_replay;
+
+use pilot_replay::read_pilot_replay;
+
 use crate::case_metadata;
 use crate::case_metadata::{NoteRecord, SeenRecord};
 
@@ -329,7 +338,7 @@ impl Comparison {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Summary {
     variant_id: String,
@@ -344,7 +353,7 @@ struct Summary {
     latency: Latency,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Latency {
     samples: usize,
@@ -358,6 +367,8 @@ struct Latency {
 #[serde(deny_unknown_fields)]
 struct Report {
     schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at: Option<String>,
     manifest: PathBuf,
     repository: PathBuf,
     main: String,
@@ -566,6 +577,7 @@ pub(super) fn successful_promotion_report() -> Vec<u8> {
     let gate = release_gate::evaluate(&args, &manifest, &manifest.repository, &comparisons, None);
     let report = Report {
         schema_version: 1,
+        started_at: None,
         manifest: "/captured/manifest.json".into(),
         repository: manifest.repository,
         main: manifest.main,
@@ -632,6 +644,14 @@ fn validate_configuration(configuration: &Configuration) -> Result<()> {
 }
 
 fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
+    validate_manifest(manifest, policy_path, true)
+}
+
+fn validate_manifest(
+    manifest: &Manifest,
+    policy_path: &str,
+    require_captured_labels: bool,
+) -> Result<()> {
     validate_configuration(&manifest.configuration)?;
     ensure!(
         manifest.schema_version == 1,
@@ -705,7 +725,7 @@ fn validate(manifest: &Manifest, policy_path: &str) -> Result<()> {
                 "Each case label needs a user, time, expected value, and explicit reason."
             );
         }
-        if case.snapshot.is_some() {
+        if case.snapshot.is_some() && (require_captured_labels || !case.labels.is_empty()) {
             ensure!(
                 case.labels
                     .last()
@@ -1472,6 +1492,7 @@ fn run_with_release_policy(
     mut args: ReplayArgs,
     policy: crate::release_policy::Loaded,
 ) -> Result<()> {
+    let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     if let Some(policy) = &policy.policy {
         release_gate::apply_policy(&mut args, policy)?;
     }
@@ -1694,6 +1715,7 @@ fn run_with_release_policy(
     let gate_passed = gate.as_ref().is_none_or(|result| result.passed);
     let report = Report {
         schema_version: 1,
+        started_at: Some(started_at),
         manifest: manifest_path,
         repository: origin,
         main: manifest.main,

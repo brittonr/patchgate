@@ -217,7 +217,7 @@ fn label_mismatch(row: &Comparison) -> bool {
     row.actual.is_some_and(|actual| actual != row.expected)
 }
 
-fn complete(row: &Comparison) -> bool {
+pub(super) fn complete(row: &Comparison) -> bool {
     row.actual.is_some()
         && row.outcome == "verdict"
         && row.cli_executed
@@ -333,7 +333,7 @@ fn compatible(row: &Comparison, previous: &Comparison) -> bool {
         && row.configuration == previous.configuration
 }
 
-fn matches_case(row: &Comparison, case: &Case, default: &Configuration) -> bool {
+pub(super) fn matches_case(row: &Comparison, case: &Case, default: &Configuration) -> bool {
     row.candidate == case.candidate
         && row.base == case.base
         && row.expected == case.expected
@@ -689,7 +689,7 @@ pub(super) fn validate_report(report: &Report) -> Result<()> {
     Ok(())
 }
 
-fn validate_variant_rows(rows: &[Comparison], variants: &[Variant]) -> Result<()> {
+pub(super) fn validate_variant_rows(rows: &[Comparison], variants: &[Variant]) -> Result<()> {
     for row in rows {
         ensure!(
             variants.iter().any(|variant| variant.id == row.variant_id
