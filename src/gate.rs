@@ -249,6 +249,8 @@ pub struct Item {
     pub state: State,
     pub reason: String,
     pub needs: Vec<(String, State)>,
+    #[serde(skip)]
+    pub(crate) execution_failed: bool,
     pub decided: bool,
     pub merge: Option<Record>,
     pub note: String,
@@ -263,6 +265,7 @@ impl From<LogEntry> for Item {
             state: State::Pending,
             reason: String::new(),
             needs: Vec::new(),
+            execution_failed: false,
             decided: false,
             merge: None,
             note: String::new(),
@@ -2012,6 +2015,15 @@ impl Gate {
         selection: &Selection,
         report: impl FnMut(&Item),
     ) -> Result<(Vec<Item>, Option<SelectionReport>)> {
+        self.review_observed(selection, report, |_| Ok(()))
+    }
+
+    pub(crate) fn review_observed(
+        &mut self,
+        selection: &Selection,
+        report: impl FnMut(&Item),
+        started: impl FnOnce(Duration) -> Result<()>,
+    ) -> Result<(Vec<Item>, Option<SelectionReport>)> {
         self.recover_under_lock()?;
         for lane in self.sync_lanes()? {
             eprintln!(
@@ -2023,6 +2035,9 @@ impl Gate {
         }
         let main = self.pijul.snapshot(&self.settings.main)?;
         self.refresh_configuration(&main)?;
+        started(Duration::try_from_secs_f64(
+            self.settings.review_timeout_seconds,
+        )?)?;
         let result = self.with_review(|gate| gate.walk(true, selection, report));
         if let Some(stop) = self.last_review_usage.as_ref().and_then(|usage| usage.stop) {
             return Err(stop.into());
@@ -2704,6 +2719,7 @@ impl Gate {
             let mut item = Item::from(entry);
             if let Some(record) = records.get(&item.hash) {
                 item.state = State::from_decision(&record.decision);
+                item.execution_failed = record.execution_error.is_some();
                 item.reason = record.reason.clone();
                 if record.message != item.message {
                     item.message.clone_from(&record.message);
@@ -2848,6 +2864,7 @@ impl Gate {
                 for (index, record) in decided.iter().enumerate() {
                     if record.decision != "accept" {
                         self.append_under_lock(record)?;
+                        self.apply_decision(&mut chunk[index].0, record);
                     } else {
                         self.land_one(&mut chunk[index].0, record.clone(), &reviewed, main)?;
                     }
@@ -2928,6 +2945,7 @@ impl Gate {
 
     fn apply_decision(&self, item: &mut Item, record: &Record) {
         item.state = State::from_decision(&record.decision);
+        item.execution_failed = record.execution_error.is_some();
         if !record.findings.is_empty() {
             item.paths.clear();
         }
@@ -5969,6 +5987,84 @@ mod feature_tests {
             .find(|change| change.hash == candidate)
             .and_then(|change| change.decision.as_deref());
         assert_eq!(decision, Some("accept"));
+        Ok(())
+    }
+
+    #[test]
+    fn watch_retains_cached_execution_failures_until_human_resolution() -> Result<()> {
+        struct WatchThread {
+            interrupted: Arc<AtomicBool>,
+            worker: Option<std::thread::JoinHandle<Result<()>>>,
+        }
+
+        impl Drop for WatchThread {
+            fn drop(&mut self) {
+                self.interrupted.store(true, Ordering::Relaxed);
+                if let Some(worker) = self.worker.take() {
+                    worker.thread().unpark();
+                    let _ = worker.join();
+                }
+            }
+        }
+
+        let (_directory, mut settings, candidate) =
+            pending_fixture(&[("value.txt", b"candidate\n")])?;
+        let (url, server) = crate::model::tests::reply_server(
+            200,
+            r#"{"choices":[{"message":{"content":"PRIVATE_INVALID_REPLY"}}]}"#,
+        )?;
+        settings.model_url = url;
+        let operator = settings.clone();
+        let interrupted = Arc::clone(&settings.interrupted);
+        let stop = Arc::clone(&interrupted);
+        let pijul = Pijul::new(settings.repo.clone());
+        let main = pijul.snapshot("main")?;
+        let inbox = pijul.snapshot("inbox")?;
+        let mut watch = WatchThread {
+            interrupted,
+            worker: Some(std::thread::spawn(move || {
+                crate::watch::run(settings, 0.01, &stop)
+            })),
+        };
+        let wait_for = |resolved: bool| -> Result<serde_json::Value> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            loop {
+                let report = crate::watch_health::inspect(&operator.repo, "main", "inbox");
+                let value = serde_json::to_value(&report)?;
+                let failures = value["snapshot"]["consecutive_failures"].as_u64();
+                if (!resolved && report.status == "degraded" && failures.is_some_and(|n| n >= 2))
+                    || (resolved && report.healthy)
+                {
+                    return Ok(value);
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline
+                        && !watch.worker.as_ref().unwrap().is_finished(),
+                    "The watch did not reach the expected health state: {value}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let failed = wait_for(false)?;
+        server.join().expect("The model fixture panicked")?;
+        assert_eq!(failed["snapshot"]["counts"]["execution_errors"], 1);
+        assert_eq!(failed["snapshot"]["failure"], "review-execution-error");
+        assert!(!serde_json::to_string(&failed)?.contains("PRIVATE_INVALID_REPLY"));
+        Gate::new(operator.clone())?.decide_by_hand(
+            &candidate,
+            "reject",
+            Some("Reject the change after an invalid review."),
+        )?;
+        let recovered = wait_for(true)?;
+        assert_eq!(recovered["snapshot"]["consecutive_failures"], 0);
+        assert_eq!(recovered["snapshot"]["counts"]["execution_errors"], 0);
+        assert_eq!(recovered["attention_required"], true);
+        assert_eq!(pijul.snapshot("main")?, main);
+        assert_eq!(pijul.snapshot("inbox")?, inbox);
+        let worker = watch.worker.take().unwrap();
+        watch.interrupted.store(true, Ordering::Relaxed);
+        worker.thread().unpark();
+        worker.join().expect("The watch thread panicked")?;
         Ok(())
     }
 }

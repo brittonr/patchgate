@@ -28,14 +28,16 @@ mod secrets;
 #[cfg(test)]
 mod test_http;
 mod verify;
+mod watch;
+mod watch_health;
 mod window_cache;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -191,6 +193,11 @@ enum Command {
         /// Exercise native state refusal and Nix isolation in private fixtures.
         #[arg(long)]
         runtime: bool,
+    },
+    /// Inspect persistent watch health without model requests.
+    Health {
+        #[arg(long)]
+        json: bool,
     },
     /// Review and merge new changes until stopped. devenv up runs this command.
     Watch {
@@ -1025,45 +1032,10 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 println!("{waiting} change(s) need a human. Run: patchgate status");
             }
         }
-        Command::Watch { interval } => {
-            let mut gate = Gate::new(settings)?;
-            let delay = Duration::try_from_secs_f64(interval)
-                .context("--interval must be a finite, nonnegative number")?;
-            let s = &gate.settings;
-            println!(
-                "patchgate watches {} -> {} in {} every {interval} s.",
-                s.inbox,
-                s.main,
-                s.repo.display()
-            );
-            println!(
-                "Model: {} at {} (profile {})",
-                s.model,
-                s.model_url,
-                s.model_profile.as_deref().unwrap_or("environment")
-            );
-            let mut last_error = None;
-            while !interrupted.load(Ordering::Relaxed) {
-                match gate.review(&Selection::default(), show) {
-                    Ok(_) => last_error = None,
-                    Err(error) => {
-                        let error = format!("{error:#}");
-                        if last_error.as_ref() != Some(&error) {
-                            eprintln!("patchgate: {error}");
-                            last_error = Some(error);
-                        }
-                    }
-                }
-                let deadline = Instant::now() + delay;
-                while !interrupted.load(Ordering::Relaxed) {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    std::thread::park_timeout(remaining);
-                }
-            }
+        Command::Health { json } => {
+            run_health(&settings.repo, &settings.main, &settings.inbox, json)?;
         }
+        Command::Watch { interval } => watch::run(settings, interval, interrupted)?,
         Command::Accept {
             change,
             resolution,
@@ -1157,6 +1129,19 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
     Ok(())
 }
 
+fn run_health(repo: &Path, main: &str, inbox: &str, json: bool) -> Result<()> {
+    let report = watch_health::inspect(repo, main, inbox);
+    if json {
+        print_json(&report)?;
+    } else {
+        watch_health::show(&report);
+    }
+    if !report.healthy {
+        bail!("The watch is not healthy. Inspect the health report.");
+    }
+    Ok(())
+}
+
 fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let interrupted = Arc::new(AtomicBool::new(false));
@@ -1169,6 +1154,10 @@ fn main() -> std::process::ExitCode {
         })?;
         match cli.command {
             Command::Artifact { command } => run_artifact(&cli.repo, command),
+            Command::Health { json } => {
+                let repo = gate::find_repo(&cli.repo)?;
+                run_health(&repo, &cli.main, &cli.inbox, json)
+            }
             command => {
                 let repo = gate::find_repo(&cli.repo)?;
                 let settings =

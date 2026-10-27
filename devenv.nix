@@ -62,7 +62,24 @@ in
 
   # `devenv up` runs the gate. `devenv test` does not run it, because the gate changes main.
   # <!-- ste-disable-next-line semicolon -->
-  processes.patchgate = lib.mkIf (!config.devenv.isTesting) { exec = "patchgate watch"; };
+  processes.patchgate = lib.mkIf (!config.devenv.isTesting) {
+    # <!-- ste-disable-next-line semicolon -->
+    exec = "patchgate watch";
+
+    ready = {
+      # <!-- ste-disable-next-line semicolon -->
+      exec = "patchgate health --json";
+      # <!-- ste-disable-next-line semicolon -->
+      probe_timeout = 30;
+      # <!-- ste-disable-next-line semicolon -->
+      failure_threshold = 1;
+    # <!-- ste-disable-next-line semicolon -->
+    };
+
+    # <!-- ste-disable-next-line semicolon -->
+    shutdown.signal = 2;
+  # <!-- ste-disable-next-line semicolon -->
+  };
 
   # `patchgate-harbor` runs the Harbor tasks in harbor/tasks with Docker, in the Colima profile patchgate.
   # <!-- ste-disable-next-line semicolon -->

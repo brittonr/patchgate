@@ -886,6 +886,7 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 | `patchgate status` | Shows each inbox change that is not in main, with its state. It also shows each merge that the inbox does not have. |
 | `patchgate review` | Reviews and merges the pending changes one time. |
 | `patchgate watch` | Reviews and merges new changes every 10 seconds until you stop it. `devenv up` runs it. |
+| `patchgate health` | Reports persistent watch health without model or Nix requests. Exit zero means healthy. |
 | `patchgate accept <hash>` | A human accepts the change. patchgate applies it to main, with the escalated conflicting changes that it resolves. |
 | `patchgate reject <hash>` | A human rejects the change. |
 | `patchgate revert <hash>` | Removes one accepted change and its recorded merge from main exactly. |
@@ -934,11 +935,72 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 | `escalated` | patchgate or the model asks a human to decide. A conflict that patchgate did not merge has this state too. |
 | `removed` | patchgate accepted the change, but a human removed it from main. patchgate does not apply it again. |
 
+### Watch health
+
+```console
+$ patchgate health --json
+$ patchgate --main stable --inbox proposals health --json
+```
+
+Health inspection reads local state without model requests, Nix commands, or state creation.
+It ignores model profile and review timeout settings.
+Use the same repository and channel names as the watch process.
+Each repository and channel pair has a separate scope.
+Only one watch can own a scope.
+
+Exit zero needs a live owner, a successful pass, no current execution failure, and an unexpired progress deadline.
+Every other status returns exit one.
+Health does not authorize acceptance or prove model quality.
+An empty inbox does not cause a model readiness probe.
+
+| Status | Meaning |
+| --- | --- |
+| `healthy` | The owner has a successful pass and no current failure. Its progress deadline remains valid. |
+| `starting` | The owner has no successful pass yet. |
+| `degraded` | The latest pass failed, or a cached decision retains an unresolved execution error. |
+| `stalled` | The progress deadline expired, or the monotonic clock moved backward. |
+| `stopped` | The watch recorded a normal stop. |
+| `not-running` | The status has no matching live owner. |
+| `missing` | The scope has no status file. |
+| `invalid` | The status has invalid data, bindings, or state. |
+| `unavailable` | Safe inspection could not complete. |
+
+The report sets `authorizes_acceptance` to `false`.
+`snapshot` contains the phase, process identity, timestamps, failure history, and last pass counts.
+`consecutive_failures` returns to zero after a successful pass.
+`failure` and `last_failure_at` retain the last failure after recovery.
+Counts can be `null` when a pass fails before it returns items.
+
+`attention_required` reports rejected, escalated, blocked, removed, or unknown changes.
+It is `null` without counts.
+A normal policy escalation needs attention but does not make the service unhealthy.
+An invalid model reply remains a service failure until a human resolves or reconsiders that decision.
+Use `patchgate status` and `patchgate explain` for change details.
+
+The watch publishes a deadline before each pass and after trusted review settings refresh.
+Active reviews use the effective review timeout plus 30 seconds.
+Idle periods use the selected interval plus 30 seconds.
+Startup and pass preparation use the larger model or check timeout plus 30 seconds.
+Deadlines use the monotonic clock. Wall-clock timestamps serve only as display data.
+
+Private files reside in `.pijul/patchgate/watch/<scope>.json` and `<scope>.lock`.
+The scope binds the canonical repository path and both channel names.
+An exclusive process lock and a unique instance prevent old status from matching a new owner.
+The watch replaces status atomically and syncs the file and directory.
+Health files contain no source text, change hashes, model replies, endpoints, or credentials.
+A status write failure stops the watch.
+
+`devenv up` uses [ready probes](https://devenv.sh/processes/#ready-probes) with `patchgate health --json`.
+The probe runs every 10 seconds with a 30-second command timeout.
+One failed probe marks the process unhealthy.
+Devenv sends SIGINT for normal shutdown, so the watch can record `stopped`.
+SIGKILL leaves no live owner, even when the last status says `healthy`.
+
 ### Decision evidence and JSON
 
-`init`, `status`, `explain`, `log`, `review`, `reconsider`, `resolve`, `workspace-status`, `budget`, `artifact`, and the `cases` subcommands accept `--json`.
+`init`, `status`, `health`, `explain`, `log`, `review`, `reconsider`, `resolve`, `workspace-status`, `budget`, `artifact`, and the `cases` subcommands accept `--json`.
 Every report declares `schema_version: 1`.
-JSON uses full change hashes and the existing lowercase state names.
+Decision reports use full change hashes and the existing lowercase state names.
 
 ```console
 $ patchgate status --json
@@ -1788,6 +1850,7 @@ The review limits must also be positive.
   Set the model context and `PATCHGATE_MAX_CHANGE_CHARS` together.
 - patchgate merges only the conflicts in the table above. A merge that needs a new line, for example a line that combines both sides, goes to a human.
 - Two gate processes can review at the same time. Each acceptance still needs the exact reviewed main state. A moved state stops that command without acceptance.
+  Only one watch can own the same repository and channel pair.
 - Cached verdicts, conflict choices, and context windows can avoid model requests.
   Remove the corresponding directory under `.pijul/patchgate/`: `decisions/`, `merges/`, or `windows/`.
 - A typed rule citation that names a path or span outside the change escalates the change. patchgate does not accept a wrong citation.
