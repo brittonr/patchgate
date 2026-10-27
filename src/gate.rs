@@ -1683,29 +1683,6 @@ impl Gate {
         gate.reconsider(prefix, reason)
     }
 
-    pub fn init(&self) -> Result<Vec<String>> {
-        let s = &self.settings;
-        let (current, names) = self.pijul.channels()?;
-        let mut lines = Vec::new();
-        if names.contains(&s.inbox) {
-            lines.push(format!("Channel {} exists.", s.inbox));
-        } else {
-            self.pijul.run(["fork", "--channel", &s.main, &s.inbox])?;
-            lines.push(format!("Made channel {} from {}.", s.inbox, s.main));
-        }
-        if current.as_deref() != Some(&s.inbox) {
-            self.pijul.run(["channel", "switch", &s.inbox]).map_err(|error| anyhow!(
-                "{error}\nRecord or reset the working copy, then run: pijul channel switch {}", s.inbox
-            ))?;
-            lines.push(format!("The working copy is now on {}.", s.inbox));
-        }
-        lines.push(format!(
-            "Record changes in {}. patchgate decides which changes go into {}.",
-            s.inbox, s.main
-        ));
-        Ok(lines)
-    }
-
     /// Fold every configured lane channel into the inbox in native order.
     /// Each apply also stages the native prerequisites of the lane change.
     pub fn sync_lanes(&mut self) -> Result<Vec<LaneReport>> {

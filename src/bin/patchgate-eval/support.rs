@@ -306,7 +306,7 @@ pub fn start(dir: &Path, signer: &Signer, files: &[(&str, &str)]) -> Result<Repo
     if !files.is_empty() {
         repo.change(files, "Start the Rust fixture")?;
     }
-    checked_output(repo.gate(None, &["init"], &[])?, "initialize gate")?;
+    checked_output(repo.gate(None, &["init", "--channels-only"], &[])?, "initialize gate")?;
     Ok(repo)
 }
 

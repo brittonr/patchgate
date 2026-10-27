@@ -9,6 +9,7 @@ mod configuration;
 mod decision;
 mod doctor;
 mod gate;
+mod initialization;
 mod isolation;
 mod model;
 mod models;
@@ -63,8 +64,15 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Make the inbox channel from main and put the working copy on it.
-    Init,
+    /// Verify trusted setup, then make and select the inbox channel.
+    Init {
+        /// Create channels without policy, model, or runtime readiness checks.
+        #[arg(long)]
+        channels_only: bool,
+        /// Print a versioned JSON setup report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show the inbox changes that are not in main.
     Status {
         /// Print a versioned JSON report.
@@ -714,10 +722,18 @@ fn run(settings: Settings, command: Command, interrupted: &AtomicBool) -> Result
                 bail!("Workspace inspection found acceptance blockers.");
             }
         }
-        Command::Init => {
-            let gate = Gate::new(settings)?;
-            for line in gate.init()? {
-                println!("{line}");
+        Command::Init {
+            channels_only,
+            json,
+        } => {
+            let report = initialization::run(settings, channels_only, interrupted)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                initialization::show(&report);
+            }
+            if !report.initialized {
+                bail!("Setup checks failed. Use the repair commands in the report.");
             }
         }
         Command::Status { json } => {

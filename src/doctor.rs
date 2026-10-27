@@ -79,13 +79,33 @@ impl Report {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InspectionMode {
+    Doctor,
+    Initialization,
+}
+
 pub fn inspect(settings: &Settings) -> Result<Report> {
+    inspect_readiness(settings, InspectionMode::Doctor).map(|(report, _)| report)
+}
+
+pub fn inspect_initialization(
+    settings: &Settings,
+) -> Result<(Report, Option<crate::pijul::ChannelSnapshot>)> {
+    inspect_readiness(settings, InspectionMode::Initialization)
+}
+
+fn inspect_readiness(
+    settings: &Settings,
+    mode: InspectionMode,
+) -> Result<(Report, Option<crate::pijul::ChannelSnapshot>)> {
     let mut report = Report {
         schema_version: 1,
         ok: true,
         checks: Vec::new(),
         configuration: None,
     };
+    let mut main_snapshot = None;
     let command = format!(
         "patchgate --repo {} --main {} --inbox {}",
         quote(&settings.repo.to_string_lossy()),
@@ -119,7 +139,35 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
             Ok(isolated) => {
                 let pijul = Pijul::with_timeout(isolated.pijul.repo.clone(), PROBE_LIMIT);
                 inspect_isolated_journal(&mut report, &settings.repo, &pijul.repo, &command);
-                inspect_channels(&mut report, &pijul, settings, &command);
+                inspect_channels(&mut report, &pijul, settings, &command, mode);
+                if mode == InspectionMode::Initialization {
+                    let snapshot = if report
+                        .checks
+                        .iter()
+                        .any(|check| check.id == "channel.main" && check.status == Status::Pass)
+                    {
+                        pijul.snapshot(&settings.main)
+                    } else {
+                        Err(anyhow::anyhow!("The main channel is unavailable"))
+                    };
+                    match snapshot {
+                        Ok(snapshot) => {
+                            report.add(
+                                "channel.main_snapshot",
+                                Status::Pass,
+                                "The private main snapshot contains native state and change hashes.",
+                                None,
+                            );
+                            main_snapshot = Some(snapshot);
+                        }
+                        Err(_) => report.add(
+                            "channel.main_snapshot",
+                            Status::Error,
+                            "Cannot read the private main snapshot.",
+                            Some("Restore a readable main channel from a trusted backup.".into()),
+                        ),
+                    }
+                }
             }
             Err(error) => {
                 for id in [
@@ -158,6 +206,31 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
             );
         }
     }
+    if mode == InspectionMode::Initialization && !report.ok {
+        for id in [
+            "model.readiness",
+            "nix.runtime",
+            "nix.sandbox",
+            "pijul.runtime_expected_state",
+            "nix.runtime_isolation",
+        ] {
+            report.add(
+                id,
+                Status::Unavailable,
+                "Repository, policy, or check errors prevent this probe.",
+                None,
+            );
+        }
+        if settings.escalation_profile.is_some() {
+            report.add(
+                "model.escalation_readiness",
+                Status::Unavailable,
+                "Repository, policy, or check errors prevent this probe.",
+                None,
+            );
+        }
+        return Ok((report, main_snapshot));
+    }
     let values = report.configuration.as_ref().map(|value| &value.values);
     let timeout = values
         .and_then(|value| Duration::try_from_secs_f64(value.timeout_seconds).ok())
@@ -168,13 +241,24 @@ pub fn inspect(settings: &Settings) -> Result<Report> {
         .unwrap_or(settings.check_timeout)
         .min(PROBE_LIMIT);
     inspect_model(&mut report, settings, timeout);
+    if mode == InspectionMode::Initialization {
+        inspect_escalation_model(&mut report, settings, timeout);
+    }
     inspect_nix(&mut report, check_timeout);
-    Ok(report)
+    if mode == InspectionMode::Initialization {
+        inspect_runtime_probes(&mut report, settings);
+    }
+    Ok((report, main_snapshot))
 }
 
 /// Run explicit probes in private fixtures after the read-only checks.
 pub fn inspect_runtime(settings: &Settings) -> Result<Report> {
     let mut report = inspect(settings)?;
+    inspect_runtime_probes(&mut report, settings);
+    Ok(report)
+}
+
+fn inspect_runtime_probes(report: &mut Report, settings: &Settings) {
     match native_runtime_probe() {
         Ok(()) => report.add(
             "pijul.runtime_expected_state",
@@ -210,7 +294,6 @@ pub fn inspect_runtime(settings: &Settings) -> Result<Report> {
             Some(sandbox_repair()),
         ),
     }
-    Ok(report)
 }
 
 type ProbeSnapshot = (Option<String>, BTreeSet<String>);
@@ -549,7 +632,13 @@ fn check_native_refusal(
     Ok(())
 }
 
-fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, command: &str) {
+fn inspect_channels(
+    report: &mut Report,
+    pijul: &Pijul,
+    settings: &Settings,
+    command: &str,
+    mode: InspectionMode,
+) {
     let channels = match pijul.channels() {
         Ok((_, channels)) => channels,
         Err(error) => {
@@ -579,10 +668,17 @@ fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, com
         ("channel.main", &settings.main, main),
         ("channel.inbox", &settings.inbox, inbox),
     ] {
-        report.add(id, if present { Status::Pass } else { Status::Error },
-            format!("Channel {name:?} {}.", if present { "exists" } else { "does not exist" }),
-            (!present).then(|| if id == "channel.inbox" && main {
-                format!("Create the inbox from main with: {command} init")
+        let expected = !present
+            && id == "channel.inbox"
+            && mode == InspectionMode::Initialization;
+        report.add(id, if present || expected { Status::Pass } else { Status::Error },
+            if expected {
+                format!("Channel {name:?} does not exist. Initialization will create it from main.")
+            } else {
+                format!("Channel {name:?} {}.", if present { "exists" } else { "does not exist" })
+            },
+            (!present && !expected).then(|| if id == "channel.inbox" && main {
+                format!("Create offline channels with: {command} init --channels-only")
             } else {
                 format!("Select the correct channel with --main and --inbox. List channels with: pijul --repository {} channel",
                     quote(&settings.repo.to_string_lossy()))
@@ -614,6 +710,11 @@ fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, com
         }
         return;
     }
+    let prepare_inbox = if inbox {
+        String::new()
+    } else {
+        format!("Create offline channels first: {command} init --channels-only. ")
+    };
     match configuration::load(pijul, &settings.main, &settings.baseline_values()) {
         Ok(evidence) => {
             report.add(
@@ -624,7 +725,7 @@ fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, com
             );
             let policy_path = &evidence.values.policy_path;
             let policy_repair = format!(
-                "Record {} in the inbox, then accept its change with: {command} accept <hash>",
+                "{prepare_inbox}Record {} in the inbox. Accept its change with: {command} accept <hash>",
                 quote(policy_path)
             );
             match pijul.read_file(&settings.main, policy_path) {
@@ -669,11 +770,12 @@ fn inspect_channels(report: &mut Report, pijul: &Pijul, settings: &Settings, com
     match verify::Plan::load(pijul, &settings.main) {
         Ok(Some(_)) => report.add("nix.manifest", Status::Pass,
             "The trusted Nix manifest and recorded check paths pass structural validation. No check was evaluated or built.", None),
-        Ok(None) => report.add("nix.manifest", Status::Warning,
+        Ok(None) => report.add("nix.manifest",
+            if mode == InspectionMode::Initialization { Status::Error } else { Status::Warning },
             "Main has no nix/checks.json. The gate has no trusted Nix checks.",
-            Some(format!("Record nix/checks.json and its check definitions, then run: {command} accept <hash>"))),
+            Some(format!("{prepare_inbox}Record nix/checks.json and its check definitions in the inbox. Accept its change with: {command} accept <hash>"))),
         Err(error) => report.add("nix.manifest", Status::Error, format!("{error:#}"),
-            Some(format!("Correct the recorded nix/checks.json and check paths, then run: {command} accept <hash>"))),
+            Some(format!("{prepare_inbox}Correct the recorded nix/checks.json and check paths. Accept its change with: {command} accept <hash>"))),
     }
 }
 
@@ -724,7 +826,7 @@ fn copy_journal(source: &Path, isolated: &Path) -> Result<()> {
     }
 }
 
-fn metadata_safety(repo: &Path) -> Result<()> {
+pub(crate) fn metadata_safety(repo: &Path) -> Result<()> {
     let root = safe_path(repo, Path::new(".pijul"))?;
     ensure!(
         fs::symlink_metadata(&root)?.is_dir(),
@@ -853,11 +955,7 @@ fn inspect_model(report: &mut Report, settings: &Settings, timeout: Duration) {
             return;
         }
     };
-    // Only fixed public data enters this request. Do not add repository data here.
     let result = (|| -> Result<bool> {
-        let state = serde_json::value::RawValue::from_string(
-            r#"{"schema_version":1,"candidate":{"message":"Doctor harmless readiness probe","paths":[],"context":{"full":true,"files":[]},"metadata_context":[]},"binding":{"probe":true}}"#.into()
-        )?;
         let model = Model::new(
             &settings.model_url,
             &settings.model,
@@ -866,13 +964,7 @@ fn inspect_model(report: &mut Report, settings: &Settings, timeout: Duration) {
             settings.model_revision.as_deref(),
             model_key.as_deref(),
         )?;
-        Ok(model
-            .review(
-                "Accept this harmless readiness probe. It contains no source changes.",
-                &state,
-            )?
-            .value
-            .is_some())
+        probe_model(&model)
     })();
     match result {
         Ok(true) => report.add("model.readiness", Status::Pass,
@@ -881,6 +973,84 @@ fn inspect_model(report: &mut Report, settings: &Settings, timeout: Duration) {
             "The configured model did not return a valid review decision for the harmless probe.", repair),
         Err(_) => report.add("model.readiness", Status::Error,
             "The configured API/model probe failed or exceeded its time limit. Server replies are omitted to protect server data.", repair),
+    }
+}
+
+fn probe_model(model: &Model) -> Result<bool> {
+    // Only fixed public data enters this request. Do not add repository data here.
+    let state = serde_json::value::RawValue::from_string(
+        r#"{"schema_version":1,"candidate":{"message":"Doctor harmless readiness probe","paths":[],"context":{"full":true,"files":[]},"metadata_context":[]},"binding":{"probe":true}}"#.into()
+    )?;
+    Ok(model
+        .review(
+            "Accept this harmless readiness probe. It contains no source changes.",
+            &state,
+        )?
+        .value
+        .is_some())
+}
+
+fn inspect_escalation_model(report: &mut Report, settings: &Settings, timeout: Duration) {
+    let Some(name) = settings.escalation_profile.as_deref() else {
+        return;
+    };
+    let repair = Some(
+        "Select a usable systemone profile with PATCHGATE_ESCALATE_PROFILE. Start its model server."
+            .into(),
+    );
+    let selected = (|| -> Result<_> {
+        let selection = crate::models::select_named(name)?;
+        ensure!(
+            matches!(selection.api, crate::model::Api::SystemOne),
+            "The escalation profile must use the systemone API"
+        );
+        let key = selection
+            .key_file
+            .as_deref()
+            .map(crate::models::read_key)
+            .transpose()?;
+        Ok((selection, key))
+    })();
+    let (selection, key) = match selected {
+        Ok(selected) => selected,
+        Err(_) => {
+            report.add(
+                "model.escalation_readiness",
+                Status::Error,
+                "The escalation profile or its local key file is invalid.",
+                repair,
+            );
+            return;
+        }
+    };
+    let result = Model::new(
+        &selection.url,
+        &selection.model,
+        timeout,
+        selection.api,
+        selection.revision.as_deref(),
+        key.as_deref(),
+    )
+    .and_then(|model| probe_model(&model));
+    match result {
+        Ok(true) => report.add(
+            "model.escalation_readiness",
+            Status::Pass,
+            "The escalation model returns a valid review response to fixed harmless data. This does not assess review quality.",
+            None,
+        ),
+        Ok(false) => report.add(
+            "model.escalation_readiness",
+            Status::Error,
+            "The escalation model did not return a valid review decision for the harmless probe.",
+            repair,
+        ),
+        Err(_) => report.add(
+            "model.escalation_readiness",
+            Status::Error,
+            "The escalation API/model probe failed or exceeded its time limit. Server replies are omitted to protect server data.",
+            repair,
+        ),
     }
 }
 
@@ -1057,6 +1227,123 @@ mod tests {
     use crate::model::Api;
     use serde_json::json;
     use std::os::unix::fs::symlink;
+
+    fn initialization_fixture() -> Result<(tempfile::TempDir, Settings)> {
+        use std::sync::{Arc, atomic::AtomicBool};
+
+        let directory = tempfile::tempdir()?;
+        let pijul = Pijul::new(directory.path().to_path_buf());
+        pijul.run(["init"])?;
+        fs::write(directory.path().join("POLICY.md"), "Accept safe changes.\n")?;
+        pijul.run(["add", "POLICY.md"])?;
+        let signer = crate::pijul::Signer::new(directory.path().join(".pijul/patchgate"));
+        let environment = signer.environment()?;
+        pijul.call_with_env(
+            ["record", "-a", "-m", "Record policy", "--author", "patchgate"],
+            &environment.vars,
+        )?;
+        let mut settings = Settings::from_env(
+            directory.path().to_path_buf(),
+            "inbox".into(),
+            "main".into(),
+            Arc::new(AtomicBool::new(false)),
+        )?;
+        settings.policy = "POLICY.md".into();
+        Ok((directory, settings))
+    }
+
+    fn repository_files(root: &Path) -> Result<BTreeMap<PathBuf, Option<Vec<u8>>>> {
+        let mut files = BTreeMap::new();
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                files.insert(path.clone(), None);
+                files.extend(repository_files(&path)?);
+            } else {
+                ensure!(entry.file_type()?.is_file(), "The fixture contains a special file");
+                files.insert(path.clone(), Some(fs::read(path)?));
+            }
+        }
+        Ok(files)
+    }
+
+    fn channel_report(settings: &Settings, mode: InspectionMode) -> Result<Report> {
+        let isolated = crate::isolation::copy_repository(&settings.repo)?;
+        let mut report = Report {
+            schema_version: 1,
+            ok: true,
+            checks: Vec::new(),
+            configuration: None,
+        };
+        inspect_channels(&mut report, &isolated.pijul, settings, "patchgate", mode);
+        Ok(report)
+    }
+
+    fn check_status(report: &Report, id: &str, expected: Status) {
+        assert!(report.checks.iter().any(|check| check.id == id && check.status == expected));
+    }
+
+    #[test]
+    fn initialization_allows_absent_inbox_but_requires_distinct_existing_main() -> Result<()> {
+        let (_directory, mut settings) = initialization_fixture()?;
+        let before = repository_files(&settings.repo)?;
+        let report = channel_report(&settings, InspectionMode::Initialization)?;
+        check_status(&report, "channel.main", Status::Pass);
+        check_status(&report, "channel.inbox", Status::Pass);
+        check_status(&report, "channel.distinct", Status::Pass);
+        let report = channel_report(&settings, InspectionMode::Doctor)?;
+        check_status(&report, "channel.inbox", Status::Error);
+
+        settings.inbox = settings.main.clone();
+        let report = channel_report(&settings, InspectionMode::Initialization)?;
+        check_status(&report, "channel.distinct", Status::Error);
+        assert!(!report.ok);
+
+        settings.inbox = "inbox".into();
+        settings.main = "absent-main".into();
+        let (report, snapshot) = inspect_initialization(&settings)?;
+        check_status(&report, "channel.main", Status::Error);
+        check_status(&report, "channel.main_snapshot", Status::Error);
+        check_status(&report, "model.readiness", Status::Unavailable);
+        check_status(&report, "nix.runtime_isolation", Status::Unavailable);
+        assert!(snapshot.is_none());
+        assert!(!report.ok);
+        assert_eq!(repository_files(&settings.repo)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn initialization_requires_recorded_checks_before_model_or_nix_probes() -> Result<()> {
+        let (_directory, settings) = initialization_fixture()?;
+        fs::create_dir(settings.repo.join("nix"))?;
+        fs::write(
+            settings.repo.join(verify::MANIFEST),
+            r#"{"schema_version":1,"checks":["check.nix"]}"#,
+        )?;
+        fs::write(settings.repo.join("nix/check.nix"), "{}\n")?;
+        let before = repository_files(&settings.repo)?;
+        let isolated = crate::isolation::copy_repository(&settings.repo)?;
+        let expected = isolated.pijul.snapshot(&settings.main)?;
+        let report = channel_report(&settings, InspectionMode::Doctor)?;
+        check_status(&report, "nix.manifest", Status::Warning);
+        let (report, snapshot) = inspect_initialization(&settings)?;
+        check_status(&report, "policy.trusted", Status::Pass);
+        check_status(&report, "nix.manifest", Status::Error);
+        for id in [
+            "model.readiness",
+            "nix.runtime",
+            "nix.sandbox",
+            "pijul.runtime_expected_state",
+            "nix.runtime_isolation",
+        ] {
+            check_status(&report, id, Status::Unavailable);
+        }
+        assert_eq!(snapshot, Some(expected));
+        assert!(!report.ok);
+        assert_eq!(repository_files(&settings.repo)?, before);
+        Ok(())
+    }
 
     #[test]
     fn model_readiness_uses_response_values_without_revision_identity_claims() -> Result<()> {
@@ -1275,7 +1562,14 @@ mod tests {
             r#"{"schema_version":1,"settings":{"policy_path":"TRUSTED.md"}}"#,
         )?;
         fs::write(root.join("TRUSTED.md"), "Accept safe changes.\n")?;
+        fs::create_dir(root.join("nix"))?;
+        fs::write(
+            root.join(verify::MANIFEST),
+            r#"{"schema_version":1,"checks":["check.nix"]}"#,
+        )?;
+        fs::write(root.join("nix/check.nix"), "{}\n")?;
         pijul.run(["add", configuration::PATH, "TRUSTED.md"])?;
+        pijul.run(["add", verify::MANIFEST, "nix/check.nix"])?;
         let signer = Signer::new(root.join(".pijul/patchgate"));
         let environment = signer.environment()?;
         pijul.call_with_env(
@@ -1292,42 +1586,36 @@ mod tests {
         pijul.run(["fork", "--channel", "main", "inbox"])?;
         fs::write(root.join(configuration::PATH), "dirty configuration")?;
         fs::write(root.join("TRUSTED.md"), "")?;
-        let settings = Settings::from_env(
+        fs::write(root.join(verify::MANIFEST), "dirty check manifest")?;
+        let mut settings = Settings::from_env(
             root.clone(),
             "inbox".into(),
             "main".into(),
             Arc::new(AtomicBool::new(false)),
         )?;
-        let isolated = crate::isolation::copy_repository(&root)?;
-        let mut report = Report {
-            schema_version: 1,
-            ok: true,
-            checks: Vec::new(),
-            configuration: None,
-        };
-        inspect_channels(&mut report, &isolated.pijul, &settings, "patchgate");
-        assert!(
-            report.checks.iter().any(|check| {
-                check.id == "configuration.trusted" && check.status == Status::Pass
-            })
-        );
-        assert!(
-            report
-                .checks
-                .iter()
-                .any(|check| { check.id == "policy.trusted" && check.status == Status::Pass })
-        );
-        let evidence = report
-            .configuration
-            .context("Missing configuration evidence")?;
-        assert_eq!(evidence.source, "main");
-        assert_eq!(evidence.values.policy_path, "TRUSTED.md");
-        assert!(configuration_detail(&evidence).contains(evidence.sha256.as_deref().unwrap()));
-        assert_eq!(
-            fs::read_to_string(root.join(configuration::PATH))?,
-            "dirty configuration"
-        );
-        assert_eq!(fs::read_to_string(root.join("TRUSTED.md"))?, "");
+        settings.policy = "UNRECORDED.md".into();
+        fs::write(root.join("UNRECORDED.md"), "Do not trust work policy.\n")?;
+        for mode in [InspectionMode::Doctor, InspectionMode::Initialization] {
+            let report = channel_report(&settings, mode)?;
+            check_status(&report, "configuration.trusted", Status::Pass);
+            check_status(&report, "policy.trusted", Status::Pass);
+            check_status(&report, "nix.manifest", Status::Pass);
+            let evidence = report
+                .configuration
+                .context("Missing configuration evidence")?;
+            assert_eq!(evidence.source, "main");
+            assert_eq!(evidence.values.policy_path, "TRUSTED.md");
+            assert!(configuration_detail(&evidence).contains(evidence.sha256.as_deref().unwrap()));
+            assert_eq!(
+                fs::read_to_string(root.join(configuration::PATH))?,
+                "dirty configuration"
+            );
+            assert_eq!(fs::read_to_string(root.join("TRUSTED.md"))?, "");
+            assert_eq!(
+                fs::read_to_string(root.join(verify::MANIFEST))?,
+                "dirty check manifest"
+            );
+        }
         pijul.call_with_env(
             [
                 "record",
@@ -1339,26 +1627,13 @@ mod tests {
             ],
             &environment.vars,
         )?;
-        let isolated = crate::isolation::copy_repository(&root)?;
-        let mut report = Report {
-            schema_version: 1,
-            ok: true,
-            checks: Vec::new(),
-            configuration: None,
-        };
-        inspect_channels(&mut report, &isolated.pijul, &settings, "patchgate");
-        assert!(report.configuration.is_none());
-        assert!(
-            report.checks.iter().any(|check| {
-                check.id == "configuration.trusted" && check.status == Status::Error
-            })
-        );
-        assert!(
-            report.checks.iter().any(|check| {
-                check.id == "policy.trusted" && check.status == Status::Unavailable
-            })
-        );
-        assert!(!serde_json::to_string(&report)?.contains("dirty configuration"));
+        for mode in [InspectionMode::Doctor, InspectionMode::Initialization] {
+            let report = channel_report(&settings, mode)?;
+            assert!(report.configuration.is_none());
+            check_status(&report, "configuration.trusted", Status::Error);
+            check_status(&report, "policy.trusted", Status::Unavailable);
+            assert!(!serde_json::to_string(&report)?.contains("dirty configuration"));
+        }
         Ok(())
     }
 }

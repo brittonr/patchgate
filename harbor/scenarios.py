@@ -106,13 +106,13 @@ class Repo:
 
 
 def start(directory: Path, signer: Signer, files: dict[str, str]) -> Repo:
-    """Record the files in main, then make the inbox channel with `patchgate init`."""
+    """Record the files in main, then create the inbox channel with `patchgate init --channels-only`."""
     repo = Repo(directory / "repo", signer.env)
     repo.path.mkdir(parents=True)
     repo.pijul("init")
     if files:
         repo.change(files, "Start the project")
-    run(PATCHGATE, "init", cwd=repo.path, env=signer.env)
+    run(PATCHGATE, "init", "--channels-only", cwd=repo.path, env=signer.env)
     return repo
 
 
@@ -850,7 +850,7 @@ class CustomChannelsPolicy:
         repo.change({"review-rules.txt": TODO_POLICY, "POLICY.md": OPEN_POLICY}, "Start the project")
         repo.pijul("channel", "rename", "main", "stable")
         settings = {**signer.env, "PATCHGATE_MAIN": "stable", "PATCHGATE_INBOX": "proposals", "PATCHGATE_POLICY": "review-rules.txt", "PATCHGATE_PROTECTED": ""}
-        run(PATCHGATE, "init", cwd=repo.path, env=settings)
+        run(PATCHGATE, "init", "--channels-only", cwd=repo.path, env=settings)
         benign = repo.change({"hello.txt": "hello\n"}, "Add a greeting")
         violation = repo.change({"notes.txt": "TODO: write notes\n"}, "Add notes")
         policy = repo.change({"review-rules.txt": OPEN_POLICY}, "Permit all changes")

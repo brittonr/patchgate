@@ -759,6 +759,11 @@ Timing evidence: `.devenv/tool-input-build-times.json`.
 
 ## Start
 
+Start the selected model server before `patchgate init`.
+Record a nonempty trusted policy and `nix/checks.json` with its check definitions in the initial main change.
+If you use `patchgate.json`, record it in the same change.
+This project supplies the policy and check files.
+
 ```console
 $ devenv shell
 $ pijul init
@@ -770,7 +775,47 @@ $ patchgate init
 
 A git clone has no `.pijul` directory, so `pijul init` and `pijul add -r .` make the Pijul repository. `.ignore` tells pijul to skip `.git` and the devenv state. The identity is optional. Without it, pijul records your changes as `Anonymous`.
 
-Record the first change in `main`, before `patchgate init`, because the gate cannot review its own start. `patchgate init` makes the `inbox` channel from `main` and puts the working copy on `inbox`.
+Record the first change in `main` before `patchgate init`.
+The gate cannot review its own start.
+Initialization checks the recorded policy, declared Nix checks, selected models, native state refusal, and fresh Nix isolation.
+It then creates `inbox` from `main` and selects `inbox`.
+
+### Initialization reports
+
+```console
+$ patchgate init --json
+```
+
+Initialization reads private copies of recorded metadata and sends only fixed harmless data to each model.
+It also checks the optional escalation profile when that profile is configured.
+Initialization can create an absent inbox, but main must exist and the two channel names must differ.
+Policy, configuration, or check errors prevent model and Nix probes.
+A preflight failure leaves source channels, work files, audit data, and keys unchanged.
+
+The command compares source main with the inspected native snapshot before and after channel setup.
+A changed state prevents a readiness claim.
+The JSON report contains `initialized`, `ready`, `channels_only`, `authorizes_acceptance`, `actions`, and `diagnostics`.
+Checked success sets `initialized` and `ready` to `true`.
+Every initialization report sets `authorizes_acceptance` to `false`.
+
+Declared checks receive structural validation during setup.
+Candidate acceptance still executes those checks.
+Probe success does not prove model accuracy, policy quality, or successful repository checks.
+The existing model profiles and environment settings select the endpoints.
+Use `patchgate model --json` to inspect that selection.
+
+For offline channel setup, use the explicit mode:
+
+```console
+$ patchgate init --channels-only --json
+```
+
+This mode does not contact a model or Nix.
+It sets `ready` to `false` and does not create gate keys or audit records.
+It refuses a pending acceptance journal.
+Recover that journal with `patchgate status` first.
+Native Pijul refuses a channel switch when tracked work has unrecorded changes.
+Record or preserve that work before the first channel switch.
 
 ## Daily use
 
@@ -820,7 +865,8 @@ To publish the reviewed work, push main: `pijul push <remote> --from-channel mai
 <!-- ste-disable-next-line paragraph-length -->
 | Command | What it does |
 | --- | --- |
-| `patchgate init` | Makes the `inbox` channel from `main` and puts the working copy on it. |
+| `patchgate init` | Verifies trusted setup, then makes and selects the inbox channel. |
+| `patchgate init --channels-only` | Makes and selects the inbox without model or Nix probes. It makes no readiness claim. |
 | `patchgate status` | Shows each inbox change that is not in main, with its state. It also shows each merge that the inbox does not have. |
 | `patchgate review` | Reviews and merges the pending changes one time. |
 | `patchgate watch` | Reviews and merges new changes every 10 seconds until you stop it. `devenv up` runs it. |
@@ -874,7 +920,7 @@ A hash can be the start of a hash, for example `FTH4472WYKIZ`.
 
 ### Decision evidence and JSON
 
-`status`, `explain`, `log`, `review`, `reconsider`, `resolve`, `workspace-status`, `budget`, `artifact`, and the `cases` subcommands accept `--json`.
+`init`, `status`, `explain`, `log`, `review`, `reconsider`, `resolve`, `workspace-status`, `budget`, `artifact`, and the `cases` subcommands accept `--json`.
 Every report declares `schema_version: 1`.
 JSON uses full change hashes and the existing lowercase state names.
 
@@ -995,6 +1041,8 @@ Selection also works with `--dry-run` and grants no acceptance authority.
 Statuses are `pass`, `error`, `warning`, or `unavailable`.
 Errors and unavailable checks cause a nonzero exit.
 Warnings do not cause failure.
+Unlike checked initialization, doctor treats absent trusted Nix checks as a warning.
+It still reports an absent inbox as an error.
 
 Doctor checks metadata safety, channels, trusted policy, pending recovery, patched Pijul support, the model API, and Nix configuration.
 It uses isolated metadata and fixed harmless model data.
