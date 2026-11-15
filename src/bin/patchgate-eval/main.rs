@@ -64,6 +64,12 @@ enum Action {
         #[arg(long, default_value = "/logs/verifier/reward.txt")]
         reward: PathBuf,
     },
+    /// Serve one scenario's scripted reviewer over HTTP until killed. The first line
+    /// of stdout is the base URL, to pass as PATCHGATE_EVAL_MODEL_URL. A live run
+    /// against it exercises the live model path with known-correct answers.
+    ServeOracle {
+        name: String,
+    },
     Smoke {
         #[arg(long = "case")]
         cases: Vec<String>,
@@ -140,6 +146,24 @@ pub fn find_scenario(name: &str) -> Result<&'static Scenario> {
     scenarios()
         .find(|case| case.name == name)
         .with_context(|| format!("unknown Rust scenario {name}"))
+}
+
+fn serve_oracle(name: &str) -> Result<()> {
+    let server = if real_model::SCENARIOS.iter().any(|case| case.name == name) {
+        ModelServer::new(real_model::scripted_reply)?
+    } else if generalization::SCENARIOS
+        .iter()
+        .any(|case| case.name == name)
+    {
+        ModelServer::new(generalization::oracle_reply)?
+    } else {
+        anyhow::bail!("{name} has no scripted reviewer to serve");
+    };
+    println!("{}", server.url);
+    std::io::Write::flush(&mut std::io::stdout())?;
+    loop {
+        std::thread::park();
+    }
 }
 
 fn setup(case: &Scenario, directory: &Path, signer: &Signer) -> Result<()> {
@@ -266,6 +290,7 @@ fn run() -> Result<()> {
             println!("reward: {}", u8::from(valid));
         }
         Action::Smoke { cases } => smoke(&cases)?,
+        Action::ServeOracle { name } => serve_oracle(&name)?,
         Action::VerifyHarbor(args) => controls::verify_harbor(args)?,
         Action::ModelHarbor(args) => real_model::model_harbor(args)?,
         Action::Replay(args) => replay::run(args)?,

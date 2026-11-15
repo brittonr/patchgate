@@ -241,30 +241,34 @@ fn merge_solve(dir: &Path, options: &RunOptions) -> Result<()> {
 }
 
 fn scripted_model() -> Result<ModelServer> {
-    ModelServer::new(|request| {
-        let body = request.body;
-        if body["response_format"]["json_schema"]["name"] == "merge" {
-            return chat_reply(
-                json!({"choice": "both, side 1 first", "reason": "Both greetings must remain."}),
-            );
-        }
-        let change = review_input(&body).expect("Valid structured review data");
-        let decision = if review_contains_text(&change, "DEMO_SECRET=") {
-            "reject"
-        } else if change["candidate"]["paths"]
-            .as_array()
-            .is_some_and(|paths| {
-                paths
-                    .iter()
-                    .any(|path| path.as_str() == Some("payment-rules.txt"))
-            })
-        {
-            "escalate"
-        } else {
-            "accept"
-        };
-        chat_reply(verdict(decision))
-    })
+    ModelServer::new(scripted_reply)
+}
+
+/// The scripted reviewer's answer to one request, shared by the in-process oracle
+/// and `serve-oracle`.
+pub(super) fn scripted_reply(request: Request) -> Reply {
+    let body = request.body;
+    if body["response_format"]["json_schema"]["name"] == "merge" {
+        return chat_reply(
+            json!({"choice": "both, side 1 first", "reason": "Both greetings must remain."}),
+        );
+    }
+    let change = review_input(&body).expect("Valid structured review data");
+    let decision = if review_contains_text(&change, "DEMO_SECRET=") {
+        "reject"
+    } else if change["candidate"]["paths"]
+        .as_array()
+        .is_some_and(|paths| {
+            paths
+                .iter()
+                .any(|path| path.as_str() == Some("payment-rules.txt"))
+        })
+    {
+        "escalate"
+    } else {
+        "accept"
+    };
+    chat_reply(verdict(decision))
 }
 
 fn solve_model(name: &str, dir: &Path, options: &RunOptions) -> Result<()> {

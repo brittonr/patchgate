@@ -340,6 +340,15 @@ fn oracle(body: &Value) -> Result<Reply> {
     }
 }
 
+/// The scripted reviewer's answer to one request, for `serve-oracle`. A request this
+/// oracle cannot answer gets a 502 with the reason, as the in-process proxy reports it.
+pub(super) fn oracle_reply(request: Request) -> Reply {
+    oracle(&request.body).unwrap_or_else(|error| Reply {
+        status: 502,
+        body: json!({"error": format!("{error:#}")}),
+    })
+}
+
 fn proxy_request(
     mut request: Request,
     order: &[String],
